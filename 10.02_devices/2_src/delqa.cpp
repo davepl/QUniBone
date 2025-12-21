@@ -199,6 +199,8 @@ bool delqa_c::on_before_install(void)
         return false;
     }
 
+    INFO("DELQA: PCAP opened successfully on interface %s", ifname.value.c_str());
+
     ifname.readonly = true;
     mac.readonly = true;
     promisc.readonly = true;
@@ -1026,16 +1028,14 @@ bool delqa_c::process_setup_packet(const std::vector<uint8_t> &frame)
 
     setup_valid = true;
 
-    if (trace.value) {
-        INFO("DELQA: Setup packet processed: promisc=%d multicast=%d",
-             setup_promiscuous, setup_multicast);
-        for (int i = 0; i < XQ_FILTER_MAX; i++) {
-            if (setup_macs[i][0] || setup_macs[i][1] || setup_macs[i][2] ||
-                setup_macs[i][3] || setup_macs[i][4] || setup_macs[i][5]) {
-                INFO("DELQA: Setup MAC[%d]: %02x:%02x:%02x:%02x:%02x:%02x", i,
-                     setup_macs[i][0], setup_macs[i][1], setup_macs[i][2],
-                     setup_macs[i][3], setup_macs[i][4], setup_macs[i][5]);
-            }
+    INFO("DELQA: Setup packet processed: len=%zu, promisc=%d multicast=%d",
+         frame.size(), setup_promiscuous, setup_multicast);
+    for (int i = 0; i < XQ_FILTER_MAX; i++) {
+        if (setup_macs[i][0] || setup_macs[i][1] || setup_macs[i][2] ||
+            setup_macs[i][3] || setup_macs[i][4] || setup_macs[i][5]) {
+            INFO("DELQA: Setup MAC[%d]: %02x:%02x:%02x:%02x:%02x:%02x", i,
+                 setup_macs[i][0], setup_macs[i][1], setup_macs[i][2],
+                 setup_macs[i][3], setup_macs[i][4], setup_macs[i][5]);
         }
     }
 
