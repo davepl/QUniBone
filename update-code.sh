@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # arg 1: Branch. "master", if none
-GITREPO=j-hoppe/QUniBone
+GITREPO=davepl/QUniBone
 GITBRANCH=master
 if [ ! -z "$1" ] ; then
     GITBRANCH=$1
