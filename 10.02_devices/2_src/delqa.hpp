@@ -102,7 +102,7 @@ private:
     bool setup_valid = false;
     bool setup_promiscuous = false;
     bool setup_multicast = false;
-    uint8_t setup_macs[XQ_FILTER_MAX][6] = {0};
+    uint8_t setup_macs[XQ_FILTER_MAX][6] = {{0}};
 
     bool deqna_lock = false;
     bool rx_delay_active = false;

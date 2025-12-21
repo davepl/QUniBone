@@ -254,7 +254,7 @@ void delqa_c::reset_controller(void)
     rcvlist_hi = 0;
     xmtlist_lo = 0;
     xmtlist_hi = 0;
-    qe_vector = intr_vector.value & QE_VEC_IV;
+    qe_vector = (intr_vector.value & QE_VEC_IV) | QE_VEC_MS;
     qe_csr = QE_XL_INVALID | QE_RL_INVALID;
 
     update_transceiver_bits();
@@ -267,6 +267,10 @@ void delqa_c::reset_controller(void)
     deqna_lock = false;
     rx_delay_active = false;
     rx_enable_deadline_ns = 0;
+    setup_valid = false;
+    setup_promiscuous = false;
+    setup_multicast = false;
+    memset(setup_macs, 0, sizeof(setup_macs));
 
     // Reset statistics
     rx_frames = 0;
