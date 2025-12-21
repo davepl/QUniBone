@@ -4,12 +4,15 @@ Contributed under the GPL2 License
 
 # DELQA (DEQNA/DELQA) Ethernet Emulation
 
-This adds a virtual QBUS Ethernet NIC that follows the DEQNA/DELQA (LANCE-style) programmer's model and bridges frames to the host interface using libpcap.
+This adds a virtual QBUS Ethernet NIC that follows the DEQNA/DELQA register interface and
+bridges frames to the host interface using libpcap.
 
 ## Overview
 
-- Registers: RDP/RAP at CSR base, with CSR0..CSR3 (LANCE-style).
-- DMA: init block, RX/TX ring descriptors, and frame buffers live in PDP-11 memory.
+- Registers: direct-mapped DEQNA layout at CSR base (station address bytes, list pointers,
+  vector, CSR).
+- DMA: RX/TX ring descriptors (qe_ring, 6 words) and frame buffers in PDP-11 memory.
+- Interrupts: QE_RCV_INT/QE_XMIT_INT with QE_INT_ENABLE.
 - Host bridge: libpcap capture/inject on the selected interface.
 
 ## Configuration
@@ -17,9 +20,9 @@ This adds a virtual QBUS Ethernet NIC that follows the DEQNA/DELQA (LANCE-style)
 The runtime uses the device parameter interface (menu `p` command) to configure the NIC:
 
 - `ifname` (string): host interface name (e.g., `eth0`).
-- `mac` (string): MAC override (`aa:bb:cc:dd:ee:ff`), empty = use init block.
+- `mac` (string): MAC override (`aa:bb:cc:dd:ee:ff`), empty = device default.
 - `promisc` (bool): enable promiscuous capture (default true).
-- `rx_slots` / `tx_slots` (unsigned): ring slots (power of two). `0` means use init block length.
+- `rx_slots` / `tx_slots` (unsigned): ring scan limit per poll (0 = default 32).
 - `base_addr`, `intr_vector`, `intr_level`, `priority_slot`: normal qunibus device params.
 
 ## Quickstart (QBUS / 2.11BSD)
@@ -33,10 +36,10 @@ The runtime uses the device parameter interface (menu `p` command) to configure 
 
 ## Limitations (MVP)
 
-- RX/TX assumes single-buffer frames (STP|ENP only).
-- No multicast filter emulation; promisc is recommended.
-- Minimal CSR3 handling.
+- Single-buffer frames only; chaining is handled only for ring wrap.
+- Multicast filter emulation not implemented; promisc is recommended.
+- Minimal error/loopback semantics.
 
 ## Debugging
 
-Set `trace=1` to log init/ring events.
+Set `trace=1` to log register and ring events.

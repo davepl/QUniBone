@@ -1,6 +1,6 @@
 /*
  * Author: Dave Plummer (davepl@davepl.com)
- * (c) 2025 Plummer's Software LLC
+ * (c) 2026 Plummer's Software LLC
  * Contributed under the GPL2 License
  */
 
@@ -16,7 +16,6 @@
 #include "qunibus.h"
 #include "qunibusadapter.hpp"
 #include "delqa.hpp"
-#include "ring_lance.h"
 
 #if !defined(QBUS)
 #error "DELQA is a QBUS-only device"
@@ -24,6 +23,8 @@
 
 // Maximum Ethernet frame size (excluding preamble/CRC added by hardware)
 static const size_t DELQA_MAX_FRAME_SIZE = 1518;
+static const unsigned DELQA_DEFAULT_SCAN = 32;
+static const unsigned DELQA_RX_START_DELAY_MS = 1;
 
 static uint8_t word_low(uint16_t w)
 {
@@ -46,28 +47,67 @@ delqa_c::delqa_c() : qunibusdevice_c()
     set_default_bus_params(DELQA_DEFAULT_ADDR, DELQA_DEFAULT_SLOT, DELQA_DEFAULT_VECTOR,
             DELQA_DEFAULT_LEVEL);
 
-    register_count = 3;
+    register_count = 8;
 
-    reg_rdp = &(this->registers[0]);
-    strcpy(reg_rdp->name, "RDP");
-    reg_rdp->active_on_dati = false;
-    reg_rdp->active_on_dato = true;
-    reg_rdp->reset_value = 0;
-    reg_rdp->writable_bits = 0xffff;
+    reg_sta_addr[0] = &(this->registers[0]);
+    strcpy(reg_sta_addr[0]->name, "STA0");
+    reg_sta_addr[0]->active_on_dati = false;
+    reg_sta_addr[0]->active_on_dato = false;
+    reg_sta_addr[0]->reset_value = 0;
+    reg_sta_addr[0]->writable_bits = 0x0000;
 
-    reg_rap = &(this->registers[1]);
-    strcpy(reg_rap->name, "RAP");
-    reg_rap->active_on_dati = false;
-    reg_rap->active_on_dato = true;
-    reg_rap->reset_value = 0;
-    reg_rap->writable_bits = 0xffff;
+    reg_sta_addr[1] = &(this->registers[1]);
+    strcpy(reg_sta_addr[1]->name, "STA1");
+    reg_sta_addr[1]->active_on_dati = false;
+    reg_sta_addr[1]->active_on_dato = false;
+    reg_sta_addr[1]->reset_value = 0;
+    reg_sta_addr[1]->writable_bits = 0x0000;
 
-    reg_rst = &(this->registers[2]);
-    strcpy(reg_rst->name, "RST");
-    reg_rst->active_on_dati = false;
-    reg_rst->active_on_dato = true;
-    reg_rst->reset_value = 0;
-    reg_rst->writable_bits = 0xffff;
+    reg_rcvlist_lo = &(this->registers[2]);
+    strcpy(reg_rcvlist_lo->name, "RCLL");
+    reg_rcvlist_lo->active_on_dati = false;
+    reg_rcvlist_lo->active_on_dato = true;
+    reg_rcvlist_lo->reset_value = 0;
+    reg_rcvlist_lo->writable_bits = 0xffff;
+    reg_sta_addr[2] = reg_rcvlist_lo;
+
+    reg_rcvlist_hi = &(this->registers[3]);
+    strcpy(reg_rcvlist_hi->name, "RCLH");
+    reg_rcvlist_hi->active_on_dati = false;
+    reg_rcvlist_hi->active_on_dato = true;
+    reg_rcvlist_hi->reset_value = 0;
+    reg_rcvlist_hi->writable_bits = 0xffff;
+    reg_sta_addr[3] = reg_rcvlist_hi;
+
+    reg_xmtlist_lo = &(this->registers[4]);
+    strcpy(reg_xmtlist_lo->name, "XMTL");
+    reg_xmtlist_lo->active_on_dati = false;
+    reg_xmtlist_lo->active_on_dato = true;
+    reg_xmtlist_lo->reset_value = 0;
+    reg_xmtlist_lo->writable_bits = 0xffff;
+    reg_sta_addr[4] = reg_xmtlist_lo;
+
+    reg_xmtlist_hi = &(this->registers[5]);
+    strcpy(reg_xmtlist_hi->name, "XMTH");
+    reg_xmtlist_hi->active_on_dati = false;
+    reg_xmtlist_hi->active_on_dato = true;
+    reg_xmtlist_hi->reset_value = 0;
+    reg_xmtlist_hi->writable_bits = 0xffff;
+    reg_sta_addr[5] = reg_xmtlist_hi;
+
+    reg_vector = &(this->registers[6]);
+    strcpy(reg_vector->name, "VECTOR");
+    reg_vector->active_on_dati = false;
+    reg_vector->active_on_dato = true;
+    reg_vector->reset_value = 0;
+    reg_vector->writable_bits = 0xffff;
+
+    reg_csr = &(this->registers[7]);
+    strcpy(reg_csr->name, "CSR");
+    reg_csr->active_on_dati = false;
+    reg_csr->active_on_dato = true;
+    reg_csr->reset_value = 0;
+    reg_csr->writable_bits = 0xffff;
 
     ifname.value = "eth0";
     mac.value = "";
@@ -75,6 +115,13 @@ delqa_c::delqa_c() : qunibusdevice_c()
     rx_slots.value = 32;
     tx_slots.value = 32;
     trace.value = false;
+
+    mac_addr[0] = 0x08;
+    mac_addr[1] = 0x00;
+    mac_addr[2] = 0x2b;
+    mac_addr[3] = 0xaa;
+    mac_addr[4] = 0xbb;
+    mac_addr[5] = 0xcc;
 
     reset_controller();
 }
@@ -84,11 +131,6 @@ delqa_c::~delqa_c()
 #ifdef HAVE_PCAP
     pcap.close();
 #endif
-}
-
-bool delqa_c::is_power_of_two(unsigned val)
-{
-    return val && ((val & (val - 1)) == 0);
 }
 
 bool delqa_c::parse_mac(const std::string &text, uint8_t out[6])
@@ -120,25 +162,21 @@ bool delqa_c::on_param_changed(parameter_c *param)
     } else if (param == &mac) {
         if (mac.new_value.empty()) {
             mac_override = false;
-            memset(mac_addr, 0, sizeof(mac_addr));
+            mac_addr[0] = 0x08;
+            mac_addr[1] = 0x00;
+            mac_addr[2] = 0x2b;
+            mac_addr[3] = 0xaa;
+            mac_addr[4] = 0xbb;
+            mac_addr[5] = 0xcc;
         } else if (!parse_mac(mac.new_value, mac_addr)) {
             ERROR("DELQA: invalid MAC format '%s'", mac.new_value.c_str());
             return false;
         } else {
             mac_override = true;
         }
-    } else if (param == &rx_slots) {
-        unsigned val = rx_slots.new_value;
-        if (val != 0 && !is_power_of_two(val)) {
-            ERROR("DELQA: rx_slots must be power-of-two or 0 (auto)");
-            return false;
-        }
-    } else if (param == &tx_slots) {
-        unsigned val = tx_slots.new_value;
-        if (val != 0 && !is_power_of_two(val)) {
-            ERROR("DELQA: tx_slots must be power-of-two or 0 (auto)");
-            return false;
-        }
+        update_mac_checksum();
+        if (handle)
+            update_station_regs();
     }
 
     return qunibusdevice_c::on_param_changed(param);
@@ -167,8 +205,16 @@ bool delqa_c::on_before_install(void)
     rx_slots.readonly = true;
     tx_slots.readonly = true;
 
+    update_transceiver_bits();
+    update_csr_reg();
+
     return true;
 #endif
+}
+
+void delqa_c::on_after_install(void)
+{
+    reset_controller();
 }
 
 void delqa_c::on_after_uninstall(void)
@@ -182,6 +228,9 @@ void delqa_c::on_after_uninstall(void)
     promisc.readonly = false;
     rx_slots.readonly = false;
     tx_slots.readonly = false;
+
+    update_transceiver_bits();
+    update_csr_reg();
 }
 
 void delqa_c::on_power_changed(signal_edge_enum aclo_edge, signal_edge_enum dclo_edge)
@@ -201,21 +250,23 @@ void delqa_c::reset_controller(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
-    csr_sel = 0;
-    csr0 = DELQA_CSR0_STOP;
-    csr1 = 0;
-    csr2 = 0;
-    csr3 = 0;
+    rcvlist_lo = 0;
+    rcvlist_hi = 0;
+    xmtlist_lo = 0;
+    xmtlist_hi = 0;
+    qe_vector = intr_vector.value & QE_VEC_IV;
+    qe_csr = QE_XL_INVALID | QE_RL_INVALID;
 
-    rx_ring.base_addr = 0;
-    rx_ring.slots = 0;
-    rx_ring.index = 0;
-    tx_ring.base_addr = 0;
-    tx_ring.slots = 0;
-    tx_ring.index = 0;
+    update_transceiver_bits();
 
-    started = false;
-    init_done = false;
+    rcvlist_addr = 0;
+    xmtlist_addr = 0;
+    rx_cur_addr = 0;
+    tx_cur_addr = 0;
+
+    deqna_lock = false;
+    rx_delay_active = false;
+    rx_enable_deadline_ns = 0;
 
     // Reset statistics
     rx_frames = 0;
@@ -227,71 +278,108 @@ void delqa_c::reset_controller(void)
     stat_rx_errors.value = 0;
     stat_tx_errors.value = 0;
 
+    update_mac_checksum();
+
     intr_request.edge_detect_reset();
+    intr_request.set_vector(qe_vector & QE_VEC_IV);
 
     if (handle) {
         reset_unibus_registers();
-        update_rdp();
-        update_rap();
+        update_station_regs();
+        update_vector_reg();
+        update_csr_reg();
         update_intr();
     }
 }
 
-void delqa_c::update_rdp(void)
+void delqa_c::update_mac_checksum(void)
 {
-    if (!handle)
-        return;
+    uint32_t checksum = 0;
+    const uint32_t wmask = 0xffff;
 
-    uint16_t val = 0;
-    switch (csr_sel & 0x3) {
-    case 0:
-        val = csr0;
-        break;
-    case 1:
-        val = csr1;
-        break;
-    case 2:
-        val = csr2;
-        break;
-    case 3:
-        val = csr3;
-        break;
-    default:
-        val = 0;
-        break;
+    for (size_t i = 0; i < 6; i += 2) {
+        checksum <<= 1;
+        if (checksum > wmask)
+            checksum -= wmask;
+        checksum += (static_cast<uint32_t>(mac_addr[i]) << 8) | mac_addr[i + 1];
+        if (checksum > wmask)
+            checksum -= wmask;
     }
+    if (checksum == wmask)
+        checksum = 0;
 
-    set_register_dati_value(reg_rdp, val, "update_rdp");
+    mac_checksum[0] = static_cast<uint8_t>(checksum);
+    mac_checksum[1] = static_cast<uint8_t>(checksum >> 8);
 }
 
-void delqa_c::update_rap(void)
+void delqa_c::update_station_regs(void)
 {
     if (!handle)
         return;
-    set_register_dati_value(reg_rap, csr_sel & 0x3, "update_rap");
+
+    for (int i = 0; i < 6; ++i) {
+        uint8_t value = mac_addr[i];
+        if (i < 2 && (qe_csr & QE_ELOOP))
+            value = mac_checksum[i];
+        uint16_t word = static_cast<uint16_t>(0xff00 | value);
+        set_register_dati_value(reg_sta_addr[i], word, "update_station_regs");
+    }
+}
+
+void delqa_c::update_vector_reg(void)
+{
+    if (!handle)
+        return;
+    set_register_dati_value(reg_vector, qe_vector, "update_vector_reg");
+}
+
+void delqa_c::update_csr_reg(void)
+{
+    if (!handle)
+        return;
+    set_register_dati_value(reg_csr, qe_csr, "update_csr_reg");
+}
+
+void delqa_c::update_transceiver_bits(void)
+{
+#ifdef HAVE_PCAP
+    if (pcap.is_open())
+        qe_csr |= QE_OK;
+    else
+        qe_csr &= ~QE_OK;
+#else
+    qe_csr &= ~QE_OK;
+#endif
+
+    if ((qe_csr & QE_RCV_ENABLE) && (qe_csr & QE_OK))
+        qe_csr |= QE_CARRIER;
+    else
+        qe_csr &= ~QE_CARRIER;
 }
 
 bool delqa_c::get_intr_level(void) const
 {
-    if (!(csr0 & DELQA_CSR0_INEA))
+    if (!(qe_csr & QE_INT_ENABLE))
         return false;
-    return (csr0 & (DELQA_CSR0_IDON | DELQA_CSR0_TINT | DELQA_CSR0_RINT | DELQA_CSR0_ERR));
+    return (qe_csr & (QE_RCV_INT | QE_XMIT_INT | QE_NEX_MEM_INT)) != 0;
 }
 
 void delqa_c::update_intr(void)
 {
     bool level = get_intr_level();
 
-    if (level)
-        csr0 |= DELQA_CSR0_INTR;
-    else
-        csr0 &= ~DELQA_CSR0_INTR;
-
     switch (intr_request.edge_detect(level)) {
     case intr_request_c::INTERRUPT_EDGE_RAISING:
+        if (trace.value) {
+            INFO("DELQA: INTR assert, csr=%06o vec=%03o level=%d",
+                 qe_csr, intr_request.get_vector(), intr_request.get_level());
+        }
         qunibusadapter->INTR(intr_request, nullptr, 0);
         break;
     case intr_request_c::INTERRUPT_EDGE_FALLING:
+        if (trace.value) {
+            INFO("DELQA: INTR deassert, csr=%06o", qe_csr);
+        }
         qunibusadapter->cancel_INTR(intr_request);
         break;
     default:
@@ -299,145 +387,72 @@ void delqa_c::update_intr(void)
     }
 }
 
-void delqa_c::handle_stop(void)
+void delqa_c::start_rx_delay(void)
 {
-    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-    started = false;
-    csr0 &= ~(DELQA_CSR0_STRT | DELQA_CSR0_INIT | DELQA_CSR0_TDMD | DELQA_CSR0_RXON | DELQA_CSR0_TXON);
-    csr0 |= DELQA_CSR0_STOP;
-    csr0 &= ~(DELQA_CSR0_IDON | DELQA_CSR0_TINT | DELQA_CSR0_RINT | DELQA_CSR0_ERR | DELQA_CSR0_INTR);
-
-    update_intr();
-    update_rdp();
+    rx_delay_active = true;
+    rx_enable_deadline_ns = timeout_c::abstime_ns() +
+            static_cast<uint64_t>(DELQA_RX_START_DELAY_MS) * 1000000ull;
 }
 
-void delqa_c::handle_start(void)
+bool delqa_c::rx_ready(void)
 {
-    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-    if (!init_done) {
-        csr0 |= DELQA_CSR0_ERR;
-        update_intr();
-        update_rdp();
-        return;
+    if (!rcv_enabled())
+        return false;
+    if (!rx_delay_active)
+        return true;
+    if (timeout_c::abstime_ns() >= rx_enable_deadline_ns) {
+        rx_delay_active = false;
+        return true;
     }
-
-    started = true;
-    csr0 &= ~(DELQA_CSR0_STOP | DELQA_CSR0_INIT | DELQA_CSR0_TDMD);
-    csr0 |= (DELQA_CSR0_STRT | DELQA_CSR0_RXON | DELQA_CSR0_TXON);
-
-    update_intr();
-    update_rdp();
+    return false;
 }
 
-void delqa_c::handle_init(void)
+bool delqa_c::loopback_enabled(void) const
 {
-    uint16_t init_words[12];
-    uint32_t init_addr;
-    uint16_t csr1_local = 0;
-    uint16_t csr2_local = 0;
+    return (qe_csr & QE_ELOOP) || !(qe_csr & QE_ILOOP);
+}
 
-    {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        started = false;
-        init_done = false;
-        csr0 &= ~(DELQA_CSR0_STRT | DELQA_CSR0_TDMD | DELQA_CSR0_RXON | DELQA_CSR0_TXON | DELQA_CSR0_INTR);
-        csr0 |= DELQA_CSR0_INIT;
-        csr1_local = csr1;
-        csr2_local = csr2;
-    }
+uint32_t delqa_c::make_addr(uint16_t hi, uint16_t lo) const
+{
+    return (static_cast<uint32_t>(hi & QE_RING_ADDR_HI_MASK) << 16) | lo;
+}
 
-    init_addr = (static_cast<uint32_t>(csr2_local) << 16) | csr1_local;
-    init_addr <<= 1; // word to byte address
+uint32_t delqa_c::next_desc_addr(uint32_t addr) const
+{
+    return addr + QE_RING_BYTES;
+}
 
-    if (!dma_read_words(init_addr, init_words, 12)) {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        csr0 |= DELQA_CSR0_ERR;
-        update_intr();
-        update_rdp();
-        return;
-    }
+void delqa_c::set_nxm_error(void)
+{
+    qe_csr |= QE_NEX_MEM_INT;
+    update_csr_reg();
+    update_intr();
+}
 
-    qe_init_block_t blk;
-    memset(&blk, 0, sizeof(blk));
-    blk.mode = init_words[0];
-    blk.padr[0] = init_words[1];
-    blk.padr[1] = init_words[2];
-    blk.padr[2] = init_words[3];
-    blk.ladr[0] = init_words[4];
-    blk.ladr[1] = init_words[5];
-    blk.ladr[2] = init_words[6];
-    blk.ladr[3] = init_words[7];
-    blk.rrd_lo = init_words[8];
-    blk.rrd_hi = init_words[9];
-    blk.trd_lo = init_words[10];
-    blk.trd_hi = init_words[11];
+bool delqa_c::rcv_enabled(void) const
+{
+    if (!(qe_csr & QE_RCV_ENABLE))
+        return false;
+    if (qe_csr & QE_RL_INVALID)
+        return false;
+    return (rcvlist_addr != 0);
+}
 
-    uint8_t init_mac[6];
-    init_mac[0] = word_low(blk.padr[0]);
-    init_mac[1] = word_high(blk.padr[0]);
-    init_mac[2] = word_low(blk.padr[1]);
-    init_mac[3] = word_high(blk.padr[1]);
-    init_mac[4] = word_low(blk.padr[2]);
-    init_mac[5] = word_high(blk.padr[2]);
+bool delqa_c::xmt_enabled(void) const
+{
+    if (qe_csr & QE_XL_INVALID)
+        return false;
+    return (xmtlist_addr != 0);
+}
 
-    if (!mac_override) {
-        memcpy(mac_addr, init_mac, sizeof(mac_addr));
-    }
+unsigned delqa_c::rx_scan_limit(void) const
+{
+    return rx_slots.value ? rx_slots.value : DELQA_DEFAULT_SCAN;
+}
 
-    uint16_t rlen_code = (blk.rrd_hi >> 13) & 0x7;
-    uint16_t tlen_code = (blk.trd_hi >> 13) & 0x7;
-    uint16_t rx_count = static_cast<uint16_t>(1u << (rlen_code + 1));
-    uint16_t tx_count = static_cast<uint16_t>(1u << (tlen_code + 1));
-
-    if (rx_slots.value != 0 && rx_slots.value != rx_count) {
-        WARNING("DELQA: init RX ring size %u differs from config %u", rx_count, rx_slots.value);
-        rx_count = rx_slots.value;
-    }
-    if (tx_slots.value != 0 && tx_slots.value != tx_count) {
-        WARNING("DELQA: init TX ring size %u differs from config %u", tx_count, tx_slots.value);
-        tx_count = tx_slots.value;
-    }
-
-    uint32_t rx_addr = (static_cast<uint32_t>(blk.rrd_hi & DELQA_DESC_ADDR_HI_MASK) << 16) | blk.rrd_lo;
-    uint32_t tx_addr = (static_cast<uint32_t>(blk.trd_hi & DELQA_DESC_ADDR_HI_MASK) << 16) | blk.trd_lo;
-    rx_addr <<= 1;
-    tx_addr <<= 1;
-
-    if ((rx_addr + static_cast<uint32_t>(rx_count) * DELQA_DESC_BYTES > qunibus->addr_space_byte_count)
-            || (tx_addr + static_cast<uint32_t>(tx_count) * DELQA_DESC_BYTES
-                > qunibus->addr_space_byte_count)) {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        csr0 |= DELQA_CSR0_ERR;
-        update_intr();
-        update_rdp();
-        return;
-    }
-
-    {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
-
-        rx_ring.base_addr = rx_addr;
-        rx_ring.slots = rx_count;
-        rx_ring.index = 0;
-
-        tx_ring.base_addr = tx_addr;
-        tx_ring.slots = tx_count;
-        tx_ring.index = 0;
-
-        init_done = true;
-        csr0 &= ~DELQA_CSR0_INIT;
-        csr0 |= DELQA_CSR0_IDON;
-
-        update_intr();
-        update_rdp();
-    }
-
-    if (trace.value) {
-        INFO("DELQA: init MAC %02x:%02x:%02x:%02x:%02x:%02x", mac_addr[0], mac_addr[1],
-             mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-        INFO("DELQA: rx ring @ %s slots=%u, tx ring @ %s slots=%u", qunibus->addr2text(rx_addr),
-             rx_count, qunibus->addr2text(tx_addr), tx_count);
-    }
+unsigned delqa_c::tx_scan_limit(void) const
+{
+    return tx_slots.value ? tx_slots.value : DELQA_DEFAULT_SCAN;
 }
 
 void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
@@ -449,52 +464,115 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
 
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
+    uint16_t val = get_register_dato_value(device_reg);
+
     switch (device_reg->index) {
-    case 0: { // RDP
-        uint16_t val = get_register_dato_value(reg_rdp);
-        if ((csr_sel & 0x3) == 0) {
-            if (trace.value) {
-                INFO("DELQA: CSR0 write %06o", val);
-            }
-            if (val & DELQA_CSR0_STOP)
-                handle_stop();
-            if (val & DELQA_CSR0_INIT)
-                handle_init();
-            if (val & DELQA_CSR0_STRT)
-                handle_start();
-
-            if (val & DELQA_CSR0_INEA)
-                csr0 |= DELQA_CSR0_INEA;
-            else
-                csr0 &= ~DELQA_CSR0_INEA;
-
-            csr0 &= ~(val & DELQA_CSR0_CLEAR_BITS);
-
-            update_intr();
-            update_rdp();
-        } else if ((csr_sel & 0x3) == 1) {
-            csr1 = val;
-            update_rdp();
-        } else if ((csr_sel & 0x3) == 2) {
-            csr2 = val;
-            update_rdp();
-        } else if ((csr_sel & 0x3) == 3) {
-            csr3 = val;
-            update_rdp();
+    case DELQA_REG_RCVLIST_LO:
+        rcvlist_lo = val;
+        rcvlist_addr = make_addr(rcvlist_hi, static_cast<uint16_t>(rcvlist_lo & ~1u));
+        if (rcvlist_addr == 0 || rcvlist_addr >= qunibus->addr_space_byte_count) {
+            qe_csr |= QE_RL_INVALID;
+            rx_cur_addr = 0;
+        } else {
+            qe_csr &= ~QE_RL_INVALID;
+            rx_cur_addr = rcvlist_addr;
         }
+        update_csr_reg();
+        update_intr();
+        break;
+    case DELQA_REG_RCVLIST_HI:
+        rcvlist_hi = val;
+        rcvlist_addr = make_addr(rcvlist_hi, static_cast<uint16_t>(rcvlist_lo & ~1u));
+        if (rcvlist_addr == 0 || rcvlist_addr >= qunibus->addr_space_byte_count) {
+            qe_csr |= QE_RL_INVALID;
+            rx_cur_addr = 0;
+        } else {
+            qe_csr &= ~QE_RL_INVALID;
+            rx_cur_addr = rcvlist_addr;
+        }
+        update_csr_reg();
+        update_intr();
+        break;
+    case DELQA_REG_XMTLIST_LO:
+        xmtlist_lo = val;
+        xmtlist_addr = make_addr(xmtlist_hi, static_cast<uint16_t>(xmtlist_lo & ~1u));
+        if (xmtlist_addr == 0 || xmtlist_addr >= qunibus->addr_space_byte_count) {
+            qe_csr |= QE_XL_INVALID;
+            tx_cur_addr = 0;
+        } else {
+            qe_csr &= ~QE_XL_INVALID;
+            tx_cur_addr = xmtlist_addr;
+        }
+        update_csr_reg();
+        update_intr();
+        break;
+    case DELQA_REG_XMTLIST_HI:
+        xmtlist_hi = val;
+        xmtlist_addr = make_addr(xmtlist_hi, static_cast<uint16_t>(xmtlist_lo & ~1u));
+        if (xmtlist_addr == 0 || xmtlist_addr >= qunibus->addr_space_byte_count) {
+            qe_csr |= QE_XL_INVALID;
+            tx_cur_addr = 0;
+        } else {
+            qe_csr &= ~QE_XL_INVALID;
+            tx_cur_addr = xmtlist_addr;
+        }
+        update_csr_reg();
+        update_intr();
+        break;
+    case DELQA_REG_VECTOR: {
+        uint16_t old_vec = qe_vector;
+        uint16_t new_vec;
+        if (deqna_lock)
+            new_vec = (qe_vector & QE_VEC_RO) | (val & (QE_VEC_IV | QE_VEC_ID));
+        else
+            new_vec = (qe_vector & QE_VEC_RO) | (val & QE_VEC_RW);
+
+        if ((old_vec ^ new_vec) & QE_VEC_MS) {
+            if (!(new_vec & QE_VEC_MS)) {
+                deqna_lock = true;
+                new_vec &= ~(QE_VEC_OS | QE_VEC_RS | QE_VEC_ST);
+            } else {
+                deqna_lock = false;
+            }
+        }
+
+        if (new_vec & QE_VEC_RS)
+            new_vec &= ~QE_VEC_RS;
+
+        qe_vector = new_vec;
+        update_vector_reg();
+        intr_request.set_vector(qe_vector & QE_VEC_IV);
         break;
     }
-    case 1: { // RAP
-        uint16_t val = get_register_dato_value(reg_rap);
-        csr_sel = val & 0x3;
-        update_rap();
-        update_rdp();
+    case DELQA_REG_CSR: {
+        uint16_t prev = qe_csr;
+        if ((prev & QE_RESET) && !(val & QE_RESET)) {
+            reset_controller();
+            return;
+        }
+
+        uint16_t set_bits = val & QE_CSR_RW;
+        uint16_t clr_bits = (~val & QE_CSR_RW) | (val & QE_CSR_W1);
+        if (val & QE_XMIT_INT)
+            clr_bits |= QE_NEX_MEM_INT;
+
+        qe_csr = (qe_csr | set_bits) & ~clr_bits;
+
+        if ((prev ^ qe_csr) & QE_RCV_ENABLE) {
+            if (qe_csr & QE_RCV_ENABLE)
+                start_rx_delay();
+            else
+                rx_delay_active = false;
+        }
+
+        if ((prev ^ qe_csr) & QE_ELOOP)
+            update_station_regs();
+
+        update_transceiver_bits();
+        update_csr_reg();
+        update_intr();
         break;
     }
-    case 2: // RST
-        handle_stop();
-        reset_controller();
-        break;
     default:
         break;
     }
@@ -582,160 +660,319 @@ bool delqa_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     return true;
 }
 
-bool delqa_c::read_descriptor(uint32_t addr, uint16_t words[DELQA_DESC_WORDS])
+bool delqa_c::read_descriptor(uint32_t addr, uint16_t words[QE_RING_WORDS])
 {
-    return dma_read_words(addr, words, DELQA_DESC_WORDS);
+    return dma_read_words(addr, words, QE_RING_WORDS);
 }
 
-bool delqa_c::write_descriptor(uint32_t addr, const uint16_t words[DELQA_DESC_WORDS])
+bool delqa_c::write_descriptor(uint32_t addr, const uint16_t words[QE_RING_WORDS])
 {
-    return dma_write_words(addr, words, DELQA_DESC_WORDS);
+    return dma_write_words(addr, words, QE_RING_WORDS);
 }
 
 bool delqa_c::rx_place_frame(const uint8_t *data, size_t len)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
-    if (!started || !init_done || rx_ring.slots == 0)
+    if (!rcv_enabled())
         return false;
 
-    uint16_t slots = rx_ring.slots;
-    uint16_t mask = slots - 1;
+    uint32_t desc_addr = rx_cur_addr ? rx_cur_addr : rcvlist_addr;
+    if (!desc_addr)
+        return false;
 
-    for (uint16_t i = 0; i < slots; ++i) {
-        uint16_t idx = (rx_ring.index + i) & mask;
-        uint32_t desc_addr = rx_ring.base_addr + static_cast<uint32_t>(idx) * DELQA_DESC_BYTES;
-        uint16_t words[DELQA_DESC_WORDS];
+    size_t total_len = len < 60 ? 60 : len;
+    size_t remaining = total_len;
+    size_t offset = 0;
+    unsigned limit = rx_scan_limit();
+    bool any_written = false;
+    bool error = false;
+
+    uint16_t rbl_total = (len >= 60) ? static_cast<uint16_t>(len - 60) : 0;
+
+    while (remaining > 0 && limit--) {
+        uint16_t words[QE_RING_WORDS];
         if (!read_descriptor(desc_addr, words)) {
-            csr0 |= DELQA_CSR0_ERR | DELQA_CSR0_RINT;
-            update_intr();
-            update_rdp();
+            set_nxm_error();
             return false;
         }
 
-        if (!(words[1] & DELQA_DESC_OWN))
-            continue;
-
-        uint32_t buf_addr = (static_cast<uint32_t>(words[1] & DELQA_DESC_ADDR_HI_MASK) << 16)
-                | words[0];
-        buf_addr <<= 1;
-        uint16_t buf_len = static_cast<uint16_t>(-static_cast<int16_t>(words[2]));
-        buf_len &= 0x0fff;
-
-        bool error = false;
-        if (buf_len == 0 || len > buf_len) {
-            error = true;
-        } else if (!dma_write_bytes(buf_addr, data, len)) {
-            error = true;
+        uint16_t addr_hi = words[1];
+        if (!(addr_hi & QE_RING_VALID)) {
+            qe_csr |= QE_RL_INVALID;
+            update_csr_reg();
+            update_intr();
+            return false;
         }
 
-        uint16_t addr_bits = words[1] & DELQA_DESC_ADDR_HI_MASK;
-        uint16_t new_w1 = addr_bits | DELQA_DESC_STP | DELQA_DESC_ENP;
-        if (error)
-            new_w1 |= DELQA_DESC_ERR | DELQA_DESC_BUF;
-        words[1] = new_w1;
-        words[3] = error ? 0 : static_cast<uint16_t>(len);
+        if (addr_hi & QE_RING_CHAIN) {
+            uint32_t next_addr = make_addr(addr_hi, words[2]);
+            if (next_addr == 0 || next_addr >= qunibus->addr_space_byte_count) {
+                qe_csr |= QE_RL_INVALID;
+                update_csr_reg();
+                update_intr();
+                return false;
+            }
+            rx_cur_addr = next_addr;
+            desc_addr = next_addr;
+            continue;
+        }
+
+        if (words[4] != QE_NOTYET) {
+            desc_addr = next_desc_addr(desc_addr);
+            continue;
+        }
+
+        uint32_t buf_addr = make_addr(addr_hi, words[2]);
+        int16_t buf_words = static_cast<int16_t>(words[3]);
+
+        if (buf_words >= 0) {
+            error = true;
+        } else {
+            size_t buf_bytes = static_cast<size_t>(-buf_words) * 2;
+            size_t addr_offset = 0;
+            if (addr_hi & QE_RING_ODD_BEGIN) {
+                addr_offset = 1;
+                if (buf_bytes)
+                    buf_bytes--;
+            }
+            if (addr_hi & QE_RING_ODD_END) {
+                if (buf_bytes)
+                    buf_bytes--;
+            }
+
+            size_t chunk = std::min(remaining, buf_bytes);
+            if (chunk == 0) {
+                error = true;
+            } else {
+                size_t data_avail = 0;
+                if (offset < len)
+                    data_avail = std::min(len - offset, chunk);
+
+                if (data_avail) {
+                    if (!dma_write_bytes(buf_addr + addr_offset, data + offset, data_avail)) {
+                        error = true;
+                        set_nxm_error();
+                    }
+                }
+
+                if (!error && chunk > data_avail) {
+                    uint8_t pad[60] = {0};
+                    size_t pad_len = chunk - data_avail;
+                    if (!dma_write_bytes(buf_addr + addr_offset + data_avail, pad, pad_len)) {
+                        error = true;
+                        set_nxm_error();
+                    }
+                }
+
+                remaining -= chunk;
+                offset += chunk;
+            }
+        }
+
+        uint16_t status1 = 0;
+        uint16_t status2 = 0;
+        if (error) {
+            status1 = QE_RST_LASTERR;
+        } else {
+            status1 = QE_RST_RSVD | (rbl_total & 0x0700);
+            if (remaining > 0)
+                status1 |= QE_RST_LASTNOT;
+        }
+
+        status2 = static_cast<uint16_t>(rbl_total & 0x00ff);
+        status2 = static_cast<uint16_t>((status2 << 8) | status2);
+
+        words[0] = 0xffff;
+        words[4] = status1;
+        words[5] = status2;
 
         if (!write_descriptor(desc_addr, words)) {
-            csr0 |= DELQA_CSR0_ERR;
+            set_nxm_error();
             error = true;
         }
 
-        rx_ring.index = (idx + 1) & mask;
+        any_written = true;
+        rx_cur_addr = next_desc_addr(desc_addr);
+        desc_addr = rx_cur_addr;
 
-        csr0 |= DELQA_CSR0_RINT;
-        if (error) {
-            csr0 |= DELQA_CSR0_ERR;
-            rx_errors++;
-            stat_rx_errors.value = rx_errors;
-        } else {
-            rx_frames++;
-            stat_rx_frames.value = rx_frames;
-        }
-
-        update_intr();
-        update_rdp();
-
-        if (trace.value) {
-            INFO("DELQA: RX desc %u len=%u %s", idx, static_cast<unsigned>(len),
-                 error ? "error" : "ok");
-        }
-        return !error;
+        if (error)
+            break;
     }
 
-    rx_errors++;
-    stat_rx_errors.value = rx_errors;
-    csr0 |= DELQA_CSR0_ERR | DELQA_CSR0_RINT;
+    if (!any_written)
+        return false;
+
+    qe_csr |= QE_RCV_INT;
+    if (error || remaining > 0) {
+        rx_errors++;
+        stat_rx_errors.value = rx_errors;
+    } else {
+        rx_frames++;
+        stat_rx_frames.value = rx_frames;
+    }
+
+    update_csr_reg();
     update_intr();
-    update_rdp();
-    return false;
+
+    if (trace.value) {
+        INFO("DELQA: RX len=%u %s", static_cast<unsigned>(len),
+             (error || remaining > 0) ? "error" : "ok");
+    }
+
+    return !(error || remaining > 0);
 }
 
 bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
-    if (!started || !init_done || tx_ring.slots == 0)
+    if (!xmt_enabled())
         return false;
 
-    uint16_t slots = tx_ring.slots;
-    uint16_t mask = slots - 1;
+    uint32_t desc_addr = tx_cur_addr ? tx_cur_addr : xmtlist_addr;
+    if (!desc_addr)
+        return false;
 
-    for (uint16_t i = 0; i < slots; ++i) {
-        uint16_t idx = (tx_ring.index + i) & mask;
-        uint32_t desc_addr = tx_ring.base_addr + static_cast<uint32_t>(idx) * DELQA_DESC_BYTES;
-        uint16_t words[DELQA_DESC_WORDS];
+    frame.clear();
+    unsigned limit = tx_scan_limit();
+    bool error = false;
+    bool eom_seen = false;
+    bool any_desc = false;
+    bool is_setup = false;
+
+    while (limit--) {
+        uint16_t words[QE_RING_WORDS];
         if (!read_descriptor(desc_addr, words)) {
-            csr0 |= DELQA_CSR0_ERR | DELQA_CSR0_TINT;
-            update_intr();
-            update_rdp();
+            set_nxm_error();
             return false;
         }
 
-        if (!(words[1] & DELQA_DESC_OWN))
+        uint16_t addr_hi = words[1];
+        if (!(addr_hi & QE_RING_VALID)) {
+            qe_csr |= QE_XL_INVALID;
+            update_csr_reg();
+            update_intr();
+            return false;
+        }
+
+        if (addr_hi & QE_RING_CHAIN) {
+            uint32_t next_addr = make_addr(addr_hi, words[2]);
+            if (next_addr == 0 || next_addr >= qunibus->addr_space_byte_count) {
+                qe_csr |= QE_XL_INVALID;
+                update_csr_reg();
+                update_intr();
+                return false;
+            }
+            tx_cur_addr = next_addr;
+            desc_addr = next_addr;
             continue;
+        }
 
-        bool error = false;
-        uint32_t buf_addr = (static_cast<uint32_t>(words[1] & DELQA_DESC_ADDR_HI_MASK) << 16)
-                | words[0];
-        buf_addr <<= 1;
+        if (words[4] != QE_NOTYET) {
+            desc_addr = next_desc_addr(desc_addr);
+            continue;
+        }
 
-        uint16_t len = static_cast<uint16_t>(-static_cast<int16_t>(words[2]));
-        len &= 0x0fff;
+        any_desc = true;
+        is_setup = is_setup || ((addr_hi & QE_RING_SETUP) != 0);
 
-        if ((words[1] & (DELQA_DESC_STP | DELQA_DESC_ENP)) != (DELQA_DESC_STP | DELQA_DESC_ENP)) {
-            error = true;
-        } else if (len == 0 || len > DELQA_MAX_FRAME_SIZE) {
+        uint32_t buf_addr = make_addr(addr_hi, words[2]);
+        int16_t buf_words = static_cast<int16_t>(words[3]);
+
+        if (buf_words >= 0) {
             error = true;
         } else {
-            frame.resize(len);
-            if (!dma_read_bytes(buf_addr, frame.data(), len)) {
+            size_t buf_bytes = static_cast<size_t>(-buf_words) * 2;
+            size_t addr_offset = 0;
+            if (addr_hi & QE_RING_ODD_BEGIN) {
+                addr_offset = 1;
+                if (buf_bytes)
+                    buf_bytes--;
+            }
+            if (addr_hi & QE_RING_ODD_END) {
+                if (buf_bytes)
+                    buf_bytes--;
+            }
+
+            if (buf_bytes == 0) {
                 error = true;
+            } else if (frame.size() + buf_bytes > DELQA_MAX_FRAME_SIZE) {
+                error = true;
+            } else {
+                size_t base = frame.size();
+                frame.resize(base + buf_bytes);
+                if (!dma_read_bytes(buf_addr + addr_offset, frame.data() + base, buf_bytes)) {
+                    error = true;
+                    set_nxm_error();
+                }
+            }
+        }
+
+        if (error)
+            eom_seen = true;
+        else
+            eom_seen = (addr_hi & QE_RING_EOMSG) != 0;
+
+        if (!eom_seen) {
+            words[0] = 0xffff;
+            words[4] = QE_RST_LASTNOT;
+            words[5] = 1;
+            if (!write_descriptor(desc_addr, words)) {
+                set_nxm_error();
+                error = true;
+                eom_seen = true;
+            }
+            tx_cur_addr = next_desc_addr(desc_addr);
+            desc_addr = tx_cur_addr;
+            continue;
+        }
+
+        bool loopback = is_setup || loopback_enabled();
+        if (!error) {
+            if (loopback) {
+                if (!rx_place_frame(frame.data(), frame.size()))
+                    error = true;
             }
 #ifdef HAVE_PCAP
-            else if (!pcap.send(frame.data(), len)) {
+            else if (!pcap.send(frame.data(), frame.size())) {
+                error = true;
+            }
+#else
+            else {
                 error = true;
             }
 #endif
         }
 
-        uint16_t addr_bits = words[1] & (DELQA_DESC_ADDR_HI_MASK | DELQA_DESC_STP | DELQA_DESC_ENP);
-        uint16_t new_w1 = addr_bits;
-        if (error)
-            new_w1 |= DELQA_DESC_ERR;
-        words[1] = new_w1;
-        words[3] = 0;
+        uint16_t status1 = 0;
+        uint16_t status2 = 0;
+        if (is_setup) {
+            process_setup_packet(frame);
+            status1 = 0x200c;
+            status2 = 0x0860;
+        } else if (loopback) {
+            status1 = error ? 0x4000 : 0x2000;
+            status2 = 1;
+        } else {
+            uint16_t tdr = static_cast<uint16_t>((100 + frame.size() * 8) & 0x03ff);
+            status1 = error ? 0x4000 : 0x0000;
+            status2 = tdr ? tdr : 1;
+        }
+
+        words[0] = 0xffff;
+        words[4] = status1;
+        words[5] = status2;
 
         if (!write_descriptor(desc_addr, words)) {
-            csr0 |= DELQA_CSR0_ERR;
+            set_nxm_error();
             error = true;
         }
 
-        tx_ring.index = (idx + 1) & mask;
+        tx_cur_addr = next_desc_addr(desc_addr);
 
-        csr0 |= DELQA_CSR0_TINT;
+        qe_csr |= QE_XMIT_INT;
         if (error) {
-            csr0 |= DELQA_CSR0_ERR;
             tx_errors++;
             stat_tx_errors.value = tx_errors;
         } else {
@@ -743,17 +980,62 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             stat_tx_frames.value = tx_frames;
         }
 
+        update_csr_reg();
         update_intr();
-        update_rdp();
 
         if (trace.value) {
-            INFO("DELQA: TX desc %u len=%u %s", idx, static_cast<unsigned>(len),
+            INFO("DELQA: TX len=%u %s", static_cast<unsigned>(frame.size()),
                  error ? "error" : "ok");
         }
         return true;
     }
 
-    return false;
+    return any_desc;
+}
+
+bool delqa_c::process_setup_packet(const std::vector<uint8_t> &frame)
+{
+    if (frame.size() < 128) {
+        // Small setup packets disable promiscuous/multicast modes
+        setup_promiscuous = false;
+        setup_multicast = false;
+        setup_valid = true;
+        return true;
+    }
+
+    // Clear existing MAC filters
+    memset(setup_macs, 0, sizeof(setup_macs));
+
+    // Extract MAC addresses from setup packet
+    // Format: bytes 1-6: MAC0, 9-14: MAC1, etc.
+    for (int i = 0; i < XQ_FILTER_MAX; i++) {
+        size_t offset = 1 + i * 8;
+        if (offset + 6 <= frame.size()) {
+            memcpy(setup_macs[i], &frame[offset], 6);
+        }
+    }
+
+    // Extract control flags from packet length
+    uint16_t len = static_cast<uint16_t>(frame.size());
+    setup_multicast = (len & 0x0001) != 0;
+    setup_promiscuous = (len & 0x0002) != 0;
+
+    setup_valid = true;
+
+    if (trace.value) {
+        INFO("DELQA: Setup packet processed: promisc=%d multicast=%d",
+             setup_promiscuous, setup_multicast);
+        for (int i = 0; i < XQ_FILTER_MAX; i++) {
+            if (setup_macs[i][0] || setup_macs[i][1] || setup_macs[i][2] ||
+                setup_macs[i][3] || setup_macs[i][4] || setup_macs[i][5]) {
+                INFO("DELQA: Setup MAC[%d]: %02x:%02x:%02x:%02x:%02x:%02x", i,
+                     setup_macs[i][0], setup_macs[i][1], setup_macs[i][2],
+                     setup_macs[i][3], setup_macs[i][4], setup_macs[i][5]);
+            }
+        }
+    }
+
+    return true;
 }
 
 void delqa_c::worker(unsigned instance)
@@ -776,7 +1058,11 @@ void delqa_c::worker_rx(void)
             timeout_c::wait_ms(1);
             continue;
         }
-        if (!started || qunibusadapter->line_INIT) {
+        if (qunibusadapter->line_INIT) {
+            timeout_c::wait_ms(1);
+            continue;
+        }
+        if (!rx_ready()) {
             timeout_c::wait_ms(1);
             continue;
         }
@@ -784,30 +1070,53 @@ void delqa_c::worker_rx(void)
         size_t len = 0;
         if (!pcap.poll(frame.data(), frame.size(), &len)) {
             WARNING("DELQA: pcap poll error: %s", pcap.last_error().c_str());
-            timeout_c::wait_ms(100);  // Longer wait on error
+            timeout_c::wait_ms(100);
             continue;
         }
 
         if (len == 0) {
-            timeout_c::wait_ms(1);  // Prevent busy-waiting on timeout
+            timeout_c::wait_ms(1);
             continue;
         }
 
-        // MAC filtering: accept broadcast, multicast, or frames matching our MAC
         if (len >= 6 && !promisc.value) {
             const uint8_t *dst = frame.data();
             bool broadcast = (dst[0] == 0xff && dst[1] == 0xff && dst[2] == 0xff &&
                               dst[3] == 0xff && dst[4] == 0xff && dst[5] == 0xff);
-            bool multicast = (dst[0] & 0x01) != 0;  // Multicast bit set
-            bool unicast_match = (memcmp(dst, mac_addr, 6) == 0);
-            if (!broadcast && !multicast && !unicast_match)
+            bool multicast = (dst[0] & 0x01) != 0;
+            
+            bool accept = broadcast;
+            
+            if (!accept && setup_valid) {
+                // Use setup packet MAC addresses for filtering
+                if (setup_promiscuous) {
+                    accept = true;
+                } else if (multicast && setup_multicast) {
+                    accept = true;
+                } else {
+                    // Check against setup MAC addresses
+                    for (int i = 0; i < XQ_FILTER_MAX; i++) {
+                        if (memcmp(dst, setup_macs[i], 6) == 0) {
+                            accept = true;
+                            break;
+                        }
+                    }
+                }
+            } else if (!accept) {
+                // Fall back to device MAC if no setup packet
+                bool unicast_match = (memcmp(dst, mac_addr, 6) == 0);
+                if (unicast_match) {
+                    accept = true;
+                }
+            }
+            
+            if (!accept)
                 continue;
         }
 
         rx_place_frame(frame.data(), len);
     }
 #else
-    // No pcap support - worker does nothing
     while (!workers_terminate) {
         timeout_c::wait_ms(100);
     }
@@ -826,7 +1135,7 @@ void delqa_c::worker_tx(void)
             timeout_c::wait_ms(1);
             continue;
         }
-        if (!started || qunibusadapter->line_INIT) {
+        if (qunibusadapter->line_INIT) {
             timeout_c::wait_ms(1);
             continue;
         }
@@ -836,7 +1145,6 @@ void delqa_c::worker_tx(void)
         }
     }
 #else
-    // No pcap support - worker does nothing
     while (!workers_terminate) {
         timeout_c::wait_ms(100);
     }

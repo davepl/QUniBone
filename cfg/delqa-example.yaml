@@ -1,0 +1,14 @@
+# Author: Dave Plummer (davepl@davepl.com)
+# (c) 2025 Plummer's Software LLC
+# Contributed under the GPL2 License
+
+devices:
+  - kind: delqa
+    name: qe0
+    csr: 0o17774440
+    vector: 0o154
+    mac: "52:54:00:12:34:56"
+    ifname: "eth0"
+    promisc: true
+    rx_slots: 32
+    tx_slots: 32
