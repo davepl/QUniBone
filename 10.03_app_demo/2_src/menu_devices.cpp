@@ -61,6 +61,7 @@
 #include "uda.hpp"
 #include "dl11w.hpp"
 #include "ke11.hpp"
+#include "delqa.hpp"
 #if defined(UNIBUS)
 #include "m9312.hpp"
 #endif
@@ -215,6 +216,9 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
     DL11b->mode.value = "8N1";
     DL11b->error_bits_enable.value = false ; // M7856 SW4-7 ?
     DL11b->break_enable.value = true ; // TU58 needs BREAK
+
+    // Create DELQA (QBUS Ethernet)
+    delqa_c *DELQA = new delqa_c();
 
     // to inject characters into DL11 receiver
     // only 1st SLU, use this for console
@@ -700,4 +704,3 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
     buslatches.output_enable(false);
     hardware_shutdown(); // stop PRU
 }
-

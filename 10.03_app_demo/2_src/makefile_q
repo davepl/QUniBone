@@ -25,6 +25,18 @@ PRUSS_INCLUDE_DIR = $(PRU_PACKAGE_ROOT)/include
 # ARM LIBRARIES
 PRUSS_DRV_LIB = $(PRU_PACKAGE_ROOT)/bin-bbb/libprussdrv.a
 
+# libpcap (optional)
+PCAP_CONFIG := $(shell command -v pcap-config 2>/dev/null)
+ifeq ($(PCAP_CONFIG),)
+PCAP_CFLAGS :=
+PCAP_LIBS :=
+PCAP_DEFS :=
+else
+PCAP_CFLAGS := $(shell pcap-config --cflags)
+PCAP_LIBS := $(shell pcap-config --libs)
+PCAP_DEFS := -DHAVE_PCAP
+endif
+
 # -static: do not use shared libs, include all code into the binary
 # (big binary, but BBB needs no shared libs of certain versions installed)
 # Example: demo binary goes from 594K to 12.3MB !
@@ -71,6 +83,9 @@ CCFLAGS= \
 	$(CCDEFS) $(CC_DBG_FLAGS) $(OS_CCDEFS)
 # OBJDIR in includes because of $(PRU_CODE)
 # no -std=c99
+
+CCFLAGS += $(PCAP_DEFS) $(PCAP_CFLAGS)
+LDFLAGS += $(PCAP_LIBS)
 
 
 # PRU program code library. Binaries as C arrays
@@ -120,6 +135,8 @@ OBJECTS = $(OBJDIR)/application.o	\
 	$(OBJDIR)/rs232.o \
 	$(OBJDIR)/rs232adapter.o \
 	$(OBJDIR)/dl11w.o \
+	$(OBJDIR)/delqa.o \
+	$(OBJDIR)/pcap_bridge.o \
 	$(OBJDIR)/storageimage.o	\
 	$(OBJDIR)/storagedrive.o	\
     $(OBJDIR)/storagecontroller.o	\
@@ -478,5 +495,3 @@ $(PRU1_CODE_LIST): $(PRU1_BASE_SRC_DIR)/*.h $(PRU1_BASE_SRC_DIR)/*.c $(SHARED_SR
 	$(MAKE) -C $(PRU1_BASE_SRC_DIR) $@
 	echo PRU1 codefile $@ created
 #	cp $(PRU_DEPLOY_DIR)/$(PRU0_CODE).[hc]
-
-
