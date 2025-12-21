@@ -219,6 +219,7 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
 
     // Create DELQA (QBUS Ethernet)
     delqa_c *DELQA = new delqa_c();
+    (void)DELQA;  // Suppress unused variable warning - device self-registers
 
     // to inject characters into DL11 receiver
     // only 1st SLU, use this for console

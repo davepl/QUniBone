@@ -325,6 +325,12 @@ $(OBJDIR)/rs232adapter.o :  $(DEVICE_SRC_DIR)/rs232adapter.cpp $(DEVICE_SRC_DIR)
 $(OBJDIR)/dl11w.o :  $(DEVICE_SRC_DIR)/dl11w.cpp $(DEVICE_SRC_DIR)/dl11w.hpp
 	$(CC) $(CCFLAGS) $< -o $@
 
+$(OBJDIR)/delqa.o :  $(DEVICE_SRC_DIR)/delqa.cpp $(DEVICE_SRC_DIR)/delqa.hpp $(DEVICE_SRC_DIR)/delqa_regs.h $(DEVICE_SRC_DIR)/ring_lance.h
+	$(CC) $(CCFLAGS) $< -o $@
+
+$(OBJDIR)/pcap_bridge.o :  $(DEVICE_SRC_DIR)/pcap_bridge.cpp $(DEVICE_SRC_DIR)/pcap_bridge.hpp
+	$(CC) $(CCFLAGS) $< -o $@
+
 $(OBJDIR)/storageimage.o :  $(DEVICE_SRC_DIR)/storageimage.cpp $(DEVICE_SRC_DIR)/storageimage.hpp
 	$(CC) $(CCFLAGS) $< -o $@
 
