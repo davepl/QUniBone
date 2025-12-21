@@ -45,8 +45,7 @@ delqa_c::delqa_c() : qunibusdevice_c()
     type_name.value = "DELQA";
     log_label = "delqa";
 
-    set_default_bus_params(DELQA_DEFAULT_ADDR, DELQA_DEFAULT_SLOT, DELQA_DEFAULT_VECTOR,
-            DELQA_DEFAULT_LEVEL);
+    set_default_bus_params(DELQA_DEFAULT_ADDR, DELQA_DEFAULT_SLOT, DELQA_DEFAULT_VECTOR, DELQA_DEFAULT_LEVEL);
 
     register_count = 8;
 
@@ -119,10 +118,10 @@ delqa_c::delqa_c() : qunibusdevice_c()
 
     mac_addr[0] = 0x08;
     mac_addr[1] = 0x00;
-    mac_addr[2] = 0x2b;
-    mac_addr[3] = 0xaa;
-    mac_addr[4] = 0xbb;
-    mac_addr[5] = 0xcc;
+    mac_addr[2] = 0x44;
+    mac_addr[3] = 0x41;
+    mac_addr[4] = 0x56;
+    mac_addr[5] = 0x45;
 
     reset_controller();
 }
@@ -139,8 +138,7 @@ bool delqa_c::parse_mac(const std::string &text, uint8_t out[6])
     unsigned values[6];
     if (text.empty())
         return false;
-    if (sscanf(text.c_str(), "%x:%x:%x:%x:%x:%x",
-               &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) != 6)
+    if (sscanf(text.c_str(), "%x:%x:%x:%x:%x:%x", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) != 6)
         return false;
 
     for (int i = 0; i < 6; ++i) {
@@ -165,10 +163,10 @@ bool delqa_c::on_param_changed(parameter_c *param)
             mac_override = false;
             mac_addr[0] = 0x08;
             mac_addr[1] = 0x00;
-            mac_addr[2] = 0x2b;
-            mac_addr[3] = 0xaa;
-            mac_addr[4] = 0xbb;
-            mac_addr[5] = 0xcc;
+            mac_addr[2] = 0x44;
+            mac_addr[3] = 0x41;
+            mac_addr[4] = 0x56;
+            mac_addr[5] = 0x45;
         } else if (!parse_mac(mac.new_value, mac_addr)) {
             ERROR("DELQA: invalid MAC format '%s'", mac.new_value.c_str());
             return false;
@@ -258,7 +256,7 @@ void delqa_c::reset_controller(void)
     xmtlist_lo = 0;
     xmtlist_hi = 0;
     qe_vector = (intr_vector.value & QE_VEC_IV) | QE_VEC_MS;
-    qe_csr = QE_XL_INVALID | QE_RL_INVALID;
+    qe_csr = QE_XL_INVALID | QE_RL_INVALID | QE_OK;
 
     update_transceiver_bits();
 
@@ -349,14 +347,7 @@ void delqa_c::update_csr_reg(void)
 
 void delqa_c::update_transceiver_bits(void)
 {
-#ifdef HAVE_PCAP
-    if (pcap.is_open())
-        qe_csr |= QE_OK;
-    else
-        qe_csr &= ~QE_OK;
-#else
-    qe_csr &= ~QE_OK;
-#endif
+    qe_csr |= QE_OK;
     qe_csr &= ~QE_CARRIER;
 }
 
@@ -469,6 +460,14 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
 
     uint16_t val = get_register_dato_value(device_reg);
 
+    // Always log register writes for debugging
+    static const char *reg_names[] = {
+        "STA0", "STA1", "RCLL", "RCLH", "XMTL", "XMTH", "VAR", "CSR"
+    };
+    const char *rname = (device_reg->index < 8) ? reg_names[device_reg->index] : "???";
+    INFO("DELQA: Write %s (reg %d) = %06o", rname, device_reg->index, val);
+
+
     switch (device_reg->index) {
     case DELQA_REG_RCVLIST_LO:
         rcvlist_lo = val;
@@ -532,24 +531,32 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
 
         if ((old_vec ^ new_vec) & QE_VEC_MS) {
             if (!(new_vec & QE_VEC_MS)) {
+                INFO("DELQA: Entering DEQNA-Lock mode");
                 deqna_lock = true;
                 new_vec &= ~(QE_VEC_OS | QE_VEC_RS | QE_VEC_ST);
             } else {
+                INFO("DELQA: Exiting DEQNA-Lock mode");
                 deqna_lock = false;
             }
         }
 
-        if (new_vec & QE_VEC_RS)
+        if (new_vec & QE_VEC_RS) {
+            INFO("DELQA: Self-test requested");
             new_vec &= ~QE_VEC_RS;
+        }
 
         qe_vector = new_vec;
+        INFO("DELQA: VAR update: old=%06o new=%06o intr_vec=%03o", old_vec, qe_vector, qe_vector & QE_VEC_IV);
         update_vector_reg();
         intr_request.set_vector(qe_vector & QE_VEC_IV);
         break;
     }
     case DELQA_REG_CSR: {
         uint16_t prev = qe_csr;
+        INFO("DELQA: CSR write: prev=%06o val=%06o", prev, val);
+        
         if ((prev & QE_RESET) && !(val & QE_RESET)) {
+            INFO("DELQA: Software reset (SR bit cleared)");
             reset_controller();
             return;
         }
@@ -560,23 +567,31 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
             clr_bits |= QE_NEX_MEM_INT;
 
         qe_csr = (qe_csr | set_bits) & ~clr_bits;
+        INFO("DELQA: CSR after update: %06o (set=%06o clr=%06o)", qe_csr, set_bits, clr_bits);
 
         if ((prev ^ qe_csr) & QE_RCV_ENABLE) {
-            if (qe_csr & QE_RCV_ENABLE)
+            if (qe_csr & QE_RCV_ENABLE) {
+                INFO("DELQA: Receiver ENABLED");
                 start_rx_delay();
-            else
+            } else {
+                INFO("DELQA: Receiver DISABLED");
                 rx_delay_active = false;
+            }
         }
 
-        if ((prev ^ qe_csr) & QE_ELOOP)
+        if ((prev ^ qe_csr) & QE_ELOOP) {
+            INFO("DELQA: External loopback mode %s", (qe_csr & QE_ELOOP) ? "ON" : "OFF");
             update_station_regs();
+        }
 
         update_transceiver_bits();
         update_csr_reg();
         update_intr();
 
-        if ((qe_csr & QE_CSR_BP) == QE_CSR_BP)
+        if ((qe_csr & QE_CSR_BP) == QE_CSR_BP) {
+            INFO("DELQA: Boot/diagnostic ROM request (BP bits set)");
             process_bootrom();
+        }
         break;
     }
     default:
@@ -682,10 +697,11 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
 
     bool normal_packet = (kind == rx_frame_kind::normal);
     bool setup_packet = (kind == rx_frame_kind::setup);
-    bool loopback_packet = (kind == rx_frame_kind::loopback || kind == rx_frame_kind::bootrom);
+    bool bootrom_packet = (kind == rx_frame_kind::bootrom);
+    bool loopback_packet = (kind == rx_frame_kind::loopback || bootrom_packet);
 
     if (!normal_packet) {
-        if (qe_csr & QE_RL_INVALID)
+        if (!bootrom_packet && (qe_csr & QE_RL_INVALID))
             return false;
         if (!rcvlist_addr)
             return false;
@@ -697,7 +713,7 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
     if (!desc_addr)
         return false;
 
-    size_t total_len = normal_packet && len < 60 ? 60 : len;
+    size_t total_len = (normal_packet && len < 60) ? 60 : len;
     size_t remaining = total_len;
     size_t offset = 0;
     unsigned limit = rx_scan_limit();
@@ -794,6 +810,11 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
             status1 = QE_RST_LASTERR;
         } else if (setup_packet) {
             status1 = 0x2700;
+        } else if (bootrom_packet) {
+            // For bootrom, set LASTNOT only if more data remaining (like loopback)
+            status1 = static_cast<uint16_t>(QE_RST_LASTNOERR | (rbl_total & 0x0700));
+            if (remaining > 0)
+                status1 |= QE_RST_LASTNOT;
         } else {
             status1 = normal_packet ? QE_RST_RSVD : QE_RST_LASTNOERR;
             status1 = static_cast<uint16_t>(status1 | (rbl_total & 0x0700));
@@ -809,6 +830,11 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
         words[0] = 0xffff;
         words[4] = status1;
         words[5] = status2;
+
+        if (bootrom_packet) {
+            INFO("DELQA: Bootrom desc_addr=0%o status1=0%o status2=0%o remaining=%u",
+                 desc_addr, status1, status2, static_cast<unsigned>(remaining));
+        }
 
         if (!write_descriptor(desc_addr, words)) {
             set_nxm_error();
@@ -857,12 +883,15 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
-    if (!xmt_enabled())
+    if (!xmt_enabled()) {
         return false;
+    }
 
     uint32_t desc_addr = tx_cur_addr ? tx_cur_addr : xmtlist_addr;
     if (!desc_addr)
         return false;
+
+    INFO("DELQA: TX processing descriptor at %06o (xmtlist=%06o)", desc_addr, xmtlist_addr);
 
     frame.clear();
     unsigned limit = tx_scan_limit();
@@ -1070,9 +1099,27 @@ bool delqa_c::process_setup_packet(const std::vector<uint8_t> &frame)
 
 bool delqa_c::process_bootrom(void)
 {
+    INFO("DELQA: Processing bootrom request, rcvlist_addr=0%o, RL=%d",
+         rcvlist_addr, (qe_csr & QE_RL_INVALID) ? 1 : 0);
+         
+    if (rcvlist_addr && rcvlist_addr < qunibus->addr_space_byte_count) {
+        qe_csr &= ~QE_RL_INVALID;
+        rx_cur_addr = rcvlist_addr;
+        update_csr_reg();
+        INFO("DELQA: Bootrom: cleared RL, rx_cur_addr=0%o", rx_cur_addr);
+    } else {
+        WARNING("DELQA: Bootrom: invalid rcvlist_addr=0%o", rcvlist_addr);
+    }
+    
     const uint8_t *bootrom_bytes = reinterpret_cast<const uint8_t *>(delqa_bootrom);
     size_t bootrom_len = sizeof(delqa_bootrom);
-    return rx_place_frame(bootrom_bytes, bootrom_len, rx_frame_kind::bootrom);
+    INFO("DELQA: Bootrom: sending %u bytes to rx_place_frame", static_cast<unsigned>(bootrom_len));
+    
+    bool result = rx_place_frame(bootrom_bytes, bootrom_len, rx_frame_kind::bootrom);
+    INFO("DELQA: Bootrom: rx_place_frame returned %s, CSR=0%o, RI=%d",
+         result ? "success" : "failure", qe_csr,
+         (qe_csr & QE_RCV_INT) ? 1 : 0);
+    return result;
 }
 
 void delqa_c::worker(unsigned instance)
