@@ -16,6 +16,7 @@
 #include "qunibus.h"
 #include "qunibusadapter.hpp"
 #include "delqa.hpp"
+#include "delqa_bootrom.h"
 
 #if !defined(QBUS)
 #error "DELQA is a QBUS-only device"
@@ -356,11 +357,7 @@ void delqa_c::update_transceiver_bits(void)
 #else
     qe_csr &= ~QE_OK;
 #endif
-
-    if ((qe_csr & QE_RCV_ENABLE) && (qe_csr & QE_OK))
-        qe_csr |= QE_CARRIER;
-    else
-        qe_csr &= ~QE_CARRIER;
+    qe_csr &= ~QE_CARRIER;
 }
 
 bool delqa_c::get_intr_level(void) const
@@ -577,6 +574,9 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         update_transceiver_bits();
         update_csr_reg();
         update_intr();
+
+        if ((qe_csr & QE_CSR_BP) == QE_CSR_BP)
+            process_bootrom();
         break;
     }
     default:
@@ -676,25 +676,37 @@ bool delqa_c::write_descriptor(uint32_t addr, const uint16_t words[QE_RING_WORDS
     return dma_write_words(addr, words, QE_RING_WORDS);
 }
 
-bool delqa_c::rx_place_frame(const uint8_t *data, size_t len)
+bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
-    if (!rcv_enabled())
+    bool normal_packet = (kind == rx_frame_kind::normal);
+    bool setup_packet = (kind == rx_frame_kind::setup);
+    bool loopback_packet = (kind == rx_frame_kind::loopback || kind == rx_frame_kind::bootrom);
+
+    if (!normal_packet) {
+        if (qe_csr & QE_RL_INVALID)
+            return false;
+        if (!rcvlist_addr)
+            return false;
+    } else if (!rcv_enabled()) {
         return false;
+    }
 
     uint32_t desc_addr = rx_cur_addr ? rx_cur_addr : rcvlist_addr;
     if (!desc_addr)
         return false;
 
-    size_t total_len = len < 60 ? 60 : len;
+    size_t total_len = normal_packet && len < 60 ? 60 : len;
     size_t remaining = total_len;
     size_t offset = 0;
     unsigned limit = rx_scan_limit();
     bool any_written = false;
     bool error = false;
 
-    uint16_t rbl_total = (len >= 60) ? static_cast<uint16_t>(len - 60) : 0;
+    uint16_t rbl_total = normal_packet
+            ? static_cast<uint16_t>((len >= 60) ? (len - 60) : 0)
+            : static_cast<uint16_t>(len);
 
     while (remaining > 0 && limit--) {
         uint16_t words[QE_RING_WORDS];
@@ -704,6 +716,11 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len)
         }
 
         uint16_t addr_hi = words[1];
+        uint16_t flag = 0xffff;
+        if (!dma_write_words(desc_addr, &flag, 1)) {
+            set_nxm_error();
+            return false;
+        }
         if (!(addr_hi & QE_RING_VALID)) {
             qe_csr |= QE_RL_INVALID;
             update_csr_reg();
@@ -721,11 +738,6 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len)
             }
             rx_cur_addr = next_addr;
             desc_addr = next_addr;
-            continue;
-        }
-
-        if (words[4] != QE_NOTYET) {
-            desc_addr = next_desc_addr(desc_addr);
             continue;
         }
 
@@ -780,8 +792,13 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len)
         uint16_t status2 = 0;
         if (error) {
             status1 = QE_RST_LASTERR;
+        } else if (setup_packet) {
+            status1 = 0x2700;
         } else {
-            status1 = QE_RST_RSVD | (rbl_total & 0x0700);
+            status1 = normal_packet ? QE_RST_RSVD : QE_RST_LASTNOERR;
+            status1 = static_cast<uint16_t>(status1 | (rbl_total & 0x0700));
+            if (loopback_packet && (qe_csr & QE_ELOOP))
+                status1 |= QE_ESETUP;
             if (remaining > 0)
                 status1 |= QE_RST_LASTNOT;
         }
@@ -800,6 +817,13 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len)
 
         any_written = true;
         rx_cur_addr = next_desc_addr(desc_addr);
+
+        uint16_t next_words[QE_RING_WORDS];
+        if (read_descriptor(rx_cur_addr, next_words)) {
+            if (!(next_words[1] & QE_RING_VALID)) {
+                qe_csr |= QE_RL_INVALID;
+            }
+        }
         desc_addr = rx_cur_addr;
 
         if (error)
@@ -854,6 +878,12 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             return false;
         }
 
+        uint16_t flag = 0xffff;
+        if (!dma_write_words(desc_addr, &flag, 1)) {
+            set_nxm_error();
+            return false;
+        }
+
         uint16_t addr_hi = words[1];
         if (!(addr_hi & QE_RING_VALID)) {
             qe_csr |= QE_XL_INVALID;
@@ -872,11 +902,6 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             }
             tx_cur_addr = next_addr;
             desc_addr = next_addr;
-            continue;
-        }
-
-        if (words[4] != QE_NOTYET) {
-            desc_addr = next_desc_addr(desc_addr);
             continue;
         }
 
@@ -937,7 +962,8 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         bool loopback = is_setup || loopback_enabled();
         if (!error) {
             if (loopback) {
-                if (!rx_place_frame(frame.data(), frame.size()))
+            rx_frame_kind kind = is_setup ? rx_frame_kind::setup : rx_frame_kind::loopback;
+            if (!rx_place_frame(frame.data(), frame.size(), kind))
                     error = true;
             }
 #ifdef HAVE_PCAP
@@ -1042,6 +1068,13 @@ bool delqa_c::process_setup_packet(const std::vector<uint8_t> &frame)
     return true;
 }
 
+bool delqa_c::process_bootrom(void)
+{
+    const uint8_t *bootrom_bytes = reinterpret_cast<const uint8_t *>(delqa_bootrom);
+    size_t bootrom_len = sizeof(delqa_bootrom);
+    return rx_place_frame(bootrom_bytes, bootrom_len, rx_frame_kind::bootrom);
+}
+
 void delqa_c::worker(unsigned instance)
 {
     if (instance == 0)
@@ -1118,7 +1151,7 @@ void delqa_c::worker_rx(void)
                 continue;
         }
 
-        rx_place_frame(frame.data(), len);
+        rx_place_frame(frame.data(), len, rx_frame_kind::normal);
     }
 #else
     while (!workers_terminate) {

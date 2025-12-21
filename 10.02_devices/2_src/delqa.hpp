@@ -21,7 +21,7 @@
 // Default DELQA parameters (offset within IOPAGE)
 #define DELQA_DEFAULT_ADDR 014440
 #define DELQA_DEFAULT_SLOT 18
-#define DELQA_DEFAULT_VECTOR 0154
+#define DELQA_DEFAULT_VECTOR 0  // Vector is software-programmable via VAR register
 #define DELQA_DEFAULT_LEVEL 5
 
 class delqa_c : public qunibusdevice_c {
@@ -139,9 +139,18 @@ private:
     bool read_descriptor(uint32_t addr, uint16_t words[QE_RING_WORDS]);
     bool write_descriptor(uint32_t addr, const uint16_t words[QE_RING_WORDS]);
 
-    bool rx_place_frame(const uint8_t *data, size_t len);
+    enum class rx_frame_kind {
+        normal,
+        setup,
+        loopback,
+        bootrom
+    };
+
+    bool rx_place_frame(const uint8_t *data, size_t len,
+                        rx_frame_kind kind = rx_frame_kind::normal);
     bool tx_take_frame(std::vector<uint8_t> &frame);
     bool process_setup_packet(const std::vector<uint8_t> &frame);
+    bool process_bootrom(void);
 
     uint32_t make_addr(uint16_t hi, uint16_t lo) const;
     uint32_t next_desc_addr(uint32_t addr) const;
