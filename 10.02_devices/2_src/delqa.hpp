@@ -160,7 +160,7 @@ private:
     bool tx_take_frame(std::vector<uint8_t> &frame);
     bool process_setup_packet(const std::vector<uint8_t> &frame);
     bool process_bootrom(void);
-    void do_bootrom_transfer(void);
+    bool do_bootrom_transfer(void);
 
     uint32_t make_addr(uint16_t hi, uint16_t lo) const;
     uint32_t next_desc_addr(uint32_t addr) const;
