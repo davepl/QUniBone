@@ -811,7 +811,10 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
         if (error) {
             status1 = QE_RST_LASTERR;
         } else if (setup_packet) {
-            status1 = 0x2700;
+            // Setup response: USED bit + ESETUP + RBL_HI, plus NOTLAST if more data follows
+            status1 = static_cast<uint16_t>(QE_RST_USED | QE_ESETUP | (rbl_total & 0x0700));
+            if (remaining > 0)
+                status1 |= QE_RST_NOTLAST;
         } else if (bootrom_packet) {
             // For bootrom, set LASTNOT only if more data remaining (like loopback)
             status1 = static_cast<uint16_t>(QE_RST_LASTNOERR | (rbl_total & 0x0700));
@@ -909,9 +912,10 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             return false;
         }
 
-        // Check if descriptor is ready (flag word = QE_NOTYET means "not yet processed")
-        if (words[0] != QE_NOTYET) {
-            // Descriptor already processed or not ready - stop scanning
+        // Check if descriptor is ready - bit 15 set means "device should process"
+        // If bit 15 is clear, the descriptor is not ready or already processed
+        if (!(words[0] & 0x8000)) {
+            // Descriptor not ready - stop scanning
             break;
         }
 
