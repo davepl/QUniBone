@@ -810,25 +810,30 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
 
         uint16_t status1 = 0;
         uint16_t status2 = 0;
+        // RX status word 1 encoding:
+        // Bit 15 (0x8000) = LAST segment indicator (must be set for final segment)
+        // Bit 14 (0x4000) = ERROR if bit 15 set, or NOT-LAST if bit 15 clear
+        // Bit 13 (0x2000) = ESETUP (setup frame indicator)
+        // So: 0x8000 = last, no error; 0xC000 = last, error; 0x4000 = not last
         if (error) {
-            status1 = QE_RST_LASTERR;
+            status1 = 0xC000;  // Last segment with error
         } else if (setup_packet) {
-            // Setup response: USED bit + ESETUP + RBL_HI, plus NOTLAST if more data follows
-            status1 = static_cast<uint16_t>(QE_RST_USED | QE_ESETUP | (rbl_total & 0x0700));
+            // Setup response: LAST + ESETUP + RBL_HI
+            status1 = static_cast<uint16_t>(0x8000 | QE_ESETUP | (rbl_total & 0x0700));
             if (remaining > 0)
-                status1 |= QE_RST_NOTLAST;
+                status1 = static_cast<uint16_t>(0x4000 | QE_ESETUP | (rbl_total & 0x0700));  // Not last
         } else if (bootrom_packet) {
-            // For bootrom, set LASTNOT only if more data remaining (like loopback)
-            status1 = static_cast<uint16_t>(QE_RST_LASTNOERR | (rbl_total & 0x0700));
+            // For bootrom: LAST + RBL_HI
+            status1 = static_cast<uint16_t>(0x8000 | (rbl_total & 0x0700));
             if (remaining > 0)
-                status1 |= QE_RST_LASTNOT;
+                status1 = static_cast<uint16_t>(0x4000 | (rbl_total & 0x0700));  // Not last
         } else {
-            status1 = normal_packet ? QE_RST_RSVD : QE_RST_LASTNOERR;
-            status1 = static_cast<uint16_t>(status1 | (rbl_total & 0x0700));
-            if (loopback_packet && (qe_csr & QE_ELOOP))
-                status1 |= QE_ESETUP;
+            // Normal or loopback packet: LAST + RBL_HI
+            uint16_t eloop_flag = (loopback_packet && (qe_csr & QE_ELOOP)) ? QE_ESETUP : 0;
             if (remaining > 0)
-                status1 |= QE_RST_LASTNOT;
+                status1 = static_cast<uint16_t>(0x4000 | eloop_flag | (rbl_total & 0x0700));  // Not last
+            else
+                status1 = static_cast<uint16_t>(0x8000 | eloop_flag | (rbl_total & 0x0700));  // Last
         }
 
         status2 = static_cast<uint16_t>(rbl_total & 0x00ff);
@@ -914,13 +919,6 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         if (!read_descriptor(desc_addr, words)) {
             set_nxm_error();
             return false;
-        }
-
-        // Check if descriptor is ready - bit 15 set means "device should process"
-        // If bit 15 is clear, the descriptor is not ready or already processed
-        if (!(words[0] & 0x8000)) {
-            // Descriptor not ready - stop scanning
-            break;
         }
 
         uint16_t flag = 0xffff;
@@ -1027,17 +1025,17 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         uint16_t status1 = 0;
         uint16_t status2 = 0;
         if (is_setup) {
-            // TX setup: USED (0x8000) + status bits
-            status1 = 0x8000 | 0x200c;
+            // TX setup completion status
+            status1 = 0x000c;  // Setup done, no errors
             status2 = 0x0860;
         } else if (loopback) {
-            // TX loopback: USED (0x8000) + error/success
-            status1 = 0x8000 | (error ? 0x4000 : 0x2000);
+            // TX loopback completion status
+            status1 = error ? 0x4000 : 0x0000;  // Error bit if failed
             status2 = 1;
         } else {
             uint16_t tdr = static_cast<uint16_t>((100 + frame.size() * 8) & 0x03ff);
-            // TX normal: USED (0x8000) + error flag
-            status1 = 0x8000 | (error ? 0x4000 : 0x0000);
+            // TX normal completion status
+            status1 = error ? 0x4000 : 0x0000;
             status2 = tdr ? tdr : 1;
         }
 
@@ -1166,7 +1164,7 @@ void delqa_c::worker_rx(void)
         // Check for pending loopback
         if (loopback_pending) {
             std::vector<uint8_t> lb_data;
-            rx_frame_kind lb_kind;
+            rx_frame_kind lb_kind = rx_frame_kind::normal;  // Initialize to avoid warning
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 if (loopback_pending) {
