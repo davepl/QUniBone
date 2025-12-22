@@ -432,8 +432,6 @@ bool delqa_c::rx_list_ready_for_loopback(void)
 
     if (!(words[1] & QE_RING_VALID))
         return false;
-    if (words[0] != QE_NOTYET)
-        return false;
 
     return true;
 }
@@ -733,8 +731,10 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
     bool loopback_packet = (kind == rx_frame_kind::loopback || bootrom_packet);
 
     if (!normal_packet) {
-        if (!bootrom_packet && (qe_csr & QE_RL_INVALID))
+        if (!bootrom_packet && (qe_csr & QE_RL_INVALID) &&
+                !(setup_packet || (loopback_packet && (qe_csr & QE_ELOOP)))) {
             return false;
+        }
         if (!rcvlist_addr)
             return false;
     } else if (!rcv_enabled()) {
@@ -764,7 +764,7 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
         }
 
         uint16_t addr_hi = words[1];
-        uint16_t flag = static_cast<uint16_t>((words[0] & ~(QE_NOTYET | QE_INUSE)) | QE_INUSE);
+        uint16_t flag = 0xffff;
         if (!dma_write_words(desc_addr, &flag, 1)) {
             set_nxm_error();
             return false;
@@ -782,13 +782,6 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
                 qe_csr |= QE_RL_INVALID;
                 update_csr_reg();
                 update_intr();
-                return false;
-            }
-            // Mark chain descriptor as processed.
-            words[0] = static_cast<uint16_t>(words[0] & ~(QE_NOTYET | QE_INUSE));
-            words[1] = static_cast<uint16_t>(addr_hi & ~QE_RING_VALID);
-            if (!write_descriptor(desc_addr, words)) {
-                set_nxm_error();
                 return false;
             }
             rx_cur_addr = next_addr;
@@ -866,8 +859,7 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
         }
 
         // Mark descriptor as processed.
-        words[0] = static_cast<uint16_t>(words[0] & ~(QE_NOTYET | QE_INUSE));
-        words[1] = static_cast<uint16_t>(addr_hi & ~QE_RING_VALID);
+        words[0] = 0xffff;
         words[4] = status1;
         words[5] = status2;
 
@@ -883,20 +875,20 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
 
         any_written = true;
         rx_cur_addr = next_desc_addr(desc_addr);
-
-        uint16_t next_words[QE_RING_WORDS];
         if (remaining == 0) {
             uint16_t next_flag = 0xffff;
             if (!dma_write_words(rx_cur_addr, &next_flag, 1)) {
                 set_nxm_error();
                 error = true;
             }
-        }
-        if (read_descriptor(rx_cur_addr, next_words)) {
-            if (!(next_words[1] & QE_RING_VALID)) {
-                qe_csr |= QE_RL_INVALID;
+            uint16_t next_words[QE_RING_WORDS];
+            if (read_descriptor(rx_cur_addr, next_words)) {
+                if (!(next_words[1] & QE_RING_VALID)) {
+                    qe_csr |= QE_RL_INVALID;
+                }
             }
         }
+
         desc_addr = rx_cur_addr;
 
         if (error)
@@ -955,30 +947,29 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             return false;
         }
 
+        if (trace.value) {
+            INFO("DELQA: TX desc %06o words=%06o %06o %06o %06o %06o %06o",
+                 desc_addr, words[0], words[1], words[2], words[3], words[4], words[5]);
+        }
+
         uint16_t addr_hi = words[1];
-        // Check if descriptor is valid BEFORE claiming ownership
-        // If not valid, just return without setting XL_INVALID - host may mark it valid later
+        uint16_t flag = 0xffff;
+        if (!dma_write_words(desc_addr, &flag, 1)) {
+            set_nxm_error();
+            return false;
+        }
+
+        // Check if descriptor is valid
         if (!(addr_hi & QE_RING_VALID)) {
-            INFO("DELQA: TX descriptor at %06o not valid (addr_hi=%06o), waiting", desc_addr, addr_hi);
-            // Only set XL_INVALID if we've already processed at least one descriptor
-            // Otherwise, the host may not have set up the descriptor yet
-            if (any_desc || (tx_cur_addr && tx_cur_addr != xmtlist_addr)) {
-                qe_csr |= QE_XL_INVALID;
-                update_csr_reg();
-                update_intr();
-            }
+            INFO("DELQA: TX descriptor at %06o not valid (addr_hi=%06o)", desc_addr, addr_hi);
+            qe_csr |= QE_XL_INVALID;
+            update_csr_reg();
+            update_intr();
             return any_desc;
         }
 
         INFO("DELQA: TX found valid descriptor at %06o (addr_hi=%06o setup=%d)", 
              desc_addr, addr_hi, (addr_hi & QE_RING_SETUP) ? 1 : 0);
-
-        // Now claim ownership by setting INUSE and preserving other flags.
-        uint16_t flag = static_cast<uint16_t>((words[0] & ~(QE_NOTYET | QE_INUSE)) | QE_INUSE);
-        if (!dma_write_words(desc_addr, &flag, 1)) {
-            set_nxm_error();
-            return false;
-        }
 
         if (addr_hi & QE_RING_CHAIN) {
             uint32_t next_addr = make_addr(addr_hi, words[2]);
@@ -986,13 +977,6 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
                 qe_csr |= QE_XL_INVALID;
                 update_csr_reg();
                 update_intr();
-                return false;
-            }
-            // Mark chain descriptor as processed.
-            words[0] = static_cast<uint16_t>(words[0] & ~(QE_NOTYET | QE_INUSE));
-            words[1] = static_cast<uint16_t>(addr_hi & ~QE_RING_VALID);
-            if (!write_descriptor(desc_addr, words)) {
-                set_nxm_error();
                 return false;
             }
             tx_cur_addr = next_addr;
@@ -1042,8 +1026,7 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
 
         if (!eom_seen) {
             // Mark descriptor as processed.
-            words[0] = static_cast<uint16_t>(words[0] & ~(QE_NOTYET | QE_INUSE));
-            words[1] = static_cast<uint16_t>(addr_hi & ~QE_RING_VALID);
+            words[0] = 0xffff;
             words[4] = QE_RST_LASTNOT;
             words[5] = 1;
             if (!write_descriptor(desc_addr, words)) {
@@ -1059,12 +1042,16 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         bool loopback = is_setup || loopback_enabled();
         if (!error) {
             if (loopback) {
+                if (is_setup)
+                    process_setup_packet(frame);
                 rx_frame_kind kind = is_setup ? rx_frame_kind::setup : rx_frame_kind::loopback;
-                // Queue for worker thread to handle (with delay like real hardware)
-                pending_loopback_data = frame;
-                pending_loopback_kind = kind;
-                loopback_pending = true;
-                loopback_due_ns = timeout_c::abstime_ns() + 400000;
+                // Try immediate delivery; if it fails, queue for retry.
+                if (!rx_place_frame(frame.data(), frame.size(), kind)) {
+                    pending_loopback_data = frame;
+                    pending_loopback_kind = kind;
+                    loopback_pending = true;
+                    loopback_due_ns = timeout_c::abstime_ns() + 400000;
+                }
             }
 #ifdef HAVE_PCAP
             else if (!pcap.send(frame.data(), frame.size())) {
@@ -1094,14 +1081,18 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         }
 
         // Mark descriptor as processed.
-        words[0] = static_cast<uint16_t>(words[0] & ~(QE_NOTYET | QE_INUSE));
-        words[1] = static_cast<uint16_t>(addr_hi & ~QE_RING_VALID);
+        words[0] = 0xffff;
         words[4] = status1;
         words[5] = status2;
 
         if (!write_descriptor(desc_addr, words)) {
             set_nxm_error();
             error = true;
+        }
+
+        if (trace.value) {
+            INFO("DELQA: TX desc %06o writeback=%06o %06o %06o %06o %06o %06o",
+                 desc_addr, words[0], words[1], words[2], words[3], words[4], words[5]);
         }
 
         tx_cur_addr = next_desc_addr(desc_addr);
@@ -1223,10 +1214,6 @@ void delqa_c::worker_rx(void)
                 timeout_c::wait_ms(1);
                 continue;
             }
-            if (!rx_list_ready_for_loopback()) {
-                timeout_c::wait_ms(1);
-                continue;
-            }
             std::vector<uint8_t> lb_data;
             rx_frame_kind lb_kind = rx_frame_kind::normal;  // Initialize to avoid warning
             {
@@ -1234,14 +1221,16 @@ void delqa_c::worker_rx(void)
                 if (loopback_pending) {
                     lb_data = pending_loopback_data;
                     lb_kind = pending_loopback_kind;
-                    loopback_pending = false;
-                    pending_loopback_data.clear();
                 }
             }
             if (!lb_data.empty()) {
-                if (lb_kind == rx_frame_kind::setup)
-                    process_setup_packet(lb_data);
-                rx_place_frame(lb_data.data(), lb_data.size(), lb_kind);
+                if (rx_place_frame(lb_data.data(), lb_data.size(), lb_kind)) {
+                    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                    loopback_pending = false;
+                    pending_loopback_data.clear();
+                } else {
+                    timeout_c::wait_ms(1);
+                }
             }
             continue;
         }

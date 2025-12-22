@@ -61,8 +61,8 @@
 #define QE_RING_ADDR_HI_MASK 0x003f
 #define QE_RING_ODD_BEGIN    0x0040
 #define QE_RING_ODD_END      0x0080
-#define QE_RING_SETUP        0x1000
 #define QE_RING_EOMSG        0x2000
+#define QE_RING_SETUP        0x1000
 #define QE_RING_CHAIN        0x4000
 #define QE_RING_VALID        0x8000
 
