@@ -810,33 +810,25 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
 
         uint16_t status1 = 0;
         uint16_t status2 = 0;
-        // RX status word 1 encoding:
-        // Bit 15 (0x8000) = LAST segment indicator (must be set for final segment)
-        // Bit 14 (0x4000) = ERROR if bit 15 set, or NOT-LAST if bit 15 clear
-        // Bit 13 (0x2000) = ESETUP (setup frame indicator)
-        // So: 0x8000 = last, no error; 0xC000 = last, error; 0x4000 = not last
-        if (error) {
-            status1 = 0xC000;  // Last segment with error
-        } else if (setup_packet) {
-            // Setup response: LAST + ESETUP + RBL_HI
-            status1 = static_cast<uint16_t>(0x8000 | QE_ESETUP | (rbl_total & 0x0700));
-            if (remaining > 0)
-                status1 = static_cast<uint16_t>(0x4000 | QE_ESETUP | (rbl_total & 0x0700));  // Not last
+
+        if (setup_packet) {
+            status1 = static_cast<uint16_t>(QE_ESETUP | (rbl_total & QE_RBL_HI));
         } else if (bootrom_packet) {
-            // For bootrom: LAST + RBL_HI
-            status1 = static_cast<uint16_t>(0x8000 | (rbl_total & 0x0700));
-            if (remaining > 0)
-                status1 = static_cast<uint16_t>(0x4000 | (rbl_total & 0x0700));  // Not last
+            status1 = static_cast<uint16_t>(rbl_total & QE_RBL_HI);
+        } else if (normal_packet) {
+            status1 = static_cast<uint16_t>(QE_RST_RSVD | (rbl_total & QE_RBL_HI));
         } else {
-            // Normal or loopback packet: LAST + RBL_HI
-            uint16_t eloop_flag = (loopback_packet && (qe_csr & QE_ELOOP)) ? QE_ESETUP : 0;
-            if (remaining > 0)
-                status1 = static_cast<uint16_t>(0x4000 | eloop_flag | (rbl_total & 0x0700));  // Not last
-            else
-                status1 = static_cast<uint16_t>(0x8000 | eloop_flag | (rbl_total & 0x0700));  // Last
+            status1 = static_cast<uint16_t>(rbl_total & QE_RBL_HI);
+            if (loopback_packet && (qe_csr & QE_ELOOP))
+                status1 |= QE_ESETUP;
         }
 
-        status2 = static_cast<uint16_t>(rbl_total & 0x00ff);
+        if (remaining > 0)
+            status1 |= QE_RST_LASTNOT;
+        if (error)
+            status1 |= QE_RST_LASTERR;
+
+        status2 = static_cast<uint16_t>(rbl_total & QE_RBL_LO);
         status2 = static_cast<uint16_t>((status2 << 8) | status2);
 
         words[0] = 0xffff;
@@ -1023,19 +1015,18 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         }
 
         uint16_t status1 = 0;
-        uint16_t status2 = 0;
+        uint16_t status2 = 1;
         if (is_setup) {
-            // TX setup completion status
-            status1 = 0x000c;  // Setup done, no errors
+            // DELQA setup transmit status words
+            status1 = 0x200c;
             status2 = 0x0860;
         } else if (loopback) {
-            // TX loopback completion status
-            status1 = error ? 0x4000 : 0x0000;  // Error bit if failed
+            // Loopback always reports FAIL in status1 in the reference implementation
+            status1 = static_cast<uint16_t>(0x2000 | QE_FAIL);
             status2 = 1;
         } else {
             uint16_t tdr = static_cast<uint16_t>((100 + frame.size() * 8) & 0x03ff);
-            // TX normal completion status
-            status1 = error ? 0x4000 : 0x0000;
+            status1 = static_cast<uint16_t>(0x2000 | (error ? QE_FAIL : 0));
             status2 = tdr ? tdr : 1;
         }
 

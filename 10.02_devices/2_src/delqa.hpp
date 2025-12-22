@@ -141,6 +141,7 @@ private:
     void start_rx_delay(void);
     bool rx_ready(void);
     bool loopback_enabled(void) const;
+    bool rx_list_ready_for_loopback(void);
 
     void worker_rx(void);
     void worker_tx(void);
