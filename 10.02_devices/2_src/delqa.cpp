@@ -690,7 +690,10 @@ bool delqa_c::read_descriptor(uint32_t addr, uint16_t words[QE_RING_WORDS])
 
 bool delqa_c::write_descriptor(uint32_t addr, const uint16_t words[QE_RING_WORDS])
 {
-    return dma_write_words(addr, words, QE_RING_WORDS);
+    INFO("DELQA: write_descriptor addr=0%o calling dma_write_words", addr);
+    bool result = dma_write_words(addr, words, QE_RING_WORDS);
+    INFO("DELQA: write_descriptor addr=0%o result=%d", addr, result);
+    return result;
 }
 
 bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind)
@@ -702,18 +705,28 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
     bool bootrom_packet = (kind == rx_frame_kind::bootrom);
     bool loopback_packet = (kind == rx_frame_kind::loopback || bootrom_packet);
 
+    INFO("DELQA: rx_place_frame kind=%d len=%zu csr=0%o rcvlist_addr=0%o rx_cur_addr=0%o",
+         static_cast<int>(kind), len, qe_csr, rcvlist_addr, rx_cur_addr);
+
     if (!normal_packet) {
-        if (!bootrom_packet && (qe_csr & QE_RL_INVALID))
+        if (!bootrom_packet && (qe_csr & QE_RL_INVALID)) {
+            INFO("DELQA: rx_place_frame rejected: RL_INVALID");
             return false;
-        if (!rcvlist_addr)
+        }
+        if (!rcvlist_addr) {
+            INFO("DELQA: rx_place_frame rejected: no rcvlist_addr");
             return false;
+        }
     } else if (!rcv_enabled()) {
+        INFO("DELQA: rx_place_frame rejected: receiver not enabled");
         return false;
     }
 
     uint32_t desc_addr = rx_cur_addr ? rx_cur_addr : rcvlist_addr;
-    if (!desc_addr)
+    if (!desc_addr) {
+        INFO("DELQA: rx_place_frame rejected: no desc_addr");
         return false;
+    }
 
     size_t total_len = (normal_packet && len < 60) ? 60 : len;
     size_t remaining = total_len;
@@ -734,12 +747,15 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
         }
 
         uint16_t addr_hi = words[1];
+        INFO("DELQA: rx_place_frame desc_addr=0%o words[0]=0%o addr_hi=0%o words[2]=0%o words[3]=0%o",
+             desc_addr, words[0], addr_hi, words[2], words[3]);
         uint16_t flag = 0xffff;
         if (!dma_write_words(desc_addr, &flag, 1)) {
             set_nxm_error();
             return false;
         }
         if (!(addr_hi & QE_RING_VALID)) {
+            INFO("DELQA: rx_place_frame: descriptor not VALID, setting RL_INVALID");
             qe_csr |= QE_RL_INVALID;
             update_csr_reg();
             update_intr();
@@ -861,9 +877,13 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
             break;
     }
 
-    if (!any_written)
+    if (!any_written) {
+        INFO("DELQA: rx_place_frame: no descriptors written, returning false");
         return false;
+    }
 
+    INFO("DELQA: rx_place_frame: success, remaining=%zu, setting RCV_INT, csr was 0%o",
+         remaining, qe_csr);
     qe_csr |= QE_RCV_INT;
     if (error || remaining > 0) {
         rx_errors++;
@@ -875,6 +895,7 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
 
     update_csr_reg();
     update_intr();
+    INFO("DELQA: rx_place_frame: done, csr now 0%o", qe_csr);
 
     if (trace.value) {
         INFO("DELQA: RX len=%u %s", static_cast<unsigned>(len),
@@ -912,10 +933,14 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             return false;
         }
 
+        INFO("DELQA: TX desc_addr=0%o words[0]=0%o words[1]=0%o words[2]=0%o words[3]=0%o",
+             desc_addr, words[0], words[1], words[2], words[3]);
+
         // Check if descriptor is ready - bit 15 set means "device should process"
         // If bit 15 is clear, the descriptor is not ready or already processed
         if (!(words[0] & 0x8000)) {
             // Descriptor not ready - stop scanning
+            INFO("DELQA: TX descriptor not ready (bit 15 clear), stopping");
             break;
         }
 
@@ -1022,20 +1047,26 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         uint16_t status2 = 0;
         if (is_setup) {
             process_setup_packet(frame);
-            status1 = 0x200c;
+            // TX setup: USED (0x8000) + status bits
+            status1 = 0x8000 | 0x200c;
             status2 = 0x0860;
         } else if (loopback) {
-            status1 = error ? 0x4000 : 0x2000;
+            // TX loopback: USED (0x8000) + error/success
+            status1 = 0x8000 | (error ? 0x4000 : 0x2000);
             status2 = 1;
         } else {
             uint16_t tdr = static_cast<uint16_t>((100 + frame.size() * 8) & 0x03ff);
-            status1 = error ? 0x4000 : 0x0000;
+            // TX normal: USED (0x8000) + error flag
+            status1 = 0x8000 | (error ? 0x4000 : 0x0000);
             status2 = tdr ? tdr : 1;
         }
 
         words[0] = 0xffff;
         words[4] = status1;
         words[5] = status2;
+
+        INFO("DELQA: TX completing desc_addr=0%o status1=0%o status2=0%o is_setup=%d",
+             desc_addr, status1, status2, is_setup);
 
         if (!write_descriptor(desc_addr, words)) {
             set_nxm_error();
@@ -1045,6 +1076,7 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         tx_cur_addr = next_desc_addr(desc_addr);
 
         qe_csr |= QE_XMIT_INT;
+        INFO("DELQA: TX done, setting XMIT_INT, csr=0%o", qe_csr);
         if (error) {
             tx_errors++;
             stat_tx_errors.value = tx_errors;
