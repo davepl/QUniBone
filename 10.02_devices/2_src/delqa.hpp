@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <string>
 #include <vector>
+#include <deque>
 #include <mutex>
 
 #include "qunibusdevice.hpp"
@@ -104,6 +105,18 @@ private:
     bool setup_multicast = false;
     uint8_t setup_macs[XQ_FILTER_MAX][6] = {{0}};
 
+    enum class rx_frame_kind {
+        normal,
+        setup,
+        loopback,
+        bootrom
+    };
+
+    // Pending loopback packet (single, protected by state_mutex)
+    std::vector<uint8_t> pending_loopback_data;
+    rx_frame_kind pending_loopback_kind = rx_frame_kind::normal;
+    volatile bool loopback_pending = false;
+
     bool deqna_lock = false;
     bool rx_delay_active = false;
     uint64_t rx_enable_deadline_ns = 0;
@@ -139,13 +152,6 @@ private:
 
     bool read_descriptor(uint32_t addr, uint16_t words[QE_RING_WORDS]);
     bool write_descriptor(uint32_t addr, const uint16_t words[QE_RING_WORDS]);
-
-    enum class rx_frame_kind {
-        normal,
-        setup,
-        loopback,
-        bootrom
-    };
 
     bool rx_place_frame(const uint8_t *data, size_t len,
                         rx_frame_kind kind = rx_frame_kind::normal);
