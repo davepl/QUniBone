@@ -24,6 +24,7 @@ public:
 
     bool poll(uint8_t *buf, size_t bufcap, size_t *len);
     bool send(const uint8_t *buf, size_t len);
+    bool set_filter(const std::string &expr);
 
     bool is_open(void) const {
         return (pcap_handle != nullptr);

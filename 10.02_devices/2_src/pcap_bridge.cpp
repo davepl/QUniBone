@@ -123,3 +123,31 @@ bool PcapBridge::send(const uint8_t *buf, size_t len)
     return false;
 #endif
 }
+
+bool PcapBridge::set_filter(const std::string &expr)
+{
+#ifdef HAVE_PCAP
+    std::lock_guard<std::mutex> lock(pcap_mutex);
+    if (!pcap_handle) {
+        error_text = "pcap not open";
+        return false;
+    }
+
+    struct bpf_program fp;
+    if (pcap_compile(pcap_handle, &fp, expr.c_str(), 1, PCAP_NETMASK_UNKNOWN) < 0) {
+        error_text = pcap_geterr(pcap_handle);
+        return false;
+    }
+    int res = pcap_setfilter(pcap_handle, &fp);
+    pcap_freecode(&fp);
+    if (res < 0) {
+        error_text = pcap_geterr(pcap_handle);
+        return false;
+    }
+    return true;
+#else
+    (void)expr;
+    error_text = "libpcap not available";
+    return false;
+#endif
+}

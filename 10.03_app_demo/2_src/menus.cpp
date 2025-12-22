@@ -208,6 +208,14 @@ void application_c::menu_info(const char *menu_code)
 void application_c::print_params(parameterized_c *parameterized, parameter_c *p) 
 {
     stringgrid_c grid;
+    auto clamp_cell = [](const std::string &text) {
+        const size_t max_len = 200;
+        if (text.size() <= max_len)
+            return text;
+        std::string out = text.substr(0, max_len - 16);
+        out += "...(len=" + std::to_string(text.size()) + ")";
+        return out;
+    };
     unsigned r;
     grid.set(0, 0, "Name");
     grid.set(1, 0, "Short");
@@ -220,12 +228,12 @@ void application_c::print_params(parameterized_c *parameterized, parameter_c *p)
     r = 1;
     for (it = parameterized->parameter.begin(); it != parameterized->parameter.end(); ++it)
         if (p == NULL || *it == p) {
-            grid.set(0, r, (*it)->name);
-            grid.set(1, r, (*it)->shortname);
-            grid.set(2, r, *(*it)->render());
-            grid.set(3, r, (*it)->unit);
+            grid.set(0, r, clamp_cell((*it)->name));
+            grid.set(1, r, clamp_cell((*it)->shortname));
+            grid.set(2, r, clamp_cell(*(*it)->render()));
+            grid.set(3, r, clamp_cell((*it)->unit));
             grid.set(4, r, (*it)->readonly ? "read only" : "writable");
-            grid.set(5, r, (*it)->info);
+            grid.set(5, r, clamp_cell((*it)->info));
             r++;
         }
     grid.print("  ", '-');
@@ -313,4 +321,3 @@ void application_c::menu_main(void)
         }
     } while (!ready);
 }
-

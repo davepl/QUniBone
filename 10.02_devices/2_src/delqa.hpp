@@ -37,9 +37,11 @@ public:
     parameter_bool_c promisc = parameter_bool_c(this, "promisc", "pr", false,
             "Enable libpcap promiscuous capture");
     parameter_unsigned_c rx_slots = parameter_unsigned_c(this, "rx_slots", "rx", false, "",
-            "%d", "RX ring scan limit (0 = default)", 16, 10);
+            "%d", "RX ring scan limit (0 = no limit)", 16, 10);
     parameter_unsigned_c tx_slots = parameter_unsigned_c(this, "tx_slots", "tx", false, "",
-            "%d", "TX ring scan limit (0 = default)", 16, 10);
+            "%d", "TX ring scan limit (0 = no limit)", 16, 10);
+    parameter_unsigned_c rx_start_delay_ms = parameter_unsigned_c(this, "rx_start_delay_ms", "rxd", false, "",
+            "%d", "Receiver start delay in ms", 16, 10);
     parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
             "Trace CSR/ring events to log");
 
@@ -104,6 +106,12 @@ private:
     bool setup_promiscuous = false;
     bool setup_multicast = false;
     uint8_t setup_macs[XQ_FILTER_MAX][6] = {{0}};
+    bool setup_l1 = true;
+    bool setup_l2 = true;
+    bool setup_l3 = true;
+    unsigned sanity_quarter_secs = 0;
+    bool sanity_active = false;
+    uint64_t sanity_deadline_ns = 0;
 
     enum class rx_frame_kind {
         normal,
@@ -112,11 +120,15 @@ private:
         bootrom
     };
 
-    // Pending loopback packet (single, protected by state_mutex)
-    std::vector<uint8_t> pending_loopback_data;
-    rx_frame_kind pending_loopback_kind = rx_frame_kind::normal;
-    volatile bool loopback_pending = false;
-    uint64_t loopback_due_ns = 0;
+    struct rx_queue_entry {
+        std::vector<uint8_t> data;
+        rx_frame_kind kind = rx_frame_kind::normal;
+        uint64_t due_ns = 0;
+    };
+
+    // Pending RX packets (protected by state_mutex)
+    std::deque<rx_queue_entry> rx_queue;
+    unsigned rx_queue_loss = 0;
 
     bool deqna_lock = false;
     bool rx_delay_active = false;
@@ -143,6 +155,11 @@ private:
     bool rx_ready(void);
     bool loopback_enabled(void) const;
     bool rx_list_ready_for_loopback(void);
+    bool enqueue_rx_packet(const uint8_t *data, size_t len, rx_frame_kind kind, uint64_t due_ns);
+    bool deliver_rx_queue_entry(void);
+    void reset_sanity_timer(void);
+    void check_sanity_timer(void);
+    void update_pcap_filter(void);
 
     void worker_rx(void);
     void worker_tx(void);

@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <algorithm>
 #include <vector>
+#include <utility>
 
 #include "logger.hpp"
 #include "utils.hpp"
@@ -22,10 +23,18 @@
 #error "DELQA is a QBUS-only device"
 #endif
 
-// Maximum Ethernet frame size (excluding preamble/CRC added by hardware)
-static const size_t DELQA_MAX_FRAME_SIZE = 1518;
-static const unsigned DELQA_DEFAULT_SCAN = 32;
-static const unsigned DELQA_RX_START_DELAY_MS = 1;
+// Ethernet framing limits (excluding preamble/CRC added by hardware)
+static const size_t ETH_MIN_PACKET = 60;
+static const size_t ETH_MAX_PACKET = 1514;
+static const size_t ETH_FRAME_SIZE = 1518;
+static const size_t XQ_MAX_RCV_PACKET = 1600;
+static const size_t XQ_LONG_PACKET = 0x0600; // 1536 bytes
+static const unsigned XQ_QUE_MAX = 500;
+static const size_t DELQA_MAX_FRAME_SIZE = ETH_FRAME_SIZE;
+static const uint16_t QE_SETUP_MC = 0x0001;
+static const uint16_t QE_SETUP_PM = 0x0002;
+static const uint16_t QE_SETUP_LD = 0x000C;
+static const uint16_t QE_SETUP_ST = 0x0070;
 
 static uint8_t word_low(uint16_t w)
 {
@@ -112,8 +121,9 @@ delqa_c::delqa_c() : qunibusdevice_c()
     ifname.value = "eth0";
     mac.value = "";
     promisc.value = true;
-    rx_slots.value = 32;
-    tx_slots.value = 32;
+    rx_slots.value = 0;
+    tx_slots.value = 0;
+    rx_start_delay_ms.value = 0;
     trace.value = false;
 
     mac_addr[0] = 0x08;
@@ -176,6 +186,7 @@ bool delqa_c::on_param_changed(parameter_c *param)
         update_mac_checksum();
         if (handle)
             update_station_regs();
+        update_pcap_filter();
     }
 
     return qunibusdevice_c::on_param_changed(param);
@@ -205,9 +216,11 @@ bool delqa_c::on_before_install(void)
     promisc.readonly = true;
     rx_slots.readonly = true;
     tx_slots.readonly = true;
+    rx_start_delay_ms.readonly = true;
 
     update_transceiver_bits();
     update_csr_reg();
+    update_pcap_filter();
 
     return true;
 #endif
@@ -229,6 +242,7 @@ void delqa_c::on_after_uninstall(void)
     promisc.readonly = false;
     rx_slots.readonly = false;
     tx_slots.readonly = false;
+    rx_start_delay_ms.readonly = false;
 
     update_transceiver_bits();
     update_csr_reg();
@@ -269,12 +283,17 @@ void delqa_c::reset_controller(void)
     rx_delay_active = false;
     rx_enable_deadline_ns = 0;
     bootrom_pending = false;
-    loopback_pending = false;
-    loopback_due_ns = 0;
-    pending_loopback_data.clear();
+    rx_queue.clear();
+    rx_queue_loss = 0;
     setup_valid = false;
     setup_promiscuous = false;
     setup_multicast = false;
+    setup_l1 = true;
+    setup_l2 = true;
+    setup_l3 = true;
+    sanity_quarter_secs = 0;
+    sanity_active = false;
+    sanity_deadline_ns = 0;
     memset(setup_macs, 0, sizeof(setup_macs));
 
     // Reset statistics
@@ -288,6 +307,7 @@ void delqa_c::reset_controller(void)
     stat_tx_errors.value = 0;
 
     update_mac_checksum();
+    update_pcap_filter();
 
     intr_request.edge_detect_reset();
     intr_request.set_vector(qe_vector & QE_VEC_IV);
@@ -351,7 +371,10 @@ void delqa_c::update_csr_reg(void)
 
 void delqa_c::update_transceiver_bits(void)
 {
-    qe_csr |= QE_OK;
+    if (pcap.is_open())
+        qe_csr |= QE_OK;
+    else
+        qe_csr &= ~QE_OK;
     qe_csr &= ~QE_CARRIER;
 }
 
@@ -387,14 +410,18 @@ void delqa_c::update_intr(void)
 
 void delqa_c::start_rx_delay(void)
 {
+    if (rx_start_delay_ms.value == 0) {
+        rx_delay_active = false;
+        return;
+    }
     rx_delay_active = true;
     rx_enable_deadline_ns = timeout_c::abstime_ns() +
-            static_cast<uint64_t>(DELQA_RX_START_DELAY_MS) * 1000000ull;
+            static_cast<uint64_t>(rx_start_delay_ms.value) * 1000000ull;
 }
 
 bool delqa_c::rx_ready(void)
 {
-    if (!rcv_enabled())
+    if (!(qe_csr & QE_RCV_ENABLE))
         return false;
     if (!rx_delay_active)
         return true;
@@ -407,8 +434,8 @@ bool delqa_c::rx_ready(void)
 
 bool delqa_c::loopback_enabled(void) const
 {
-    // Loopback is enabled if ILOOP (internal) or ELOOP (external) is set
-    return (qe_csr & (QE_ILOOP | QE_ELOOP)) != 0;
+    // OpenSIMH models internal loopback as active-low (IL=0) or external loopback.
+    return ((qe_csr & QE_ILOOP) == 0) || ((qe_csr & QE_ELOOP) != 0);
 }
 
 bool delqa_c::rx_list_ready_for_loopback(void)
@@ -419,21 +446,141 @@ bool delqa_c::rx_list_ready_for_loopback(void)
         return false;
     if (!rcvlist_addr)
         return false;
+    return true;
+}
 
-    uint32_t desc_addr = rx_cur_addr ? rx_cur_addr : rcvlist_addr;
-    if (!desc_addr)
-        return false;
+bool delqa_c::enqueue_rx_packet(const uint8_t *data, size_t len, rx_frame_kind kind, uint64_t due_ns)
+{
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
-    uint16_t words[QE_RING_WORDS];
-    if (!read_descriptor(desc_addr, words)) {
-        set_nxm_error();
+    if (rx_queue.size() >= XQ_QUE_MAX) {
+        rx_queue_loss++;
         return false;
     }
 
-    if (!(words[1] & QE_RING_VALID))
+    size_t copy_len = len;
+    if (copy_len > XQ_MAX_RCV_PACKET)
+        copy_len = XQ_MAX_RCV_PACKET;
+
+    rx_queue_entry entry;
+    entry.data.assign(data, data + copy_len);
+    entry.kind = kind;
+    entry.due_ns = due_ns;
+    rx_queue.push_back(std::move(entry));
+    return true;
+}
+
+bool delqa_c::deliver_rx_queue_entry(void)
+{
+    rx_queue_entry entry;
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        if (rx_queue.empty())
+            return false;
+        if (timeout_c::abstime_ns() < rx_queue.front().due_ns)
+            return false;
+        if ((qe_csr & QE_RL_INVALID) || !rcvlist_addr)
+            return false;
+        entry = rx_queue.front();
+    }
+
+    if (!rx_place_frame(entry.data.data(), entry.data.size(), entry.kind))
         return false;
 
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        if (!rx_queue.empty())
+            rx_queue.pop_front();
+    }
+
     return true;
+}
+
+void delqa_c::reset_sanity_timer(void)
+{
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+
+    if (sanity_quarter_secs == 0 || !(qe_csr & QE_STIM_ENABLE)) {
+        sanity_active = false;
+        return;
+    }
+
+    sanity_active = true;
+    sanity_deadline_ns = timeout_c::abstime_ns() +
+            static_cast<uint64_t>(sanity_quarter_secs) * 250000000ull;
+}
+
+void delqa_c::check_sanity_timer(void)
+{
+    bool expired = false;
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        if (!sanity_active)
+            return;
+        if (timeout_c::abstime_ns() < sanity_deadline_ns)
+            return;
+        sanity_active = false;
+        expired = true;
+    }
+
+    if (expired) {
+        WARNING("DELQA: sanity timer expired");
+        reset_controller();
+    }
+}
+
+void delqa_c::update_pcap_filter(void)
+{
+#ifdef HAVE_PCAP
+    if (!pcap.is_open())
+        return;
+
+    if (promisc.value || setup_promiscuous) {
+        if (!pcap.set_filter("ip or not ip")) {
+            WARNING("DELQA: pcap filter set failed: %s", pcap.last_error().c_str());
+        }
+        return;
+    }
+
+    std::string filter;
+    auto append_term = [&](const std::string &term) {
+        if (!filter.empty())
+            filter += " or ";
+        filter += term;
+    };
+    auto add_mac = [&](const uint8_t *mac) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "ether dst %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        append_term(buf);
+    };
+    auto mac_is_zero = [](const uint8_t *mac) {
+        return mac[0] == 0 && mac[1] == 0 && mac[2] == 0 &&
+               mac[3] == 0 && mac[4] == 0 && mac[5] == 0;
+    };
+
+    append_term("ether broadcast");
+    if (setup_multicast)
+        append_term("ether multicast");
+
+    if (setup_valid) {
+        for (int i = 0; i < XQ_FILTER_MAX; ++i) {
+            if (!mac_is_zero(setup_macs[i]))
+                add_mac(setup_macs[i]);
+        }
+    } else {
+        add_mac(mac_addr);
+    }
+
+    if (filter.empty())
+        filter = "ip or not ip";
+
+    if (!pcap.set_filter(filter)) {
+        WARNING("DELQA: pcap filter set failed: %s", pcap.last_error().c_str());
+    }
+#endif
 }
 
 uint32_t delqa_c::make_addr(uint16_t hi, uint16_t lo) const
@@ -471,12 +618,12 @@ bool delqa_c::xmt_enabled(void) const
 
 unsigned delqa_c::rx_scan_limit(void) const
 {
-    return rx_slots.value ? rx_slots.value : DELQA_DEFAULT_SCAN;
+    return rx_slots.value;
 }
 
 unsigned delqa_c::tx_scan_limit(void) const
 {
-    return tx_slots.value ? tx_slots.value : DELQA_DEFAULT_SCAN;
+    return tx_slots.value;
 }
 
 void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
@@ -502,13 +649,6 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     case DELQA_REG_RCVLIST_LO:
         rcvlist_lo = val;
         rcvlist_addr = make_addr(rcvlist_hi, static_cast<uint16_t>(rcvlist_lo & ~1u));
-        if (rcvlist_addr == 0 || rcvlist_addr >= qunibus->addr_space_byte_count) {
-            qe_csr |= QE_RL_INVALID;
-            rx_cur_addr = 0;
-        } else {
-            qe_csr &= ~QE_RL_INVALID;
-            rx_cur_addr = rcvlist_addr;
-        }
         update_csr_reg();
         update_intr();
         break;
@@ -528,13 +668,6 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     case DELQA_REG_XMTLIST_LO:
         xmtlist_lo = val;
         xmtlist_addr = make_addr(xmtlist_hi, static_cast<uint16_t>(xmtlist_lo & ~1u));
-        if (xmtlist_addr == 0 || xmtlist_addr >= qunibus->addr_space_byte_count) {
-            qe_csr |= QE_XL_INVALID;
-            tx_cur_addr = 0;
-        } else {
-            qe_csr &= ~QE_XL_INVALID;
-            tx_cur_addr = xmtlist_addr;
-        }
         update_csr_reg();
         update_intr();
         break;
@@ -612,6 +745,10 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         if ((prev ^ qe_csr) & QE_ELOOP) {
             INFO("DELQA: External loopback mode %s", (qe_csr & QE_ELOOP) ? "ON" : "OFF");
             update_station_regs();
+        }
+
+        if ((prev ^ qe_csr) & QE_STIM_ENABLE) {
+            reset_sanity_timer();
         }
 
         update_transceiver_bits();
@@ -727,48 +864,73 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
 
     bool normal_packet = (kind == rx_frame_kind::normal);
     bool setup_packet = (kind == rx_frame_kind::setup);
-    bool bootrom_packet = (kind == rx_frame_kind::bootrom);
-    bool loopback_packet = (kind == rx_frame_kind::loopback || bootrom_packet);
+    bool loopback_packet = (kind == rx_frame_kind::loopback || kind == rx_frame_kind::bootrom);
 
-    if (!normal_packet) {
-        if (!bootrom_packet && (qe_csr & QE_RL_INVALID) &&
-                !(setup_packet || (loopback_packet && (qe_csr & QE_ELOOP)))) {
+    if (normal_packet) {
+        if (!(qe_csr & QE_RCV_ENABLE))
             return false;
-        }
-        if (!rcvlist_addr)
-            return false;
-    } else if (!rcv_enabled()) {
-        return false;
     }
+    if (qe_csr & QE_RL_INVALID)
+        return false;
+    if (!rcvlist_addr)
+        return false;
 
     uint32_t desc_addr = rx_cur_addr ? rx_cur_addr : rcvlist_addr;
     if (!desc_addr)
         return false;
 
-    size_t total_len = (normal_packet && len < 60) ? 60 : len;
+    size_t packet_len = len;
+    if (!loopback_packet && packet_len > XQ_MAX_RCV_PACKET)
+        packet_len = XQ_MAX_RCV_PACKET;
+
+    size_t total_len = packet_len;
+    if (normal_packet && total_len < ETH_MIN_PACKET)
+        total_len = ETH_MIN_PACKET;
+
     size_t remaining = total_len;
     size_t offset = 0;
     unsigned limit = rx_scan_limit();
     bool any_written = false;
     bool error = false;
+    bool long_error = false;
+    bool runt_error = false;
+    bool overflow = false;
 
-    uint16_t rbl_total = normal_packet
-            ? static_cast<uint16_t>((len >= 60) ? (len - 60) : 0)
-            : static_cast<uint16_t>(len);
+    size_t rbl_total = 0;
+    if (normal_packet)
+        rbl_total = (packet_len >= ETH_MIN_PACKET) ? (packet_len - ETH_MIN_PACKET) : 0;
 
-    while (remaining > 0 && limit--) {
+    uint32_t start_desc_addr = desc_addr;
+    unsigned dcount = 0;
+
+    while (remaining > 0) {
+        if (limit && dcount >= limit)
+            break;
+        if (dcount && desc_addr == start_desc_addr)
+            break;
+        ++dcount;
+
         uint16_t words[QE_RING_WORDS];
         if (!read_descriptor(desc_addr, words)) {
             set_nxm_error();
             return false;
         }
 
+        if (trace.value) {
+            INFO("DELQA: RX desc %06o words=%06o %06o %06o %06o %06o %06o",
+                 desc_addr, words[0], words[1], words[2], words[3], words[4], words[5]);
+        }
+
         uint16_t addr_hi = words[1];
+        
+        // Mark descriptor as being used (write 0xFFFF to flag word) - per SimH, do this BEFORE validity check
         uint16_t flag = 0xffff;
         if (!dma_write_words(desc_addr, &flag, 1)) {
             set_nxm_error();
             return false;
         }
+        
+        // Check validity AFTER writing flag (per SimH)
         if (!(addr_hi & QE_RING_VALID)) {
             qe_csr |= QE_RL_INVALID;
             update_csr_reg();
@@ -793,8 +955,8 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
         uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
         size_t buf_bytes = static_cast<size_t>(w_length) * 2;
         size_t chunk = 0;
+        size_t addr_offset = 0;
         if (buf_bytes) {
-            size_t addr_offset = 0;
             if (addr_hi & QE_RING_ODD_BEGIN) {
                 addr_offset = 1;
                 if (buf_bytes)
@@ -807,8 +969,8 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
             chunk = std::min(remaining, buf_bytes);
             if (chunk > 0) {
                 size_t data_avail = 0;
-                if (offset < len)
-                    data_avail = std::min(len - offset, chunk);
+                if (offset < packet_len)
+                    data_avail = std::min(packet_len - offset, chunk);
 
                 if (data_avail) {
                     if (!dma_write_bytes(buf_addr + addr_offset, data + offset, data_avail)) {
@@ -818,7 +980,7 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
                 }
 
                 if (!error && chunk > data_avail) {
-                    uint8_t pad[60] = {0};
+                    uint8_t pad[ETH_MIN_PACKET] = {0};
                     size_t pad_len = chunk - data_avail;
                     if (!dma_write_bytes(buf_addr + addr_offset + data_avail, pad, pad_len)) {
                         error = true;
@@ -831,64 +993,75 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
             }
         }
 
+        if (setup_packet && deqna_lock && buf_bytes && buf_bytes <= chunk + 2) {
+            uint16_t qdtc_chip_extra = 0xC000;
+            if (!dma_write_words(buf_addr + addr_offset + chunk, &qdtc_chip_extra, 1)) {
+                error = true;
+                set_nxm_error();
+            }
+        }
+
         uint16_t status1 = 0;
         uint16_t status2 = 0;
         size_t rbl_status = normal_packet ? rbl_total : chunk;
 
-        if (bootrom_packet) {
-            status1 = (remaining > 0) ? QE_RST_LASTNOT : QE_RST_USED;
-            status2 = 0;
-        } else if (setup_packet) {
+        if (setup_packet) {
             status1 = 0x2700;  // DELQA setup receive status word 1
+        } else if (loopback_packet) {
+            status1 = QE_RST_LASTNOERR;
+            if (chunk && (offset == chunk) && (packet_len < ETH_MIN_PACKET)) {
+                if (qe_csr & QE_RCV_ENABLE) {
+                    if (deqna_lock ||
+                            (memcmp(setup_macs[0], data, 6) != 0)) {
+                        status1 |= static_cast<uint16_t>(QE_RUNT | QE_RST_LASTERR);
+                        runt_error = true;
+                    }
+                }
+            }
+            status1 |= static_cast<uint16_t>(rbl_status & QE_RBL_HI);
+            if (qe_csr & QE_ELOOP)
+                status1 |= QE_ESETUP;
         } else if (normal_packet) {
             status1 = static_cast<uint16_t>(QE_RST_RSVD | (rbl_total & QE_RBL_HI));
-        } else {
-            status1 = static_cast<uint16_t>(rbl_status & QE_RBL_HI);
-            if (loopback_packet && (qe_csr & QE_ELOOP))
-                status1 |= QE_ESETUP;
         }
 
-        if (!bootrom_packet && remaining > 0)
+        if (remaining > 0)
             status1 |= QE_RST_LASTNOT;
-        if (!bootrom_packet && error)
+        if (error)
             status1 |= QE_RST_LASTERR;
 
-        if (!bootrom_packet) {
-            status2 = static_cast<uint16_t>(rbl_status & QE_RBL_LO);
-            status2 = static_cast<uint16_t>((status2 << 8) | status2);
+        status2 = static_cast<uint16_t>(rbl_status & QE_RBL_LO);
+        status2 = static_cast<uint16_t>((status2 << 8) | status2);
+
+        if (rx_queue_loss) {
+            overflow = true;
+            status1 |= QE_OVF;
+            rx_queue_loss = 0;
         }
 
-        // Mark descriptor as processed.
-        words[0] = 0xffff;
+        if (((!(qe_csr & QE_ELOOP)) && normal_packet && (packet_len > ETH_MAX_PACKET)) ||
+                ((qe_csr & QE_ELOOP) && loopback_packet && (rbl_status >= XQ_LONG_PACKET))) {
+            status1 |= QE_RST_LASTERR;
+            long_error = true;
+        }
+
+        // Mark descriptor as processed - set word0=0xFFFF, keep VALID in word1
+        words[0] = 0xFFFF;
         words[4] = status1;
         words[5] = status2;
-
-        if (bootrom_packet) {
-            INFO("DELQA: Bootrom desc_addr=0%o status1=0%o status2=0%o remaining=%u",
-                 desc_addr, status1, status2, static_cast<unsigned>(remaining));
-        }
 
         if (!write_descriptor(desc_addr, words)) {
             set_nxm_error();
             error = true;
         }
 
-        any_written = true;
-        rx_cur_addr = next_desc_addr(desc_addr);
-        if (remaining == 0) {
-            uint16_t next_flag = 0xffff;
-            if (!dma_write_words(rx_cur_addr, &next_flag, 1)) {
-                set_nxm_error();
-                error = true;
-            }
-            uint16_t next_words[QE_RING_WORDS];
-            if (read_descriptor(rx_cur_addr, next_words)) {
-                if (!(next_words[1] & QE_RING_VALID)) {
-                    qe_csr |= QE_RL_INVALID;
-                }
-            }
+        if (trace.value) {
+            INFO("DELQA: RX desc %06o writeback=%06o %06o %06o %06o %06o %06o",
+                 desc_addr, words[0], words[1], words[2], words[3], words[4], words[5]);
         }
 
+        any_written = true;
+        rx_cur_addr = next_desc_addr(desc_addr);
         desc_addr = rx_cur_addr;
 
         if (error)
@@ -899,7 +1072,8 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
         return false;
 
     qe_csr |= QE_RCV_INT;
-    if (error || remaining > 0) {
+    bool packet_error = error || remaining > 0 || long_error || runt_error || overflow;
+    if (packet_error) {
         rx_errors++;
         stat_rx_errors.value = rx_errors;
     } else {
@@ -912,10 +1086,10 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
 
     if (trace.value) {
         INFO("DELQA: RX len=%u %s", static_cast<unsigned>(len),
-             (error || remaining > 0) ? "error" : "ok");
+             packet_error ? "error" : "ok");
     }
 
-    return !(error || remaining > 0);
+    return !packet_error;
 }
 
 bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
@@ -935,12 +1109,17 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
 
     frame.clear();
     unsigned limit = tx_scan_limit();
+    unsigned dcount = 0;
     bool error = false;
     bool eom_seen = false;
     bool any_desc = false;
     bool is_setup = false;
 
-    while (limit--) {
+    while (true) {
+        if (limit && dcount >= limit)
+            break;
+        ++dcount;
+
         uint16_t words[QE_RING_WORDS];
         if (!read_descriptor(desc_addr, words)) {
             set_nxm_error();
@@ -953,13 +1132,15 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         }
 
         uint16_t addr_hi = words[1];
+
+        // Mark descriptor as being used (write 0xFFFF to flag word) - per SimH, do this BEFORE validity check
         uint16_t flag = 0xffff;
         if (!dma_write_words(desc_addr, &flag, 1)) {
             set_nxm_error();
             return false;
         }
 
-        // Check if descriptor is valid
+        // Check if descriptor is valid AFTER writing flag (per SimH)
         if (!(addr_hi & QE_RING_VALID)) {
             INFO("DELQA: TX descriptor at %06o not valid (addr_hi=%06o)", desc_addr, addr_hi);
             qe_csr |= QE_XL_INVALID;
@@ -1025,8 +1206,8 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             eom_seen = (addr_hi & QE_RING_EOMSG) != 0;
 
         if (!eom_seen) {
-            // Mark descriptor as processed.
-            words[0] = 0xffff;
+            // Mark descriptor as processed - implicit chain status
+            words[0] = 0xFFFF;
             words[4] = QE_RST_LASTNOT;
             words[5] = 1;
             if (!write_descriptor(desc_addr, words)) {
@@ -1044,17 +1225,42 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             if (loopback) {
                 if (is_setup)
                     process_setup_packet(frame);
-                rx_frame_kind kind = is_setup ? rx_frame_kind::setup : rx_frame_kind::loopback;
-                // Try immediate delivery; if it fails, queue for retry.
-                if (!rx_place_frame(frame.data(), frame.size(), kind)) {
-                    pending_loopback_data = frame;
-                    pending_loopback_kind = kind;
-                    loopback_pending = true;
-                    loopback_due_ns = timeout_c::abstime_ns() + 400000;
+                bool queue_loopback = true;
+                if (!is_setup && !(qe_csr & QE_ELOOP)) {
+                    queue_loopback = rx_list_ready_for_loopback();
+                    if (queue_loopback) {
+                        uint32_t rx_addr = rx_cur_addr ? rx_cur_addr : rcvlist_addr;
+                        if (rx_addr == 0) {
+                            queue_loopback = false;
+                        } else {
+                            uint16_t rx_words[QE_RING_WORDS];
+                            if (!read_descriptor(rx_addr, rx_words)) {
+                                set_nxm_error();
+                                queue_loopback = false;
+                            } else if (!(rx_words[1] & QE_RING_VALID)) {
+                                queue_loopback = false;
+                            }
+                        }
+                    }
+                }
+
+                if (queue_loopback) {
+                    uint64_t due_ns = timeout_c::abstime_ns() + 400000;
+                    bool queued = enqueue_rx_packet(frame.data(), frame.size(),
+                                                    is_setup ? rx_frame_kind::setup : rx_frame_kind::loopback,
+                                                    due_ns);
+                    if (trace.value) {
+                        INFO("DELQA: loopback queued kind=%s len=%zu (queue=%zu)",
+                             is_setup ? "setup" : "loop", frame.size(), rx_queue.size());
+                        if (!queued)
+                            INFO("DELQA: loopback queue overflow");
+                    }
+                } else if (trace.value) {
+                    INFO("DELQA: dropping loopback packet: no receive buffer");
                 }
             }
 #ifdef HAVE_PCAP
-            else if (!pcap.send(frame.data(), frame.size())) {
+            else if (!pcap.is_open() || !pcap.send(frame.data(), frame.size())) {
                 error = true;
             }
 #else
@@ -1076,12 +1282,14 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             status2 = 1;
         } else {
             uint16_t tdr = static_cast<uint16_t>((100 + frame.size() * 8) & 0x03ff);
-            status1 = static_cast<uint16_t>(0x2000 | (error ? QE_FAIL : 0));
-            status2 = tdr ? tdr : 1;
+            if (!tdr)
+                tdr = 1;
+            status1 = error ? QE_RST_LASTERR : 0;
+            status2 = tdr;
         }
 
-        // Mark descriptor as processed.
-        words[0] = 0xffff;
+        // Mark descriptor as processed - set word0=0xFFFF, keep VALID in word1
+        words[0] = 0xFFFF;
         words[4] = status1;
         words[5] = status2;
 
@@ -1096,6 +1304,8 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         }
 
         tx_cur_addr = next_desc_addr(desc_addr);
+
+        reset_sanity_timer();
 
         qe_csr |= QE_XMIT_INT;
         if (error) {
@@ -1113,7 +1323,16 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             INFO("DELQA: TX len=%u %s", static_cast<unsigned>(frame.size()),
                  error ? "error" : "ok");
         }
-        return true;
+
+        // Continue processing more descriptors (per SimH behavior)
+        // Clear frame for next packet and continue loop
+        any_desc = true;
+        frame.clear();
+        is_setup = false;
+        error = false;
+        eom_seen = false;
+        desc_addr = tx_cur_addr;
+        // Loop continues to check next descriptor
     }
 
     return any_desc;
@@ -1121,32 +1340,79 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
 
 bool delqa_c::process_setup_packet(const std::vector<uint8_t> &frame)
 {
-    if (frame.size() < 128) {
-        // Small setup packets disable promiscuous/multicast modes
-        setup_promiscuous = false;
-        setup_multicast = false;
-        setup_valid = true;
-        return true;
-    }
-
     // Clear existing MAC filters
     memset(setup_macs, 0, sizeof(setup_macs));
 
     // Extract MAC addresses from setup packet
-    // Format: bytes 1-6: MAC0, 9-14: MAC1, etc.
-    for (int i = 0; i < XQ_FILTER_MAX; i++) {
-        size_t offset = 1 + i * 8;
-        if (offset + 6 <= frame.size()) {
-            memcpy(setup_macs[i], &frame[offset], 6);
+    // Format is column-major: two columns of seven addresses.
+    for (int i = 0; i < 7; ++i) {
+        for (int j = 0; j < 6; ++j) {
+            size_t offset = static_cast<size_t>(i + 1 + j * 8);
+            if (offset < frame.size())
+                setup_macs[i][j] = frame[offset];
+            offset = static_cast<size_t>(i + 65 + j * 8);
+            if (offset < frame.size())
+                setup_macs[i + 7][j] = frame[offset];
         }
     }
 
-    // Extract control flags from packet length
-    uint16_t len = static_cast<uint16_t>(frame.size());
-    setup_multicast = (len & 0x0001) != 0;
-    setup_promiscuous = (len & 0x0002) != 0;
+    // Small setup packets only disable promiscuous mode.
+    setup_promiscuous = false;
+    if (frame.size() > 128) {
+        uint16_t len = static_cast<uint16_t>(frame.size());
+        uint16_t led = static_cast<uint16_t>((len & QE_SETUP_LD) >> 2);
+        uint16_t san = static_cast<uint16_t>((len & QE_SETUP_ST) >> 4);
+
+        setup_multicast = (len & QE_SETUP_MC) != 0;
+        setup_promiscuous = (len & QE_SETUP_PM) != 0;
+
+        switch (led) {
+        case 1:
+            setup_l1 = false;
+            break;
+        case 2:
+            setup_l2 = false;
+            break;
+        case 3:
+            setup_l3 = false;
+            break;
+        default:
+            break;
+        }
+
+        switch (san) {
+        case 0:
+            sanity_quarter_secs = 1;
+            break;
+        case 1:
+            sanity_quarter_secs = 4;
+            break;
+        case 2:
+            sanity_quarter_secs = 16;
+            break;
+        case 3:
+            sanity_quarter_secs = 64;
+            break;
+        case 4:
+            sanity_quarter_secs = 1 * 60 * 4;
+            break;
+        case 5:
+            sanity_quarter_secs = 4 * 60 * 4;
+            break;
+        case 6:
+            sanity_quarter_secs = 16 * 60 * 4;
+            break;
+        case 7:
+            sanity_quarter_secs = 64 * 60 * 4;
+            break;
+        default:
+            break;
+        }
+    }
 
     setup_valid = true;
+    reset_sanity_timer();
+    update_pcap_filter();
 
     INFO("DELQA: Setup packet processed: len=%zu, promisc=%d multicast=%d",
          frame.size(), setup_promiscuous, setup_multicast);
@@ -1166,11 +1432,10 @@ bool delqa_c::process_bootrom(void)
 {
     // Cannot do DMA from register callback - CPU owns the bus.
     // Set flag and let worker thread handle it.
-    if (rcvlist_addr && rcvlist_addr < qunibus->addr_space_byte_count) {
-        qe_csr &= ~QE_RL_INVALID;
-        rx_cur_addr = rcvlist_addr;
-        update_csr_reg();
-    }
+    setup_l1 = true;
+    setup_l2 = true;
+    setup_l3 = true;
+    reset_sanity_timer();
     bootrom_pending = true;
     return true;
 }
@@ -1179,7 +1444,7 @@ bool delqa_c::do_bootrom_transfer(void)
 {
     const uint8_t *bootrom_bytes = reinterpret_cast<const uint8_t *>(delqa_bootrom);
     size_t bootrom_len = sizeof(delqa_bootrom);
-    return rx_place_frame(bootrom_bytes, bootrom_len, rx_frame_kind::bootrom);
+    return enqueue_rx_packet(bootrom_bytes, bootrom_len, rx_frame_kind::bootrom, timeout_c::abstime_ns());
 }
 
 void delqa_c::worker(unsigned instance)
@@ -1198,39 +1463,17 @@ void delqa_c::worker_rx(void)
     std::vector<uint8_t> frame(2048);
 
     while (!workers_terminate) {
-        // Check for deferred bootrom transfer first
+        check_sanity_timer();
+
+        if (deliver_rx_queue_entry())
+            continue;
+
+        // Check for deferred bootrom transfer.
         if (bootrom_pending) {
             if (do_bootrom_transfer()) {
                 bootrom_pending = false;
             } else {
                 timeout_c::wait_ms(1);
-            }
-            continue;
-        }
-
-        // Check for pending loopback
-        if (loopback_pending) {
-            if (timeout_c::abstime_ns() < loopback_due_ns) {
-                timeout_c::wait_ms(1);
-                continue;
-            }
-            std::vector<uint8_t> lb_data;
-            rx_frame_kind lb_kind = rx_frame_kind::normal;  // Initialize to avoid warning
-            {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                if (loopback_pending) {
-                    lb_data = pending_loopback_data;
-                    lb_kind = pending_loopback_kind;
-                }
-            }
-            if (!lb_data.empty()) {
-                if (rx_place_frame(lb_data.data(), lb_data.size(), lb_kind)) {
-                    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                    loopback_pending = false;
-                    pending_loopback_data.clear();
-                } else {
-                    timeout_c::wait_ms(1);
-                }
             }
             continue;
         }
@@ -1260,7 +1503,7 @@ void delqa_c::worker_rx(void)
             continue;
         }
 
-        if (len >= 6 && !promisc.value) {
+        if (len >= 6 && !(promisc.value || setup_promiscuous)) {
             const uint8_t *dst = frame.data();
             bool broadcast = (dst[0] == 0xff && dst[1] == 0xff && dst[2] == 0xff &&
                               dst[3] == 0xff && dst[4] == 0xff && dst[5] == 0xff);
@@ -1295,11 +1538,25 @@ void delqa_c::worker_rx(void)
                 continue;
         }
 
-        rx_place_frame(frame.data(), len, rx_frame_kind::normal);
+        enqueue_rx_packet(frame.data(), len, rx_frame_kind::normal, timeout_c::abstime_ns());
     }
 #else
+    worker_init_realtime_priority(rt_device);
+
     while (!workers_terminate) {
-        timeout_c::wait_ms(100);
+        check_sanity_timer();
+
+        if (deliver_rx_queue_entry())
+            continue;
+        if (bootrom_pending) {
+            if (do_bootrom_transfer()) {
+                bootrom_pending = false;
+            } else {
+                timeout_c::wait_ms(1);
+            }
+            continue;
+        }
+        timeout_c::wait_ms(1);
     }
 #endif
 }
@@ -1312,12 +1569,7 @@ void delqa_c::worker_tx(void)
     std::vector<uint8_t> frame(2048);
 
     while (!workers_terminate) {
-        // In loopback mode, we can process TX even without pcap open
-        // because we just loop the frame back to RX
-        if (!pcap.is_open() && !loopback_enabled()) {
-            timeout_c::wait_ms(1);
-            continue;
-        }
+        check_sanity_timer();
         if (qunibusadapter->line_INIT) {
             timeout_c::wait_ms(1);
             continue;
@@ -1328,16 +1580,13 @@ void delqa_c::worker_tx(void)
         }
     }
 #else
-    // Without PCAP, we can still handle loopback mode
+    // Without PCAP, still process TX descriptors (loopback only).
     worker_init_realtime_priority(rt_device);
 
     std::vector<uint8_t> frame(2048);
 
     while (!workers_terminate) {
-        if (!loopback_enabled()) {
-            timeout_c::wait_ms(100);
-            continue;
-        }
+        check_sanity_timer();
         if (qunibusadapter->line_INIT) {
             timeout_c::wait_ms(1);
             continue;
