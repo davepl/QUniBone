@@ -107,6 +107,7 @@ private:
     bool deqna_lock = false;
     bool rx_delay_active = false;
     uint64_t rx_enable_deadline_ns = 0;
+    volatile bool bootrom_pending = false;
 
     // Statistics counters
     uint64_t rx_frames = 0;
@@ -151,6 +152,7 @@ private:
     bool tx_take_frame(std::vector<uint8_t> &frame);
     bool process_setup_packet(const std::vector<uint8_t> &frame);
     bool process_bootrom(void);
+    void do_bootrom_transfer(void);
 
     uint32_t make_addr(uint16_t hi, uint16_t lo) const;
     uint32_t next_desc_addr(uint32_t addr) const;

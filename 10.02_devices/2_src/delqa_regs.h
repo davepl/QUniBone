@@ -67,10 +67,12 @@
 #define QE_RING_VALID        0x8000
 
 // Receive status word values
-#define QE_RST_UNUSED     0x8000
-#define QE_RST_LASTNOT    0xC000
-#define QE_RST_LASTERR    0x4000
-#define QE_RST_LASTNOERR  0x0000
+// Bit 15 = "used" (descriptor processed), Bit 14 = "not last" (more segments follow)
+#define QE_RST_USED       0x8000  // Descriptor has been processed
+#define QE_RST_NOTLAST    0x4000  // Not the last segment (more data follows)
+#define QE_RST_LASTNOT    0xC000  // Used + Not last (for compatibility)
+#define QE_RST_LASTERR    0x4000  // Error on last segment
+#define QE_RST_LASTNOERR  0x8000  // Last segment, no error (USED bit set)
 #define QE_RST_RSVD       0x00f8
 
 #define QE_OVF        0x0001

@@ -268,6 +268,7 @@ void delqa_c::reset_controller(void)
     deqna_lock = false;
     rx_delay_active = false;
     rx_enable_deadline_ns = 0;
+    bootrom_pending = false;
     setup_valid = false;
     setup_promiscuous = false;
     setup_multicast = false;
@@ -403,7 +404,8 @@ bool delqa_c::rx_ready(void)
 
 bool delqa_c::loopback_enabled(void) const
 {
-    return (qe_csr & QE_ELOOP) || !(qe_csr & QE_ILOOP);
+    // Loopback is enabled if ILOOP (internal) or ELOOP (external) is set
+    return (qe_csr & (QE_ILOOP | QE_ELOOP)) != 0;
 }
 
 uint32_t delqa_c::make_addr(uint16_t hi, uint16_t lo) const
@@ -907,6 +909,12 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             return false;
         }
 
+        // Check if descriptor is ready (flag word = QE_NOTYET means "not yet processed")
+        if (words[0] != QE_NOTYET) {
+            // Descriptor already processed or not ready - stop scanning
+            break;
+        }
+
         uint16_t flag = 0xffff;
         if (!dma_write_words(desc_addr, &flag, 1)) {
             set_nxm_error();
@@ -1099,27 +1107,25 @@ bool delqa_c::process_setup_packet(const std::vector<uint8_t> &frame)
 
 bool delqa_c::process_bootrom(void)
 {
-    INFO("DELQA: Processing bootrom request, rcvlist_addr=0%o, RL=%d",
-         rcvlist_addr, (qe_csr & QE_RL_INVALID) ? 1 : 0);
-         
+    // Cannot do DMA from register callback - CPU owns the bus.
+    // Set flag and let worker thread handle it.
     if (rcvlist_addr && rcvlist_addr < qunibus->addr_space_byte_count) {
         qe_csr &= ~QE_RL_INVALID;
         rx_cur_addr = rcvlist_addr;
         update_csr_reg();
-        INFO("DELQA: Bootrom: cleared RL, rx_cur_addr=0%o", rx_cur_addr);
-    } else {
-        WARNING("DELQA: Bootrom: invalid rcvlist_addr=0%o", rcvlist_addr);
     }
+    bootrom_pending = true;
+    return true;
+}
+
+void delqa_c::do_bootrom_transfer(void)
+{
+    bootrom_pending = false;
     
     const uint8_t *bootrom_bytes = reinterpret_cast<const uint8_t *>(delqa_bootrom);
     size_t bootrom_len = sizeof(delqa_bootrom);
-    INFO("DELQA: Bootrom: sending %u bytes to rx_place_frame", static_cast<unsigned>(bootrom_len));
     
-    bool result = rx_place_frame(bootrom_bytes, bootrom_len, rx_frame_kind::bootrom);
-    INFO("DELQA: Bootrom: rx_place_frame returned %s, CSR=0%o, RI=%d",
-         result ? "success" : "failure", qe_csr,
-         (qe_csr & QE_RCV_INT) ? 1 : 0);
-    return result;
+    rx_place_frame(bootrom_bytes, bootrom_len, rx_frame_kind::bootrom);
 }
 
 void delqa_c::worker(unsigned instance)
@@ -1138,6 +1144,11 @@ void delqa_c::worker_rx(void)
     std::vector<uint8_t> frame(2048);
 
     while (!workers_terminate) {
+        // Check for deferred bootrom transfer first
+        if (bootrom_pending) {
+            do_bootrom_transfer();
+        }
+
         if (!pcap.is_open()) {
             timeout_c::wait_ms(1);
             continue;
