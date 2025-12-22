@@ -270,6 +270,7 @@ void delqa_c::reset_controller(void)
     rx_enable_deadline_ns = 0;
     bootrom_pending = false;
     loopback_pending = false;
+    loopback_due_ns = 0;
     pending_loopback_data.clear();
     setup_valid = false;
     setup_promiscuous = false;
@@ -408,6 +409,33 @@ bool delqa_c::loopback_enabled(void) const
 {
     // Loopback is enabled if ILOOP (internal) or ELOOP (external) is set
     return (qe_csr & (QE_ILOOP | QE_ELOOP)) != 0;
+}
+
+bool delqa_c::rx_list_ready_for_loopback(void)
+{
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+
+    if (qe_csr & QE_RL_INVALID)
+        return false;
+    if (!rcvlist_addr)
+        return false;
+
+    uint32_t desc_addr = rx_cur_addr ? rx_cur_addr : rcvlist_addr;
+    if (!desc_addr)
+        return false;
+
+    uint16_t words[QE_RING_WORDS];
+    if (!read_descriptor(desc_addr, words)) {
+        set_nxm_error();
+        return false;
+    }
+
+    if (!(words[1] & QE_RING_VALID))
+        return false;
+    if (words[0] != QE_NOTYET)
+        return false;
+
+    return true;
 }
 
 uint32_t delqa_c::make_addr(uint16_t hi, uint16_t lo) const
@@ -762,12 +790,10 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
         }
 
         uint32_t buf_addr = make_addr(addr_hi, words[2]);
-        int16_t buf_words = static_cast<int16_t>(words[3]);
-
-        if (buf_words >= 0) {
-            error = true;
-        } else {
-            size_t buf_bytes = static_cast<size_t>(-buf_words) * 2;
+        uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
+        size_t buf_bytes = static_cast<size_t>(w_length) * 2;
+        size_t chunk = 0;
+        if (buf_bytes) {
             size_t addr_offset = 0;
             if (addr_hi & QE_RING_ODD_BEGIN) {
                 addr_offset = 1;
@@ -778,11 +804,8 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
                 if (buf_bytes)
                     buf_bytes--;
             }
-
-            size_t chunk = std::min(remaining, buf_bytes);
-            if (chunk == 0) {
-                error = true;
-            } else {
+            chunk = std::min(remaining, buf_bytes);
+            if (chunk > 0) {
                 size_t data_avail = 0;
                 if (offset < len)
                     data_avail = std::min(len - offset, chunk);
@@ -810,28 +833,34 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
 
         uint16_t status1 = 0;
         uint16_t status2 = 0;
+        size_t rbl_status = normal_packet ? rbl_total : chunk;
 
-        if (setup_packet) {
-            status1 = static_cast<uint16_t>(QE_ESETUP | (rbl_total & QE_RBL_HI));
-        } else if (bootrom_packet) {
-            status1 = static_cast<uint16_t>(rbl_total & QE_RBL_HI);
+        if (bootrom_packet) {
+            status1 = (remaining > 0) ? QE_RST_LASTNOT : QE_RST_USED;
+            status2 = 0;
+        } else if (setup_packet) {
+            status1 = 0x2700;  // DELQA setup receive status word 1
         } else if (normal_packet) {
             status1 = static_cast<uint16_t>(QE_RST_RSVD | (rbl_total & QE_RBL_HI));
         } else {
-            status1 = static_cast<uint16_t>(rbl_total & QE_RBL_HI);
+            status1 = static_cast<uint16_t>(rbl_status & QE_RBL_HI);
             if (loopback_packet && (qe_csr & QE_ELOOP))
                 status1 |= QE_ESETUP;
         }
 
-        if (remaining > 0)
+        if (!bootrom_packet && remaining > 0)
             status1 |= QE_RST_LASTNOT;
-        if (error)
+        if (!bootrom_packet && error)
             status1 |= QE_RST_LASTERR;
 
-        status2 = static_cast<uint16_t>(rbl_total & QE_RBL_LO);
-        status2 = static_cast<uint16_t>((status2 << 8) | status2);
+        if (!bootrom_packet) {
+            status2 = static_cast<uint16_t>(rbl_status & QE_RBL_LO);
+            status2 = static_cast<uint16_t>((status2 << 8) | status2);
+        }
 
         words[0] = 0xffff;
+        // Mark descriptor as processed.
+        words[1] = static_cast<uint16_t>(addr_hi & ~QE_RING_VALID);
         words[4] = status1;
         words[5] = status2;
 
@@ -849,6 +878,13 @@ bool delqa_c::rx_place_frame(const uint8_t *data, size_t len, rx_frame_kind kind
         rx_cur_addr = next_desc_addr(desc_addr);
 
         uint16_t next_words[QE_RING_WORDS];
+        if (remaining == 0) {
+            uint16_t next_flag = 0xffff;
+            if (!dma_write_words(rx_cur_addr, &next_flag, 1)) {
+                set_nxm_error();
+                error = true;
+            }
+        }
         if (read_descriptor(rx_cur_addr, next_words)) {
             if (!(next_words[1] & QE_RING_VALID)) {
                 qe_csr |= QE_RL_INVALID;
@@ -981,6 +1017,8 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
             eom_seen = (addr_hi & QE_RING_EOMSG) != 0;
 
         if (!eom_seen) {
+            // Mark descriptor as processed.
+            words[1] = static_cast<uint16_t>(addr_hi & ~QE_RING_VALID);
             words[0] = 0xffff;
             words[4] = QE_RST_LASTNOT;
             words[5] = 1;
@@ -998,10 +1036,11 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         if (!error) {
             if (loopback) {
                 rx_frame_kind kind = is_setup ? rx_frame_kind::setup : rx_frame_kind::loopback;
-                // Queue for worker thread to handle
+                // Queue for worker thread to handle (with delay like real hardware)
                 pending_loopback_data = frame;
                 pending_loopback_kind = kind;
                 loopback_pending = true;
+                loopback_due_ns = timeout_c::abstime_ns() + 400000;
             }
 #ifdef HAVE_PCAP
             else if (!pcap.send(frame.data(), frame.size())) {
@@ -1031,6 +1070,8 @@ bool delqa_c::tx_take_frame(std::vector<uint8_t> &frame)
         }
 
         words[0] = 0xffff;
+        // Mark descriptor as processed.
+        words[1] = static_cast<uint16_t>(addr_hi & ~QE_RING_VALID);
         words[4] = status1;
         words[5] = status2;
 
@@ -1154,6 +1195,14 @@ void delqa_c::worker_rx(void)
 
         // Check for pending loopback
         if (loopback_pending) {
+            if (timeout_c::abstime_ns() < loopback_due_ns) {
+                timeout_c::wait_ms(1);
+                continue;
+            }
+            if (!rx_list_ready_for_loopback()) {
+                timeout_c::wait_ms(1);
+                continue;
+            }
             std::vector<uint8_t> lb_data;
             rx_frame_kind lb_kind = rx_frame_kind::normal;  // Initialize to avoid warning
             {

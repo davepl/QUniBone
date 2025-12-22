@@ -116,6 +116,7 @@ private:
     std::vector<uint8_t> pending_loopback_data;
     rx_frame_kind pending_loopback_kind = rx_frame_kind::normal;
     volatile bool loopback_pending = false;
+    uint64_t loopback_due_ns = 0;
 
     bool deqna_lock = false;
     bool rx_delay_active = false;
