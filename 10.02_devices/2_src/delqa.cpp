@@ -953,6 +953,11 @@ bool delqa_c::process_rbdl(void)
         }
         WARNING("DELQA: RX process start at %06o (queue=%zu csr=%06o)",
                 cur_ba, queue_size, csr_snapshot);
+        if (queue_size == 0) {
+            WARNING("DELQA: RX process idle at %06o (queue empty, csr=%06o)",
+                    cur_ba, csr_snapshot);
+            break;
+        }
         uint16_t words[QE_RING_WORDS] = {0};
         uint16_t flag = 0xFFFF;
 
@@ -1053,9 +1058,16 @@ bool delqa_c::process_rbdl(void)
             rbuf = item.packet.msg.data();
         }
 
-        if (rbl > b_length)
+        size_t used_before = item.packet.used;
+        size_t remaining = item.packet.len - used_before;
+        bool overflow = false;
+        if (rbl > b_length) {
             rbl = b_length;
-        item.packet.used += rbl;
+            overflow = true;
+        }
+        item.packet.used = used_before + rbl;
+        if (overflow)
+            item.packet.used = item.packet.len;
 
         if (!dma_write_bytes(address, rbuf, rbl)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1082,9 +1094,12 @@ bool delqa_c::process_rbdl(void)
             break;
         }
 
-        // SimH: XQ_RST_LASTNOT if packet has more data to deliver
-        if (item.packet.used < item.packet.len)
+        if (overflow) {
+            words[4] |= QE_RST_LASTERR;
+            words[4] |= QE_OVF | QE_DISCARD;
+        } else if (item.packet.used < item.packet.len) {
             words[4] |= QE_RST_LASTNOT;  // 0xC000 = not last segment
+        }
         words[5] = static_cast<uint16_t>(((rbl & 0x00FF) << 8) | (rbl & 0x00FF));
 
         bool loss = false;
