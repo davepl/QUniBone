@@ -93,6 +93,8 @@ static const uint16_t XQ_VEC_IV = QE_VEC_IV;
 static const uint16_t XQ_VEC_RO = QE_VEC_RO;
 static const uint16_t XQ_VEC_RW = QE_VEC_RW;
 
+static const char *DELQA_VERSION = "v011";  // Increment on each change
+
 static const uint16_t XQ_SETUP_MC = 0x0001;
 static const uint16_t XQ_SETUP_PM = 0x0002;
 static const uint16_t XQ_SETUP_LD = 0x000C;
@@ -855,46 +857,30 @@ void delqa_c::enqueue_readq(int type, const uint8_t *data, size_t len, int statu
 bool delqa_c::dispatch_rbdl(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
-    csr_set_clr(0, XQ_CSR_RL);
 
+    // SimH: clear RL and recalculate rbdl_ba from base registers
+    csr_set_clr(0, XQ_CSR_RL);
+    rbdl_ba = make_addr(rbdl[1], static_cast<uint16_t>(rbdl[0] & ~1u));
     if (rbdl_ba == 0)
         return false;
 
-    WARNING("DELQA: RX list dispatch enter at %06o (csr=%06o queue=%zu)",
+    WARNING("DELQA: RX list dispatch at %06o (csr=%06o queue=%zu)",
             rbdl_ba, csr, read_queue.size());
-    WARNING("DELQA: RX list dispatch after RL clear at %06o (csr=%06o)",
-            rbdl_ba, csr);
 
-    uint16_t words[QE_RING_WORDS] = {0};
-    uint16_t flag = 0xFFFF;
-
-    if (!dma_write_words(rbdl_ba, &flag, 1)) {
-        nxm_error();
-        return false;
-    }
-    if (!dma_read_words(rbdl_ba + 2, &words[1], QE_RING_WORDS - 1)) {
+    // SimH: only READ the descriptor in dispatch, don't write 0xFFFF yet
+    uint16_t words[4] = {0};
+    if (!dma_read_words(rbdl_ba, words, 4)) {
         nxm_error();
         return false;
     }
 
-    WARNING("DELQA: RX list dispatch read words1=%06o words2=%06o words3=%06o",
-            words[1], words[2], words[3]);
+    WARNING("DELQA: RX dispatch read words0=%06o words1=%06o words2=%06o words3=%06o",
+            words[0], words[1], words[2], words[3]);
 
-    if (~words[1] & XQ_DSC_V) {
-        WARNING("DELQA: RX descriptor at %06o not valid (addr_hi=%06o)",
-                rbdl_ba, words[1]);
-        csr_set_clr(XQ_CSR_RL, 0);
-        return false;
-    }
-
-    if (!read_queue.empty()) {
-        WARNING("DELQA: RX list dispatch has data (queue=%zu)", read_queue.size());
+    // Process any waiting packets in receive queue
+    if (!read_queue.empty())
         return process_rbdl();
-    }
 
-    WARNING("DELQA: RX list dispatch idle at %06o (queue empty, csr=%06o)",
-            rbdl_ba, csr);
-    touch_rbdl_if_idle();
     return true;
 }
 
@@ -988,7 +974,8 @@ bool delqa_c::process_rbdl(void)
             return false;
         }
 
-        words[4] = static_cast<uint16_t>(XQ_DSC_V);
+        // Status word 1: start with 0 (last segment, no errors), add type-specific bits
+        words[4] = 0;
         switch (item.type) {
         case 0:
             stats.setup++;
@@ -1006,8 +993,9 @@ bool delqa_c::process_rbdl(void)
             break;
         }
 
+        // SimH: XQ_RST_LASTNOT if packet has more data to deliver
         if (item.packet.used < item.packet.len)
-            words[4] |= static_cast<uint16_t>(XQ_DSC_C);
+            words[4] |= QE_RST_LASTNOT;  // 0xC000 = not last segment
         words[5] = static_cast<uint16_t>(((rbl & 0x00FF) << 8) | (rbl & 0x00FF));
 
         if (read_queue_loss) {
@@ -1031,54 +1019,17 @@ bool delqa_c::process_rbdl(void)
         rbdl_ba += QE_RING_BYTES;
     }
 
-    if (read_queue.empty())
-        touch_rbdl_if_idle();
-
     return true;
 }
 
 void delqa_c::touch_rbdl_if_idle(void)
 {
+    // SimH doesn't have this function - descriptors are only touched when processing packets
+    // Just log for debugging, no DMA operations
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
     if (!read_queue.empty())
         return;
-    if (rbdl_ba == 0)
-        return;
-
-    WARNING("DELQA: RX idle touch at %06o (csr=%06o)", rbdl_ba, csr);
-
-    while (true) {
-        uint16_t words[QE_RING_WORDS] = {0};
-        uint16_t flag = 0xFFFF;
-
-        if (!dma_write_words(rbdl_ba, &flag, 1)) {
-            nxm_error();
-            return;
-        }
-        if (!dma_read_words(rbdl_ba + 2, &words[1], QE_RING_WORDS - 1)) {
-            nxm_error();
-            return;
-        }
-
-        WARNING("DELQA: RX idle desc %06o words1=%06o words2=%06o words3=%06o",
-                rbdl_ba, words[1], words[2], words[3]);
-
-        if (~words[1] & XQ_DSC_V) {
-            WARNING("DELQA: RX descriptor at %06o not valid (addr_hi=%06o)",
-                    rbdl_ba, words[1]);
-            csr_set_clr(XQ_CSR_RL, 0);
-            return;
-        }
-
-        if (words[1] & XQ_DSC_C) {
-            rbdl_ba = make_addr(words[1], words[2]);
-            continue;
-        }
-
-        WARNING("DELQA: RX list idle at %06o (descriptor valid, queue empty, csr=%06o)",
-                rbdl_ba, csr);
-        return;
-    }
+    WARNING("DELQA: RX idle at %06o (queue empty)", rbdl_ba);
 }
 
 bool delqa_c::dispatch_xbdl(void)
@@ -1086,6 +1037,8 @@ bool delqa_c::dispatch_xbdl(void)
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
     csr_set_clr(0, XQ_CSR_XL);
 
+    // SimH: Always recalculate xbdl_ba from base registers when dispatching
+    xbdl_ba = make_addr(xbdl[1], static_cast<uint16_t>(xbdl[0] & ~1u));
     if (xbdl_ba == 0)
         return false;
 
@@ -1176,11 +1129,15 @@ bool delqa_c::process_xbdl(void)
         write_buffer.len += b_length;
 
         if (words[1] & XQ_DSC_E) {
-            bool loopback = (!(csr & XQ_CSR_RE)) && ((!(csr & XQ_CSR_IL)) || (csr & XQ_CSR_EL));
+            // SimH: loopback if IL=0 (internal) OR EL=1 (external), independent of RE
+            bool il_clear = !(csr & XQ_CSR_IL);
+            bool el_set = (csr & XQ_CSR_EL) != 0;
+            bool loopback = il_clear || el_set;
             bool setup_packet = (words[1] & XQ_DSC_S) != 0;
 
-            WARNING("DELQA: TX EOMSG len=%u setup=%d loopback=%d csr=%06o",
-                    write_buffer.len, setup_packet ? 1 : 0, loopback ? 1 : 0, csr);
+            WARNING("DELQA: TX EOMSG len=%u setup=%d loopback=%d (IL_clear=%d EL_set=%d) csr=%06o",
+                    write_buffer.len, setup_packet ? 1 : 0, loopback ? 1 : 0,
+                    il_clear ? 1 : 0, el_set ? 1 : 0, csr);
 
             if (loopback || setup_packet) {
                 if (setup_packet) {
@@ -1363,10 +1320,13 @@ bool delqa_c::process_bootrom(void)
             return false;
         }
 
+        // Status word 1 for bootrom: DELQA sets bit 15 on both packets,
+        // and additionally bit 14 if not the last segment.
+        // First descriptor = 0xC000 (bits 15,14), Second = 0x8000 (bit 15 only)
         if (part == 0)
-            words[4] = static_cast<uint16_t>(XQ_DSC_V | XQ_DSC_C);
+            words[4] = QE_RST_LASTNOT;  // 0xC000 = not last segment
         else
-            words[4] = static_cast<uint16_t>(XQ_DSC_V);
+            words[4] = QE_RST_UNUSED;   // 0x8000 = last segment (bootrom special)
         words[5] = 0;
         if (!dma_write_words(rbdl_ba + 8, &words[4], 2)) {
             nxm_error();
@@ -1384,7 +1344,6 @@ bool delqa_c::process_bootrom(void)
 
     csr_set_clr(XQ_CSR_RI, 0);
     reset_sanity_timer();
-    touch_rbdl_if_idle();
     return true;
 }
 
@@ -1507,7 +1466,7 @@ bool delqa_c::send_system_id(const uint8_t *dest, uint16_t receipt_id)
 
 void delqa_c::worker(unsigned instance)
 {
-    WARNING("DELQA: build %s %s worker(%u) start", __DATE__, __TIME__, instance);
+    WARNING("DELQA: %s worker(%u) start", DELQA_VERSION, instance);
     if (instance == 0)
         worker_rx();
     else
