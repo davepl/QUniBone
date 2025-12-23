@@ -85,63 +85,77 @@ private:
     std::recursive_mutex state_mutex;
     std::recursive_mutex dma_mutex;
 
-    uint16_t rcvlist_lo = 0;
-    uint16_t rcvlist_hi = 0;
-    uint16_t xmtlist_lo = 0;
-    uint16_t xmtlist_hi = 0;
-    uint16_t qe_vector = 0;
-    uint16_t qe_csr = 0;
+    struct setup_state {
+        bool valid = false;
+        bool promiscuous = false;
+        bool multicast = false;
+        bool l1 = true;
+        bool l2 = true;
+        bool l3 = true;
+        int sanity_timer = 0;
+        uint8_t macs[XQ_FILTER_MAX][6] = {{0}};
+    } setup;
 
-    uint32_t rcvlist_addr = 0;
-    uint32_t xmtlist_addr = 0;
-    uint32_t rx_cur_addr = 0;
-    uint32_t tx_cur_addr = 0;
+    struct sanity_state {
+        int enabled = 0; // 2=HW, 1=SW, 0=off
+        int quarter_secs = 0;
+        int max = 0;
+        int timer = 0;
+    } sanity;
+
+    struct stats_state {
+        uint64_t recv = 0;
+        uint64_t filter = 0;
+        uint64_t xmit = 0;
+        uint64_t fail = 0;
+        uint64_t runt = 0;
+        uint64_t giant = 0;
+        uint64_t setup = 0;
+        uint64_t loop = 0;
+    } stats;
+
+    struct packet_buffer {
+        std::vector<uint8_t> msg;
+        size_t len = 0;
+        size_t used = 0;
+        int status = 0;
+    } read_buffer, write_buffer;
+
+    struct queue_item {
+        int type = 0; // 0=setup, 1=loopback, 2=normal
+        packet_buffer packet;
+    };
+
+    std::deque<queue_item> read_queue;
+    unsigned read_queue_loss = 0;
+
+    uint16_t rbdl[2] = {0, 0};
+    uint16_t xbdl[2] = {0, 0};
+    uint16_t var = 0;
+    uint16_t csr = 0;
+    bool irq = false;
+
+    uint32_t rbdl_ba = 0;
+    uint32_t xbdl_ba = 0;
 
     bool mac_override = false;
     uint8_t mac_addr[6] = {0};
     uint8_t mac_checksum[2] = {0};
 
-    // Setup packet state
-    bool setup_valid = false;
-    bool setup_promiscuous = false;
-    bool setup_multicast = false;
-    uint8_t setup_macs[XQ_FILTER_MAX][6] = {{0}};
-    bool setup_l1 = true;
-    bool setup_l2 = true;
-    bool setup_l3 = true;
-    unsigned sanity_quarter_secs = 0;
-    bool sanity_active = false;
-    uint64_t sanity_deadline_ns = 0;
-
-    enum class rx_frame_kind {
-        normal,
-        setup,
-        loopback,
-        bootrom
-    };
-
-    struct rx_queue_entry {
-        std::vector<uint8_t> data;
-        rx_frame_kind kind = rx_frame_kind::normal;
-        uint64_t due_ns = 0;
-    };
-
-    // Pending RX packets (protected by state_mutex)
-    std::deque<rx_queue_entry> rx_queue;
-    unsigned rx_queue_loss = 0;
-
     bool deqna_lock = false;
     bool rx_delay_active = false;
     uint64_t rx_enable_deadline_ns = 0;
-    volatile bool bootrom_pending = false;
+    bool bootrom_pending = false;
+    bool rbdl_pending = false;
+    bool xbdl_pending = false;
 
-    // Statistics counters
-    uint64_t rx_frames = 0;
-    uint64_t tx_frames = 0;
-    uint64_t rx_errors = 0;
-    uint64_t tx_errors = 0;
+    int idtmr = 0;
+
+    std::vector<uint8_t> bootrom_image;
+    bool bootrom_ready = false;
 
     void reset_controller(void);
+    void sw_reset(void);
 
     void update_mac_checksum(void);
     void update_station_regs(void);
@@ -149,16 +163,15 @@ private:
     void update_csr_reg(void);
     void update_transceiver_bits(void);
     void update_intr(void);
-    bool get_intr_level(void) const;
+
+    void set_int(void);
+    void clr_int(void);
+    void csr_set_clr(uint16_t set_bits, uint16_t clear_bits);
+    void nxm_error(void);
 
     void start_rx_delay(void);
     bool rx_ready(void);
-    bool loopback_enabled(void) const;
-    bool rx_list_ready_for_loopback(void);
-    bool enqueue_rx_packet(const uint8_t *data, size_t len, rx_frame_kind kind, uint64_t due_ns);
-    bool deliver_rx_queue_entry(void);
-    void reset_sanity_timer(void);
-    void check_sanity_timer(void);
+
     void update_pcap_filter(void);
 
     void worker_rx(void);
@@ -169,24 +182,28 @@ private:
     bool dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len);
     bool dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len);
 
-    bool read_descriptor(uint32_t addr, uint16_t words[QE_RING_WORDS]);
-    bool write_descriptor(uint32_t addr, const uint16_t words[QE_RING_WORDS]);
-
-    bool rx_place_frame(const uint8_t *data, size_t len,
-                        rx_frame_kind kind = rx_frame_kind::normal);
-    bool tx_take_frame(std::vector<uint8_t> &frame);
-    bool process_setup_packet(const std::vector<uint8_t> &frame);
-    bool process_bootrom(void);
-    bool do_bootrom_transfer(void);
-
     uint32_t make_addr(uint16_t hi, uint16_t lo) const;
-    uint32_t next_desc_addr(uint32_t addr) const;
-    void set_nxm_error(void);
 
-    bool rcv_enabled(void) const;
-    bool xmt_enabled(void) const;
-    unsigned rx_scan_limit(void) const;
-    unsigned tx_scan_limit(void) const;
+    void enqueue_readq(int type, const uint8_t *data, size_t len, int status);
+    bool process_rbdl(void);
+    bool dispatch_rbdl(void);
+
+    bool process_xbdl(void);
+    bool dispatch_xbdl(void);
+    void write_callback(int status);
+
+    void process_setup(void);
+    bool process_bootrom(void);
+    bool ensure_bootrom_image(void);
+    void touch_rbdl_if_idle(void);
+
+    bool process_local(const uint8_t *data, size_t len);
+    bool process_loopback(const uint8_t *data, size_t len);
+    bool process_remote_console(const uint8_t *data, size_t len);
+    bool send_system_id(const uint8_t *dest, uint16_t receipt_id);
+
+    void reset_sanity_timer(void);
+    void service_timers(void);
 
     static bool parse_mac(const std::string &text, uint8_t out[6]);
 };
