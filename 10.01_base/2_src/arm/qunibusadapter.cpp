@@ -1045,8 +1045,11 @@ void qunibusadapter_c::worker_device_dma_chunk_complete_event()
     // Must run under pthread_mutex_lock(&requests_mutex) ;
 
     dma_request_c *dmareq = dynamic_cast<dma_request_c *>(prl->active);
-
-    assert(dmareq != NULL);
+    if (!dmareq) {
+        WARNING("DMA complete event with no active DMA request (cur_status=%u buscycle=%u)",
+                mailbox->dma.cur_status, mailbox->dma.buscycle);
+        return;
+    }
     // fix PRU data struct: remove IOPAGE bit from mailbox struct, was set im mailbox_execute()
     mailbox->dma.startaddr &= ~QUNIBUS_IOPAGE_ADDR_BITMASK ;
     mailbox->dma.cur_addr &= ~QUNIBUS_IOPAGE_ADDR_BITMASK ;

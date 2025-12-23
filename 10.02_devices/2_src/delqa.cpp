@@ -127,6 +127,7 @@ delqa_c::delqa_c() : qunibusdevice_c()
 
     set_default_bus_params(DELQA_DEFAULT_ADDR, DELQA_DEFAULT_SLOT, DELQA_DEFAULT_VECTOR, DELQA_DEFAULT_LEVEL);
     dma_request.set_priority_slot(priority_slot.value);
+    dma_desc_request.set_priority_slot(priority_slot.value);
     intr_request.set_priority_slot(priority_slot.value);
     intr_request.set_level(intr_level.value);
     intr_request.set_vector(intr_vector.value);
@@ -446,7 +447,7 @@ void delqa_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
 
 void delqa_c::nxm_error(void)
 {
-    const uint16_t set_bits = XQ_CSR_NI | XQ_CSR_XI | XQ_CSR_XL | XQ_CSR_RL;
+    const uint16_t set_bits = XQ_CSR_XI | XQ_CSR_XL | XQ_CSR_RL;
     csr_set_clr(set_bits, 0);
     stats.fail++;
     stat_tx_errors.value = stats.fail;
@@ -651,7 +652,14 @@ void delqa_c::update_pcap_filter(void)
 
 uint32_t delqa_c::make_addr(uint16_t hi, uint16_t lo) const
 {
-    return (static_cast<uint32_t>(hi & QE_RING_ADDR_HI_MASK) << 16) | lo;
+    uint16_t mask = QE_RING_ADDR_HI_MASK;
+    if (qunibus) {
+        if (qunibus->addr_width <= 16)
+            mask = 0x0000;
+        else if (qunibus->addr_width <= 18)
+            mask = 0x0003;
+    }
+    return (static_cast<uint32_t>(hi & mask) << 16) | lo;
 }
 
 void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
@@ -770,9 +778,9 @@ bool delqa_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     }
 
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    WARNING("DELQA: DMA read_words addr=%06o words=%zu", addr, wordcount);
+//    WARNING("DELQA: DMA read_words addr=%06o words=%zu", addr, wordcount);
     qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
-    WARNING("DELQA: DMA read_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
+//    WARNING("DELQA: DMA read_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
     return dma_request.success;
 }
 
@@ -794,11 +802,68 @@ bool delqa_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
     }
 
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    WARNING("DELQA: DMA write_words addr=%06o words=%zu", addr, wordcount);
+//    WARNING("DELQA: DMA write_words addr=%06o words=%zu", addr, wordcount);
     qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
             const_cast<uint16_t *>(buffer), wordcount);
-    WARNING("DELQA: DMA write_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
+//    WARNING("DELQA: DMA write_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
     return dma_request.success;
+}
+
+bool delqa_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
+{
+    if (wordcount == 0)
+        return true;
+    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+        return false;
+
+    if (ddrmem && ddrmem->enabled &&
+        addr >= ddrmem->qunibus_startaddr &&
+        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        for (size_t i = 0; i < wordcount; ++i) {
+            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
+                return false;
+        }
+        return true;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
+    for (size_t i = 0; i < wordcount; ++i) {
+        uint16_t word = 0;
+        qunibusadapter->cpu_DATA_transfer(dma_desc_request, QUNIBUS_CYCLE_DATI,
+                addr + static_cast<uint32_t>(i * 2), &word);
+        if (!dma_desc_request.success)
+            return false;
+        buffer[i] = word;
+    }
+    return true;
+}
+
+bool delqa_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
+{
+    if (wordcount == 0)
+        return true;
+    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+        return false;
+
+    if (ddrmem && ddrmem->enabled &&
+        addr >= ddrmem->qunibus_startaddr &&
+        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        for (size_t i = 0; i < wordcount; ++i) {
+            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
+                return false;
+        }
+        return true;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
+    for (size_t i = 0; i < wordcount; ++i) {
+        uint16_t word = buffer[i];
+        qunibusadapter->cpu_DATA_transfer(dma_desc_request, QUNIBUS_CYCLE_DATO,
+                addr + static_cast<uint32_t>(i * 2), &word);
+        if (!dma_desc_request.success)
+            return false;
+    }
+    return true;
 }
 
 bool delqa_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
@@ -917,9 +982,9 @@ bool delqa_c::dispatch_rbdl(void)
     // SimH: only READ the descriptor in dispatch, don't write 0xFFFF yet
     uint16_t words[4] = {0};
     for (size_t i = 0; i < 4; ++i) {
-        if (!dma_read_words(cur_ba + static_cast<uint32_t>(i * 2), &words[i], 1)) {
+        if (!desc_read_words(cur_ba + static_cast<uint32_t>(i * 2), &words[i], 1)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
+            csr_set_clr(XQ_CSR_RL, 0);
             return false;
         }
     }
@@ -962,16 +1027,16 @@ bool delqa_c::process_rbdl(void)
         uint16_t flag = 0xFFFF;
 
         WARNING("DELQA: RX desc fetch at %06o (pre-write)", cur_ba);
-        if (!dma_write_words(cur_ba, &flag, 1)) {
+        if (!desc_write_words(cur_ba, &flag, 1)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
+            csr_set_clr(XQ_CSR_RL, 0);
             return false;
         }
         WARNING("DELQA: RX desc fetch at %06o (pre-read)", cur_ba);
         for (size_t i = 1; i < QE_RING_WORDS; ++i) {
-            if (!dma_read_words(cur_ba + 2 + static_cast<uint32_t>((i - 1) * 2), &words[i], 1)) {
+            if (!desc_read_words(cur_ba + 2 + static_cast<uint32_t>((i - 1) * 2), &words[i], 1)) {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                nxm_error();
+                csr_set_clr(XQ_CSR_RL, 0);
                 return false;
             }
         }
@@ -1006,9 +1071,9 @@ bool delqa_c::process_rbdl(void)
             }
         }
 
-        if (!dma_read_words(cur_ba + 8, &words[4], 2)) {
+        if (!desc_read_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
+            csr_set_clr(XQ_CSR_RL, 0);
             return false;
         }
 
@@ -1069,10 +1134,13 @@ bool delqa_c::process_rbdl(void)
         if (overflow)
             item.packet.used = item.packet.len;
 
+        bool dma_failed = false;
         if (!dma_write_bytes(address, rbuf, rbl)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            return false;
+            // Treat RX buffer DMA failure as a dropped packet so we can still
+            // write status back to the descriptor instead of raising NI.
+            dma_failed = true;
+            rbl = 0;
+            item.packet.used = item.packet.len;
         }
 
         // Status word 1: start with 0 (last segment, no errors), add type-specific bits
@@ -1094,7 +1162,10 @@ bool delqa_c::process_rbdl(void)
             break;
         }
 
-        if (overflow) {
+        if (dma_failed) {
+            words[4] |= QE_RST_LASTERR;
+            words[4] |= QE_DISCARD;
+        } else if (overflow) {
             words[4] |= QE_RST_LASTERR;
             words[4] |= QE_OVF | QE_DISCARD;
         } else if (item.packet.used < item.packet.len) {
@@ -1113,9 +1184,9 @@ bool delqa_c::process_rbdl(void)
         if (loss)
             words[4] |= 0x0001;
 
-        if (!dma_write_words(cur_ba + 8, &words[4], 2)) {
+        if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
+            csr_set_clr(XQ_CSR_RL, 0);
             return false;
         }
 
@@ -1187,11 +1258,11 @@ void delqa_c::write_callback(int status)
     stats.xmit++;
     stat_tx_frames.value = stats.xmit;
 
-    if (!dma_write_words(cur_ba + 8, (status == 0) ? write_success : write_failure, 2)) {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        nxm_error();
-        return;
-    }
+        if (!desc_write_words(cur_ba + 8, (status == 0) ? write_success : write_failure, 2)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            nxm_error();
+            return;
+        }
 
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1222,14 +1293,14 @@ bool delqa_c::process_xbdl(void)
             cur_ba = xbdl_ba;
         }
         uint16_t words[QE_RING_WORDS] = {0};
-        if (!dma_read_words(cur_ba, words, QE_RING_WORDS)) {
+        if (!desc_read_words(cur_ba, words, QE_RING_WORDS)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
             return false;
         }
 
         uint16_t flag = 0xFFFF;
-        if (!dma_write_words(cur_ba, &flag, 1)) {
+        if (!desc_write_words(cur_ba, &flag, 1)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
             return false;
@@ -1308,7 +1379,7 @@ bool delqa_c::process_xbdl(void)
                 }
 
                 uint16_t write_success[2] = {0, 1};
-                if (!dma_write_words(cur_ba + 8, write_success, 2)) {
+                if (!desc_write_words(cur_ba + 8, write_success, 2)) {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
                     nxm_error();
                     return false;
@@ -1338,7 +1409,7 @@ bool delqa_c::process_xbdl(void)
                 return true;
             }
         } else {
-            if (!dma_write_words(cur_ba + 8, implicit_chain_status, 2)) {
+            if (!desc_write_words(cur_ba + 8, implicit_chain_status, 2)) {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 nxm_error();
                 return false;
@@ -1455,7 +1526,7 @@ bool delqa_c::process_bootrom(void)
             cur_ba = rbdl_ba;
         }
         WARNING("DELQA: RX list dispatch pre-write flag at %06o", cur_ba);
-        if (!dma_write_words(cur_ba, &flag, 1)) {
+        if (!desc_write_words(cur_ba, &flag, 1)) {
             WARNING("DELQA: RX list dispatch flag write failed at %06o", cur_ba);
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
@@ -1463,7 +1534,7 @@ bool delqa_c::process_bootrom(void)
         }
         WARNING("DELQA: RX list dispatch pre-read desc at %06o", cur_ba);
         for (size_t i = 1; i < QE_RING_WORDS; ++i) {
-            if (!dma_read_words(cur_ba + 2 + static_cast<uint32_t>((i - 1) * 2), &words[i], 1)) {
+            if (!desc_read_words(cur_ba + 2 + static_cast<uint32_t>((i - 1) * 2), &words[i], 1)) {
                 WARNING("DELQA: RX list dispatch desc read failed at %06o", cur_ba);
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 nxm_error();
@@ -1483,7 +1554,7 @@ bool delqa_c::process_bootrom(void)
             return false;
         }
 
-        if (!dma_read_words(cur_ba + 8, &words[4], 2)) {
+        if (!desc_read_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
             return false;
@@ -1529,7 +1600,7 @@ bool delqa_c::process_bootrom(void)
         else
             words[4] = QE_RST_UNUSED;   // 0x8000 = last segment (bootrom special)
         words[5] = 0;
-        if (!dma_write_words(cur_ba + 8, &words[4], 2)) {
+        if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
             return false;

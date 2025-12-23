@@ -79,6 +79,7 @@ private:
 
     intr_request_c intr_request = intr_request_c(this);
     dma_request_c dma_request = dma_request_c(this);
+    dma_request_c dma_desc_request = dma_request_c(this);
 
     PcapBridge pcap;
 
@@ -179,6 +180,8 @@ private:
 
     bool dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
     bool dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
+    bool desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
+    bool desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
     bool dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len);
     bool dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len);
 
