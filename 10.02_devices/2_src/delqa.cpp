@@ -400,12 +400,14 @@ void delqa_c::update_transceiver_bits(void)
 void delqa_c::set_int(void)
 {
     irq = true;
+    WARNING("DELQA: INTR assert, csr=%06o ie=%d", csr, (csr & XQ_CSR_IE) ? 1 : 0);
     update_intr();
 }
 
 void delqa_c::clr_int(void)
 {
     irq = false;
+    WARNING("DELQA: INTR deassert, csr=%06o ie=%d", csr, (csr & XQ_CSR_IE) ? 1 : 0);
     update_intr();
 }
 
@@ -432,6 +434,11 @@ void delqa_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
 
     update_transceiver_bits();
     update_csr_reg();
+
+    if ((saved_csr ^ csr) & (XQ_CSR_RL | XQ_CSR_XL | XQ_CSR_RI | XQ_CSR_XI)) {
+        WARNING("DELQA: CSR change prev=%06o now=%06o set=%06o clr=%06o",
+                saved_csr, csr, set_bits, clear_bits);
+    }
 }
 
 void delqa_c::nxm_error(void)
@@ -539,6 +546,9 @@ void delqa_c::reset_controller(void)
     intr_request.edge_detect_reset();
     intr_request.set_vector(var & XQ_VEC_IV);
 
+    if (!read_queue.empty()) {
+        WARNING("DELQA: reset_controller clearing RX queue (size=%zu)", read_queue.size());
+    }
     read_queue.clear();
     read_queue_loss = 0;
     write_buffer.len = 0;
@@ -576,6 +586,9 @@ void delqa_c::sw_reset(void)
 
     clr_int();
 
+    if (!read_queue.empty()) {
+        WARNING("DELQA: sw_reset clearing RX queue (size=%zu)", read_queue.size());
+    }
     read_queue.clear();
     read_queue_loss = 0;
 
@@ -821,6 +834,9 @@ bool delqa_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
 void delqa_c::enqueue_readq(int type, const uint8_t *data, size_t len, int status)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    WARNING("DELQA: Enqueue RX type=%d len=%zu status=%06o queue=%zu",
+            type, len, static_cast<uint16_t>(status), read_queue.size());
+
     if (read_queue.size() >= XQ_QUE_MAX) {
         read_queue_loss++;
         if (!read_queue.empty())
@@ -844,8 +860,10 @@ bool delqa_c::dispatch_rbdl(void)
     if (rbdl_ba == 0)
         return false;
 
-    WARNING("DELQA: RX list dispatch at %06o (csr=%06o queue=%zu)",
+    WARNING("DELQA: RX list dispatch enter at %06o (csr=%06o queue=%zu)",
             rbdl_ba, csr, read_queue.size());
+    WARNING("DELQA: RX list dispatch after RL clear at %06o (csr=%06o)",
+            rbdl_ba, csr);
 
     uint16_t words[QE_RING_WORDS] = {0};
     uint16_t flag = 0xFFFF;
@@ -859,6 +877,9 @@ bool delqa_c::dispatch_rbdl(void)
         return false;
     }
 
+    WARNING("DELQA: RX list dispatch read words1=%06o words2=%06o words3=%06o",
+            words[1], words[2], words[3]);
+
     if (~words[1] & XQ_DSC_V) {
         WARNING("DELQA: RX descriptor at %06o not valid (addr_hi=%06o)",
                 rbdl_ba, words[1]);
@@ -866,27 +887,38 @@ bool delqa_c::dispatch_rbdl(void)
         return false;
     }
 
-    if (!read_queue.empty())
+    if (!read_queue.empty()) {
+        WARNING("DELQA: RX list dispatch has data (queue=%zu)", read_queue.size());
         return process_rbdl();
+    }
 
+    WARNING("DELQA: RX list dispatch idle at %06o (queue empty, csr=%06o)",
+            rbdl_ba, csr);
+    touch_rbdl_if_idle();
     return true;
 }
 
 bool delqa_c::process_rbdl(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    WARNING("DELQA: RX process start at %06o (queue=%zu csr=%06o)",
+            rbdl_ba, read_queue.size(), csr);
     while (true) {
         uint16_t words[QE_RING_WORDS] = {0};
         uint16_t flag = 0xFFFF;
 
+        WARNING("DELQA: RX desc fetch at %06o (pre-write)", rbdl_ba);
         if (!dma_write_words(rbdl_ba, &flag, 1)) {
             nxm_error();
             return false;
         }
+        WARNING("DELQA: RX desc fetch at %06o (pre-read)", rbdl_ba);
         if (!dma_read_words(rbdl_ba + 2, &words[1], QE_RING_WORDS - 1)) {
             nxm_error();
             return false;
         }
+        WARNING("DELQA: RX desc %06o words1=%06o words2=%06o words3=%06o",
+                rbdl_ba, words[1], words[2], words[3]);
 
         if (~words[1] & XQ_DSC_V) {
             WARNING("DELQA: RX descriptor at %06o not valid (addr_hi=%06o)",
@@ -900,8 +932,11 @@ bool delqa_c::process_rbdl(void)
             continue;
         }
 
-        if (read_queue.empty())
+        if (read_queue.empty()) {
+            WARNING("DELQA: RX list idle at %06o (queue empty, csr=%06o)",
+                    rbdl_ba, csr);
             break;
+        }
 
         if (!dma_read_words(rbdl_ba + 8, &words[4], 2)) {
             nxm_error();
@@ -953,26 +988,26 @@ bool delqa_c::process_rbdl(void)
             return false;
         }
 
-        words[4] = 0;
+        words[4] = static_cast<uint16_t>(XQ_DSC_V);
         switch (item.type) {
         case 0:
             stats.setup++;
-            words[4] = 0x2700;
+            words[4] |= 0x2700;
             break;
         case 1:
             stats.loop++;
-            words[4] = 0x2000;
+            words[4] |= 0x2000;
             words[4] |= static_cast<uint16_t>(rbl & 0x0700);
             break;
         case 2:
         default:
             rbl -= 60;
-            words[4] = static_cast<uint16_t>(rbl & 0x0700);
+            words[4] |= static_cast<uint16_t>(rbl & 0x0700);
             break;
         }
 
         if (item.packet.used < item.packet.len)
-            words[4] |= 0xC000;
+            words[4] |= static_cast<uint16_t>(XQ_DSC_C);
         words[5] = static_cast<uint16_t>(((rbl & 0x00FF) << 8) | (rbl & 0x00FF));
 
         if (read_queue_loss) {
@@ -984,6 +1019,9 @@ bool delqa_c::process_rbdl(void)
             nxm_error();
             return false;
         }
+
+        WARNING("DELQA: RX desc %06o writeback status1=%06o status2=%06o bytes=%u",
+                rbdl_ba, words[4], words[5], static_cast<unsigned>(rbl));
 
         if (item.packet.used >= item.packet.len)
             read_queue.pop_front();
@@ -1007,6 +1045,8 @@ void delqa_c::touch_rbdl_if_idle(void)
     if (rbdl_ba == 0)
         return;
 
+    WARNING("DELQA: RX idle touch at %06o (csr=%06o)", rbdl_ba, csr);
+
     while (true) {
         uint16_t words[QE_RING_WORDS] = {0};
         uint16_t flag = 0xFFFF;
@@ -1020,6 +1060,9 @@ void delqa_c::touch_rbdl_if_idle(void)
             return;
         }
 
+        WARNING("DELQA: RX idle desc %06o words1=%06o words2=%06o words3=%06o",
+                rbdl_ba, words[1], words[2], words[3]);
+
         if (~words[1] & XQ_DSC_V) {
             WARNING("DELQA: RX descriptor at %06o not valid (addr_hi=%06o)",
                     rbdl_ba, words[1]);
@@ -1032,6 +1075,8 @@ void delqa_c::touch_rbdl_if_idle(void)
             continue;
         }
 
+        WARNING("DELQA: RX list idle at %06o (descriptor valid, queue empty, csr=%06o)",
+                rbdl_ba, csr);
         return;
     }
 }
@@ -1462,6 +1507,7 @@ bool delqa_c::send_system_id(const uint8_t *dest, uint16_t receipt_id)
 
 void delqa_c::worker(unsigned instance)
 {
+    WARNING("DELQA: build %s %s worker(%u) start", __DATE__, __TIME__, instance);
     if (instance == 0)
         worker_rx();
     else
@@ -1471,6 +1517,7 @@ void delqa_c::worker(unsigned instance)
 void delqa_c::worker_rx(void)
 {
     worker_init_realtime_priority(rt_device);
+    bool rx_blocked_logged = false;
 
     while (!workers_terminate) {
         service_timers();
@@ -1489,15 +1536,21 @@ void delqa_c::worker_rx(void)
             }
 
             if (rbdl_pending) {
+                WARNING("DELQA: RX list pending set (csr=%06o)", csr);
                 rbdl_pending = false;
                 dispatch_rbdl();
             }
         }
 
         if (!rx_ready()) {
+            if (!read_queue.empty() && !rx_blocked_logged) {
+                WARNING("DELQA: RX blocked (RE=0) with queued packets=%zu", read_queue.size());
+                rx_blocked_logged = true;
+            }
             timeout_c::wait_ms(1);
             continue;
         }
+        rx_blocked_logged = false;
 
 #ifdef HAVE_PCAP
         if (pcap.is_open()) {
