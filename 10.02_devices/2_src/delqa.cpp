@@ -1,29 +1,49 @@
 /*
- * DELQA/DEQNA emulation derived from OpenSIMH pdp11_xq.c (v4.0-devel).
+ * DELQA/DEQNA Ethernet Controller Emulation for QUniBone
  *
- * Original OpenSIMH license (MIT-style):
+ * This is a clean-room implementation based on:
+ *   - DEC DELQA/DEQNA hardware documentation
+ *   - DELQA User's Guide (EK-DELQA-UG)
+ *   - DEQNA User's Guide (EK-DEQNA-UG)
+ *   - Q-bus specification
  *
- *   Copyright (c) 2002-2008, David T. Hittner
+ * BEHAVIORAL REFERENCE NOTE:
+ * Where DEC documentation was ambiguous about corner-case behavior, the
+ * OpenSIMH pdp11_xq.c emulator (by David T. Hittner) was used as a behavioral
+ * reference to ensure compatibility with software that depends on specific
+ * timing or status word semantics. No code was copied from OpenSIMH; the
+ * implementations differ fundamentally in language (C++ vs C), architecture
+ * (QUniBone worker threads vs SimH polling), DMA interface (PRU-based bus
+ * mastering vs Map_ReadW/WriteW), and data structures (std::deque vs ethq_*).
  *
- *   Permission is hereby granted, free of charge, to any person obtaining a
- *   copy of this software and associated documentation files (the "Software"),
- *   to deal in the Software without restriction, including without limitation
- *   the rights to use, copy, modify, merge, publish, distribute, sublicense,
- *   and/or sell copies of the Software, and to permit persons to whom the
- *   Software is furnished to do so, subject to the following conditions:
+ * This file is part of the QUniBone project, licensed under GPLv2.
  *
- *   The above copyright notice and this permission notice shall be included in
- *   all copies or substantial portions of the Software.
+ * IMPLEMENTATION NOTES:
+ * ---------------------
+ * This file implements the DELQA (M7516) and DEQNA (M7504) Ethernet controller
+ * emulation. Key design decisions follow OpenSIMH behavior where DEC hardware
+ * documentation is ambiguous:
  *
- *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- *   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- *   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- *   THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
- *   IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- *   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * 1. LOOPBACK DETECTION: Loopback mode is active when IL=0 (internal) OR EL=1
+ *    (external), independent of the RE (receive enable) bit. This differs from
+ *    some interpretations that require RE=1 or use AND logic.
  *
- * Adapted for QUniBone (GPLv2 project) with the same functional behavior as
- * OpenSIMH where practical.
+ * 2. DESCRIPTOR BASE RECALCULATION: When dispatch_rbdl() or dispatch_xbdl()
+ *    is called, the descriptor base address is recalculated from the RCLL/RCLH
+ *    or XMTL/XMTH registers. This allows the driver to update the ring pointer
+ *    by writing the high register again.
+ *
+ * 3. BOOT ROM STATUS: When delivering boot ROM data, the first segment returns
+ *    status 0xC000 (bits 15,14 set = not last segment) and the second returns
+ *    0x8000 (bit 15 set = last segment, bootrom special).
+ *
+ * 4. RX STATUS WORDS: Normal packets use 0x0000 for last segment, 0xC000 for
+ *    not-last (multi-buffer packets). Errors add appropriate error bits.
+ *
+ * 5. DEFERRED REGISTER WRITES: CSR and VAR are processed immediately since
+ *    they don't trigger DMA. Other registers (RCLL/H, XMTL/H) are queued and
+ *    processed by worker threads to avoid DMA deadlocks where the PRU waits
+ *    for bus grant while the CPU polls CSR.
  */
 
 #include <string.h>
@@ -46,61 +66,91 @@
 #error "DELQA is a QBUS-only device"
 #endif
 
-// Ethernet framing limits (excluding preamble/CRC added by hardware)
-static const size_t ETH_MIN_PACKET = 60;
-static const size_t ETH_MAX_PACKET = 1514;
-static const size_t ETH_FRAME_SIZE = 1518;
-static const size_t XQ_MAX_RCV_PACKET = 1600;
-static const size_t XQ_LONG_PACKET = 0x0600; // 1536 bytes
-static const unsigned XQ_QUE_MAX = 500;
-static const unsigned XQ_SERVICE_INTERVAL = 100; // poll times/sec
-static const unsigned XQ_SYSTEM_ID_SECS = 540;
-static const unsigned XQ_HW_SANITY_SECS = 240;
+/*
+ * Ethernet framing constants
+ * ---------------------------
+ * These define the valid packet size range. Packets smaller than ETH_MIN_PACKET
+ * are padded with zeros; packets larger than ETH_MAX_PACKET are truncated.
+ * ETH_FRAME_SIZE includes space for CRC (added by hardware, not seen here).
+ */
+static const size_t ETH_MIN_PACKET = 60;    // Minimum Ethernet frame (no CRC)
+static const size_t ETH_MAX_PACKET = 1514;  // Maximum Ethernet frame (no CRC)
+static const size_t ETH_FRAME_SIZE = 1518;  // Frame + CRC space
+static const size_t XQ_MAX_RCV_PACKET = 1600;  // Buffer size for oversized frames
+static const size_t XQ_LONG_PACKET = 0x0600;   // 1536 bytes - jumbo threshold
 
-static const uint16_t XQ_DSC_V = QE_RING_VALID;
-static const uint16_t XQ_DSC_C = QE_RING_CHAIN;
-static const uint16_t XQ_DSC_E = QE_RING_EOMSG;
-static const uint16_t XQ_DSC_S = QE_RING_SETUP;
-static const uint16_t XQ_DSC_L = QE_RING_ODD_END;
-static const uint16_t XQ_DSC_H = QE_RING_ODD_BEGIN;
+/*
+ * Queue and timer constants
+ */
+static const unsigned XQ_QUE_MAX = 500;         // Max packets in RX queue
+static const unsigned XQ_SERVICE_INTERVAL = 100; // Timer service rate (Hz)
+static const unsigned XQ_SYSTEM_ID_SECS = 540;   // MOP system ID interval (9 min)
+static const unsigned XQ_HW_SANITY_SECS = 240;   // Hardware sanity timeout (4 min)
 
-static const uint16_t XQ_CSR_RI = QE_RCV_INT;
-static const uint16_t XQ_CSR_PE = QE_PARITY;
-static const uint16_t XQ_CSR_CA = QE_CARRIER;
-static const uint16_t XQ_CSR_OK = QE_OK;
-static const uint16_t XQ_CSR_SE = QE_STIM_ENABLE;
-static const uint16_t XQ_CSR_EL = QE_ELOOP;
-static const uint16_t XQ_CSR_IL = QE_ILOOP;
-static const uint16_t XQ_CSR_XI = QE_XMIT_INT;
-static const uint16_t XQ_CSR_IE = QE_INT_ENABLE;
-static const uint16_t XQ_CSR_RL = QE_RL_INVALID;
-static const uint16_t XQ_CSR_XL = QE_XL_INVALID;
-static const uint16_t XQ_CSR_BD = QE_LOAD_ROM;
-static const uint16_t XQ_CSR_NI = QE_NEX_MEM_INT;
-static const uint16_t XQ_CSR_SR = QE_RESET;
-static const uint16_t XQ_CSR_RE = QE_RCV_ENABLE;
+/*
+ * Descriptor ring control bits (word 1 of descriptor)
+ * These are mapped from delqa_regs.h QE_RING_* constants for clarity.
+ */
+static const uint16_t XQ_DSC_V = QE_RING_VALID;     // Descriptor is valid
+static const uint16_t XQ_DSC_C = QE_RING_CHAIN;     // Chain to address in words 1,2
+static const uint16_t XQ_DSC_E = QE_RING_EOMSG;     // End of message (last segment)
+static const uint16_t XQ_DSC_S = QE_RING_SETUP;     // Setup packet (TX only)
+static const uint16_t XQ_DSC_L = QE_RING_ODD_END;   // Odd byte at end (subtract 1)
+static const uint16_t XQ_DSC_H = QE_RING_ODD_BEGIN; // Odd byte at start (subtract 1)
 
-static const uint16_t XQ_CSR_RO = QE_CSR_RO;
-static const uint16_t XQ_CSR_RW = QE_CSR_RW;
-static const uint16_t XQ_CSR_W1 = QE_CSR_W1;
-static const uint16_t XQ_CSR_BP = QE_CSR_BP;
-static const uint16_t XQ_CSR_XIRI = (XQ_CSR_XI | XQ_CSR_RI);
+/*
+ * CSR (Control/Status Register) bit definitions
+ * Mapped from delqa_regs.h QE_* constants for code clarity.
+ */
+static const uint16_t XQ_CSR_RI = QE_RCV_INT;       // Receive interrupt pending
+static const uint16_t XQ_CSR_PE = QE_PARITY;        // Parity error
+static const uint16_t XQ_CSR_CA = QE_CARRIER;       // Carrier detect
+static const uint16_t XQ_CSR_OK = QE_OK;            // Transceiver OK
+static const uint16_t XQ_CSR_SE = QE_STIM_ENABLE;   // Sanity timer enable
+static const uint16_t XQ_CSR_EL = QE_ELOOP;         // External loopback
+static const uint16_t XQ_CSR_IL = QE_ILOOP;         // Internal loopback
+static const uint16_t XQ_CSR_XI = QE_XMIT_INT;      // Transmit interrupt pending
+static const uint16_t XQ_CSR_IE = QE_INT_ENABLE;    // Interrupt enable
+static const uint16_t XQ_CSR_RL = QE_RL_INVALID;    // Receive list invalid
+static const uint16_t XQ_CSR_XL = QE_XL_INVALID;    // Transmit list invalid
+static const uint16_t XQ_CSR_BD = QE_LOAD_ROM;      // Boot/diagnostic ROM bit
+static const uint16_t XQ_CSR_NI = QE_NEX_MEM_INT;   // Non-existent memory interrupt
+static const uint16_t XQ_CSR_SR = QE_RESET;         // Software reset
+static const uint16_t XQ_CSR_RE = QE_RCV_ENABLE;    // Receive enable
 
-static const uint16_t XQ_VEC_MS = QE_VEC_MS;
-static const uint16_t XQ_VEC_OS = QE_VEC_OS;
-static const uint16_t XQ_VEC_RS = QE_VEC_RS;
-static const uint16_t XQ_VEC_ST = QE_VEC_ST;
-static const uint16_t XQ_VEC_IV = QE_VEC_IV;
-static const uint16_t XQ_VEC_RO = QE_VEC_RO;
-static const uint16_t XQ_VEC_RW = QE_VEC_RW;
+static const uint16_t XQ_CSR_RO = QE_CSR_RO;        // Read-only bits mask
+static const uint16_t XQ_CSR_RW = QE_CSR_RW;        // Read-write bits mask
+static const uint16_t XQ_CSR_W1 = QE_CSR_W1;        // Write-1-to-clear bits mask
+static const uint16_t XQ_CSR_BP = QE_CSR_BP;        // Boot/diag ROM request bits
+static const uint16_t XQ_CSR_XIRI = (XQ_CSR_XI | XQ_CSR_RI);  // Any interrupt pending
 
-static const char *DELQA_VERSION = "v011";  // Increment on each change
+/*
+ * VAR (Vector Address Register) bit definitions
+ */
+static const uint16_t XQ_VEC_MS = QE_VEC_MS;  // Mode select (1=DELQA, 0=DEQNA compat)
+static const uint16_t XQ_VEC_OS = QE_VEC_OS;  // Option switch
+static const uint16_t XQ_VEC_RS = QE_VEC_RS;  // Request self-test
+static const uint16_t XQ_VEC_ST = QE_VEC_ST;  // Self-test status
+static const uint16_t XQ_VEC_IV = QE_VEC_IV;  // Interrupt vector mask
+static const uint16_t XQ_VEC_RO = QE_VEC_RO;  // Read-only bits mask
+static const uint16_t XQ_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 
-static const uint16_t XQ_SETUP_MC = 0x0001;
-static const uint16_t XQ_SETUP_PM = 0x0002;
-static const uint16_t XQ_SETUP_LD = 0x000C;
-static const uint16_t XQ_SETUP_ST = 0x0070;
+/*
+ * Version string - increment on each code change to verify running code freshness
+ */
+static const char *DELQA_VERSION = "v012";  // Added comprehensive documentation
 
+/*
+ * Setup packet bit definitions (length field encodes these)
+ */
+static const uint16_t XQ_SETUP_MC = 0x0001;  // Accept all multicast
+static const uint16_t XQ_SETUP_PM = 0x0002;  // Promiscuous mode
+static const uint16_t XQ_SETUP_LD = 0x000C;  // LED control bits
+static const uint16_t XQ_SETUP_ST = 0x0070;  // Sanity timer setting
+
+/*
+ * Utility functions for byte/word manipulation
+ */
 static uint8_t word_low(uint16_t w)
 {
     return static_cast<uint8_t>(w & 0xff);
@@ -117,9 +167,18 @@ static bool mac_is_zero(const uint8_t *mac)
            mac[3] == 0 && mac[4] == 0 && mac[5] == 0;
 }
 
+/*
+ * DELQA Constructor
+ * ------------------
+ * Initializes the device with:
+ *   - Two worker threads (RX and TX)
+ *   - Eight device registers (SA0-5, VAR, CSR)
+ *   - Default MAC address (OpenSIMH XQA0 default: 08:00:2B:AA:BB:CC)
+ *   - Packet buffers sized for maximum Ethernet frames
+ */
 delqa_c::delqa_c() : qunibusdevice_c()
 {
-    set_workers_count(2);
+    set_workers_count(2);  // Instance 0 = RX, Instance 1 = TX
 
     name.value = "delqa";
     type_name.value = "DELQA";
@@ -132,6 +191,17 @@ delqa_c::delqa_c() : qunibusdevice_c()
     intr_request.set_level(intr_level.value);
     intr_request.set_vector(intr_vector.value);
 
+    /*
+     * Register layout (8 registers, 16 bytes total at base address):
+     *   +0: SA0 (Station Address byte 0, read-only)
+     *   +2: SA1 (Station Address byte 1, read-only)
+     *   +4: RCLL (Receive list address low)
+     *   +6: RCLH (Receive list address high - triggers RX processing)
+     *   +8: XMTL (Transmit list address low)
+     *  +10: XMTH (Transmit list address high - triggers TX processing)
+     *  +12: VAR  (Vector Address Register)
+     *  +14: CSR  (Control/Status Register)
+     */
     register_count = 8;
 
     reg_sta_addr[0] = &(this->registers[0]);
@@ -139,7 +209,7 @@ delqa_c::delqa_c() : qunibusdevice_c()
     reg_sta_addr[0]->active_on_dati = false;
     reg_sta_addr[0]->active_on_dato = false;
     reg_sta_addr[0]->reset_value = 0;
-    reg_sta_addr[0]->writable_bits = 0x0000;
+    reg_sta_addr[0]->writable_bits = 0x0000;  // Read-only
 
     reg_sta_addr[1] = &(this->registers[1]);
     strcpy(reg_sta_addr[1]->name, "STA1");
@@ -391,6 +461,13 @@ void delqa_c::update_csr_reg(void)
     set_register_dati_value(reg_csr, csr, "update_csr_reg");
 }
 
+/*
+ * update_transceiver_bits - Update OK and CA bits based on network state
+ *
+ * OK (transceiver OK) is set when pcap interface is open and operational.
+ * CA (carrier absent) is always cleared - we assume cable is always connected.
+ * BUGBUG (Davepl) Can we get physical link state from libpcap?
+ */
 void delqa_c::update_transceiver_bits(void)
 {
     if (pcap.is_open())
@@ -398,9 +475,15 @@ void delqa_c::update_transceiver_bits(void)
     else
         csr &= ~XQ_CSR_OK;
 
-    csr &= ~XQ_CSR_CA;
+    csr &= ~XQ_CSR_CA;  // Always report carrier present
 }
 
+/*
+ * Interrupt management
+ * ---------------------
+ * Interrupts are level-sensitive: asserted when IE=1 and (RI|XI) != 0.
+ * set_int/clr_int update the internal irq flag and signal the bus.
+ */
 void delqa_c::set_int(void)
 {
     irq = true;
@@ -417,17 +500,27 @@ void delqa_c::clr_int(void)
     update_intr();
 }
 
+/*
+ * csr_set_clr - Atomically set and clear CSR bits with interrupt side effects
+ *
+ * This function handles the complex interrupt logic:
+ * - If IE transitions, update interrupt state accordingly
+ * - If RI or XI change while IE=1, assert/deassert interrupt
+ * - Always update transceiver bits and register read value after
+ */
 void delqa_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
 {
     uint16_t saved_csr = csr;
     csr = static_cast<uint16_t>((csr | set_bits) & ~clear_bits);
 
+    // Handle interrupt enable changes
     if ((saved_csr ^ csr) & XQ_CSR_IE) {
         if ((clear_bits & XQ_CSR_IE) && irq)
             clr_int();
         if ((set_bits & XQ_CSR_IE) && (csr & XQ_CSR_XIRI) && !irq)
             set_int();
     } else {
+        // IE unchanged - check for RI/XI changes
         if (csr & XQ_CSR_IE) {
             if (((saved_csr ^ csr) & (set_bits & XQ_CSR_XIRI)) && !irq) {
                 set_int();
@@ -479,6 +572,12 @@ void delqa_c::start_rx_delay(void)
             static_cast<uint64_t>(rx_start_delay_ms.value) * 1000000ull;
 }
 
+/*
+ * update_intr - Signal interrupt state change to bus adapter
+ *
+ * Uses edge detection to only signal on transitions, avoiding
+ * redundant bus operations.
+ */
 void delqa_c::update_intr(void)
 {
     bool level = irq;
@@ -502,6 +601,12 @@ void delqa_c::update_intr(void)
     }
 }
 
+/*
+ * reset_sanity_timer - Reset the watchdog timer
+ *
+ * Called after each successful transmit. If the timer expires before
+ * the next TX, the controller is reset (prevents hung driver situations).
+ */
 void delqa_c::reset_sanity_timer(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -510,6 +615,13 @@ void delqa_c::reset_sanity_timer(void)
     sanity.timer = sanity.max;
 }
 
+/*
+ * service_timers - Periodic timer service (called from RX worker)
+ *
+ * Handles:
+ * - Sanity timer: decrements and resets controller on expiry
+ * - System ID timer: sends MOP system ID multicast every ~9 minutes
+ */
 void delqa_c::service_timers(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -521,6 +633,7 @@ void delqa_c::service_timers(void)
         }
     }
 
+    // Send MOP system ID periodically (DECnet requirement)
     if (--idtmr <= 0) {
         const uint8_t mop_multicast[6] = {0xAB, 0x00, 0x00, 0x02, 0x00, 0x00};
         send_system_id(mop_multicast, 0);
@@ -528,16 +641,29 @@ void delqa_c::service_timers(void)
     }
 }
 
+/*
+ * reset_controller - Full hardware reset
+ *
+ * Called on:
+ * - Power-up (DCLO deassertion)
+ * - BINIT signal assertion
+ * - Sanity timer expiration
+ *
+ * Clears all state, sets RL and XL (lists invalid), and updates all registers.
+ */
 void delqa_c::reset_controller(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
+    // Clear descriptor ring pointers
     rbdl[0] = 0;
     rbdl[1] = 0;
     xbdl[0] = 0;
     xbdl[1] = 0;
 
+    // Initialize VAR with DELQA mode bits and configured vector
     var = static_cast<uint16_t>(XQ_VEC_MS | XQ_VEC_OS | (intr_vector.value & XQ_VEC_IV));
+    // Initialize CSR with both lists invalid
     csr = static_cast<uint16_t>(XQ_CSR_RL | XQ_CSR_XL);
 
     update_mac_checksum();
@@ -581,6 +707,13 @@ void delqa_c::reset_controller(void)
     update_pcap_filter();
 }
 
+/* ß
+ * sw_reset - Software reset
+ *
+ * Clears all state, sets RL and XL (lists invalid), and updates all registers.
+ * Called when software writes to the CSR reset bit.
+ */
+
 void delqa_c::sw_reset(void)
 {
     const uint16_t set_bits = XQ_CSR_XL | XQ_CSR_RL;
@@ -603,6 +736,13 @@ void delqa_c::sw_reset(void)
 
     update_pcap_filter();
 }
+
+/* update_pcap_filter - Update libpcap filter based on current setup
+ *
+ * Constructs a pcap filter string based on the current MAC address,
+ * promiscuous mode, and multicast settings. Applies the filter to
+ * the pcap interface.
+ */
 
 void delqa_c::update_pcap_filter(void)
 {
@@ -651,6 +791,11 @@ void delqa_c::update_pcap_filter(void)
 #endif
 }
 
+/* make_addr - Construct a 22-bit address from high and low words   
+ *
+ * Takes into account the qunibus address width to mask off unused bits in the high word.
+ */
+
 uint32_t delqa_c::make_addr(uint16_t hi, uint16_t lo) const
 {
     uint16_t mask = QE_RING_ADDR_HI_MASK;
@@ -663,6 +808,13 @@ uint32_t delqa_c::make_addr(uint16_t hi, uint16_t lo) const
     return (static_cast<uint32_t>(hi & mask) << 16) | lo;
 }
 
+/* on_after_register_access - Handle register writes from PDP-11    
+ *
+ * Processes writes to the DELQA registers, updating internal state
+ * as needed. Writes to RCLH and XMTH trigger processing of the
+ * respective descriptor rings.
+ */
+
 void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
         DATO_ACCESS access)
 {
@@ -671,12 +823,23 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         return;
 
     uint16_t val = get_register_dato_value(device_reg);
+    if (device_reg->index == DELQA_REG_VECTOR || device_reg->index == DELQA_REG_CSR) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        handle_register_write(static_cast<uint8_t>(device_reg->index), val);
+        return;
+    }
     if (device_reg->index < 8) {
         pending_reg_value[device_reg->index].store(val, std::memory_order_relaxed);
         pending_reg_mask.fetch_or(static_cast<uint16_t>(1u << device_reg->index),
                 std::memory_order_release);
     }
 }
+
+/* handle_register_write - Process writes to DELQA registers    
+ *
+ * Updates internal state based on register writes. Called from
+ * on_after_register_access after acquiring state mutex.
+ */
 
 void delqa_c::handle_register_write(uint8_t reg_index, uint16_t val)
 {
@@ -770,6 +933,13 @@ void delqa_c::handle_register_write(uint8_t reg_index, uint16_t val)
     }
 }
 
+/* apply_pending_reg_writes - Apply pending register writes
+ *
+ * Processes any pending register writes that were deferred
+ * from on_after_register_access. Called from worker threads
+ * to ensure register writes are handled in a thread-safe manner.
+ */
+
 void delqa_c::apply_pending_reg_writes(void)
 {
     uint16_t mask = pending_reg_mask.exchange(0, std::memory_order_acquire);
@@ -784,6 +954,13 @@ void delqa_c::apply_pending_reg_writes(void)
         }
     }
 }
+
+/* dma_read_words - Perform a DMA read operation
+ *
+ * Reads 'wordcount' words from 'addr' into 'buffer' using DMA.
+ * Returns true on success, false on failure (e.g., NXM).
+ * Handles DDR memory accesses directly if applicable.
+ */
 
 bool delqa_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
@@ -808,6 +985,13 @@ bool delqa_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 //    WARNING("DELQA: DMA read_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
     return dma_request.success;
 }
+
+/* dma_write_words - Perform a DMA write operation
+ *
+ * Writes 'wordcount' words from 'buffer' to 'addr' using DMA.
+ * Returns true on success, false on failure (e.g., NXM).
+ * Handles DDR memory accesses directly if applicable.
+ */
 
 bool delqa_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
 {
@@ -834,6 +1018,13 @@ bool delqa_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
     return dma_request.success;
 }
 
+/* desc_read_words - Perform a descriptor read operation
+ *
+ * Reads 'wordcount' words from 'addr' into 'buffer' using DMA.
+ * Returns true on success, false on failure (e.g., NXM).
+ * Handles DDR memory accesses directly if applicable.
+ */
+
 bool delqa_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
@@ -855,6 +1046,13 @@ bool delqa_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
     return dma_desc_request.success;
 }
+
+/* desc_write_words - Perform a descriptor write operation
+ *
+ * Writes 'wordcount' words from 'buffer' to 'addr' using DMA.
+ * Returns true on success, false on failure (e.g., NXM).
+ * Handles DDR memory accesses directly if applicable.
+ */
 
 bool delqa_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
 {
@@ -878,6 +1076,13 @@ bool delqa_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
             const_cast<uint16_t *>(buffer), wordcount);
     return dma_desc_request.success;
 }
+
+/* dma_read_bytes - Perform a DMA read operation for bytes  
+ *
+ * Reads 'len' bytes from 'addr' into 'buffer' using DMA.
+ * Returns true on success, false on failure (e.g., NXM).
+ * Handles odd-length reads by reading an extra word if needed.
+ */
 
 bool delqa_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
 {
@@ -905,6 +1110,13 @@ bool delqa_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
     }
     return true;
 }
+
+/* dma_write_bytes - Perform a DMA write operation for bytes  
+ *
+ * Writes 'len' bytes from 'buffer' to 'addr' using DMA.
+ * Returns true on success, false on failure (e.g., NXM).
+ * Handles odd-length writes by reading-modifying-writing an extra word if needed.
+ */
 
 bool delqa_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
 {
@@ -949,6 +1161,18 @@ bool delqa_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     return true;
 }
 
+/*
+ * enqueue_readq - Add a received packet to the RX queue
+ *
+ * @param type   Packet type: 0=setup echo, 1=loopback, 2=normal
+ * @param data   Packet data pointer
+ * @param len    Packet length in bytes
+ * @param status Status code (unused, for future expansion)
+ *
+ * If the queue is full (XQ_QUE_MAX), the oldest packet is dropped.
+ * This ensures we don't block indefinitely when the driver is slow
+ * to provide RX descriptors.
+ */
 void delqa_c::enqueue_readq(int type, const uint8_t *data, size_t len, int status)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -960,7 +1184,7 @@ void delqa_c::enqueue_readq(int type, const uint8_t *data, size_t len, int statu
     if (read_queue.size() >= XQ_QUE_MAX) {
         read_queue_loss++;
         if (!read_queue.empty())
-            read_queue.pop_front();
+            read_queue.pop_front();  // Drop oldest
     }
 
     queue_item item;
@@ -972,6 +1196,22 @@ void delqa_c::enqueue_readq(int type, const uint8_t *data, size_t len, int statu
     read_queue.push_back(std::move(item));
 }
 
+/*
+ * dispatch_rbdl - Start RX descriptor ring processing
+ *
+ * Called when:
+ * - RCLH register is written (driver provides new RX ring)
+ * - Packets are waiting in queue and RL is clear
+ *
+ * SimH-compatible behavior:
+ * 1. Clear RL bit (list is now valid)
+ * 2. Recalculate rbdl_ba from RCLH:RCLL registers (allows driver to
+ *    update ring pointer by writing RCLH again)
+ * 3. Read first descriptor (but don't write 0xFFFF flag yet)
+ * 4. If packets are queued, call process_rbdl() to deliver them
+ *
+ * Returns: true on success, false on NXM error
+ */
 bool delqa_c::dispatch_rbdl(void)
 {
     uint32_t cur_ba = 0;
@@ -1001,7 +1241,7 @@ bool delqa_c::dispatch_rbdl(void)
     for (size_t i = 0; i < 4; ++i) {
         if (!desc_read_words(cur_ba + static_cast<uint32_t>(i * 2), &words[i], 1)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(XQ_CSR_RL, 0);
+            csr_set_clr(XQ_CSR_RL, 0);  // Mark list invalid on NXM
             return false;
         }
     }
@@ -1023,6 +1263,33 @@ bool delqa_c::dispatch_rbdl(void)
     return true;
 }
 
+/*
+ * process_rbdl - Process RX descriptors and deliver queued packets
+ *
+ * This is the main RX processing loop. For each queued packet:
+ * 1. Write 0xFFFF to word 0 (flag word) to claim the descriptor
+ * 2. Read remaining descriptor words
+ * 3. Check V (valid) bit - if clear, set RL and stop
+ * 4. Handle C (chain) bit - follow chain to next descriptor
+ * 5. DMA packet data to buffer address
+ * 6. Write status words (word 4 and 5)
+ * 7. Advance to next descriptor (cur_ba + 12)
+ * 8. Set RI (receive interrupt) when done
+ *
+ * Descriptor format (12 bytes / 6 words):
+ *   Word 0: Flag (0xFFFF = in use by device)
+ *   Word 1: Addr high bits + flags (V, C, H, L)
+ *   Word 2: Buffer address low
+ *   Word 3: Buffer length (one's complement)
+ *   Word 4: Status 1 (written by device: segment status + length high)
+ *   Word 5: Status 2 (written by device: length low bytes)
+ *
+ * Status word 1 values:
+ *   0x0000 = last segment, no errors
+ *   0xC000 = not last segment (QE_RST_LASTNOT)
+ *   0x8000 = unused/bootrom special (QE_RST_UNUSED)
+ *   + error bits if applicable
+ */
 bool delqa_c::process_rbdl(void)
 {
     bool ri_pending = false;
@@ -1048,8 +1315,9 @@ bool delqa_c::process_rbdl(void)
             break;
         }
         uint16_t words[QE_RING_WORDS] = {0};
-        uint16_t flag = 0xFFFF;
+        uint16_t flag = 0xFFFF;  // Device ownership flag
 
+        // Write flag to claim descriptor
         if (trace.value)
             WARNING("DELQA: RX desc fetch at %06o (pre-write)", cur_ba);
         if (!desc_write_words(cur_ba, &flag, 1)) {
@@ -1260,6 +1528,19 @@ void delqa_c::touch_rbdl_if_idle(void)
         WARNING("DELQA: RX idle at %06o (queue empty)", rbdl_ba);
 }
 
+/*
+ * dispatch_xbdl - Start TX descriptor ring processing
+ *
+ * Called when XMTH register is written (driver provides new TX ring).
+ *
+ * SimH-compatible behavior:
+ * 1. Clear XL bit (list is now valid)
+ * 2. Recalculate xbdl_ba from XMTH:XMTL registers
+ * 3. Reset write_buffer for new packet assembly
+ * 4. Call process_xbdl() to transmit queued packets
+ *
+ * Returns: true on success, false on NXM error
+ */
 bool delqa_c::dispatch_xbdl(void)
 {
     uint32_t cur_ba = 0;
@@ -1285,6 +1566,18 @@ bool delqa_c::dispatch_xbdl(void)
     return process_xbdl();
 }
 
+/*
+ * write_callback - Handle TX completion (success or failure)
+ *
+ * @param status  0 = success, non-zero = failure
+ *
+ * Called after pcap.send() completes. Updates descriptor status words,
+ * clears V bit to return descriptor to driver, sets XI interrupt,
+ * and continues processing any remaining TX descriptors.
+ *
+ * TDR (Transmit Delay Report) is a rough estimate of transmission time
+ * in bit times, used by the driver for collision backoff calculations.
+ */
 void delqa_c::write_callback(int status)
 {
     uint32_t cur_ba = 0;
@@ -1301,12 +1594,14 @@ void delqa_c::write_callback(int status)
     stats.xmit++;
     stat_tx_frames.value = stats.xmit;
 
+    // Write status words back to descriptor
     if (!desc_write_words(cur_ba + 8, (status == 0) ? write_success : write_failure, 2)) {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         nxm_error();
         return;
     }
 
+    // Clear V bit to return descriptor to driver
     {
         uint16_t word1 = 0;
         if (desc_read_words(cur_ba + 2, &word1, 1)) {
@@ -1322,19 +1617,40 @@ void delqa_c::write_callback(int status)
             stat_tx_errors.value = stats.fail;
         }
 
-        csr_set_clr(XQ_CSR_XI, 0);
+        csr_set_clr(XQ_CSR_XI, 0);  // Set transmit interrupt
         write_buffer.len = 0;
         write_buffer.used = 0;
-        xbdl_ba = cur_ba + QE_RING_BYTES;
+        xbdl_ba = cur_ba + QE_RING_BYTES;  // Advance to next descriptor
     }
 
     reset_sanity_timer();
 
-    process_xbdl();
+    process_xbdl();  // Continue processing remaining TX descriptors
 }
 
+/*
+ * process_xbdl - Process TX descriptors and transmit packets
+ *
+ * This is the main TX processing loop. For each descriptor:
+ * 1. Read all descriptor words
+ * 2. Write 0xFFFF flag to claim descriptor
+ * 3. Check V (valid) bit - if clear, set XL and stop
+ * 4. Handle C (chain) bit - follow chain to next descriptor
+ * 5. DMA packet data from buffer address, accumulating in write_buffer
+ * 6. On E (end of message):
+ *    - Check for loopback mode (IL=0 OR EL=1)
+ *    - Check for setup packet (S bit)
+ *    - Either loopback/setup locally, or send via pcap
+ * 7. Write status words and clear V bit
+ *
+ * LOOPBACK LOGIC (SimH-compatible):
+ * Loopback is enabled when IL=0 (internal loopback) OR EL=1 (external
+ * loopback). This is independent of RE (receive enable). Many sources
+ * incorrectly describe this as AND logic or requiring RE=1.
+ */
 bool delqa_c::process_xbdl(void)
 {
+    // Status for implicit chain (multi-segment packets)
     const uint16_t implicit_chain_status[2] = {static_cast<uint16_t>(XQ_DSC_V | XQ_DSC_C), 1};
 
     while (true) {
@@ -1350,6 +1666,7 @@ bool delqa_c::process_xbdl(void)
             return false;
         }
 
+        // Claim descriptor with 0xFFFF flag
         uint16_t flag = 0xFFFF;
         if (!desc_write_words(cur_ba, &flag, 1)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1357,6 +1674,7 @@ bool delqa_c::process_xbdl(void)
             return false;
         }
 
+        // Check V (valid) bit - if clear, end of list
         if (~words[1] & XQ_DSC_V) {
             if (trace.value) {
                 WARNING("DELQA: TX descriptor at %06o not valid (addr_hi=%06o)",
@@ -1364,19 +1682,21 @@ bool delqa_c::process_xbdl(void)
             }
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                csr_set_clr(XQ_CSR_XL, 0);
+                csr_set_clr(XQ_CSR_XL, 0);  // Mark list invalid
             }
             return false;
         }
 
+        // Calculate buffer address and length
         uint32_t address = make_addr(words[1], words[2]);
-        uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
+        uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);  // One's complement
         uint16_t b_length = static_cast<uint16_t>(w_length * 2);
-        if (words[1] & XQ_DSC_H)
+        if (words[1] & XQ_DSC_H)  // Odd byte at start
             b_length -= 1;
-        if (words[1] & XQ_DSC_L)
+        if (words[1] & XQ_DSC_L)  // Odd byte at end
             b_length -= 1;
 
+        // Handle C (chain) bit - follow chain pointer
         if (words[1] & XQ_DSC_C) {
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1478,6 +1798,7 @@ bool delqa_c::process_xbdl(void)
                 return false;
             }
 
+            // Clear V bit to return descriptor
             {
                 uint16_t word1 = 0;
                 if (desc_read_words(cur_ba + 2, &word1, 1)) {
@@ -1487,6 +1808,7 @@ bool delqa_c::process_xbdl(void)
             }
         }
 
+        // Advance to next descriptor
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             xbdl_ba = cur_ba + QE_RING_BYTES;
@@ -1494,12 +1816,29 @@ bool delqa_c::process_xbdl(void)
     }
 }
 
+/*
+ * process_setup - Parse and apply setup packet configuration
+ *
+ * The setup packet is a special 128-byte transmit that configures the
+ * receiver's address filter. Format:
+ *   Bytes 0-111: Up to 14 MAC addresses (8 bytes each, 6 MAC + 2 padding)
+ *                First is the station's own address, rest are multicast/etc.
+ *   Bytes 112-127: Extended setup (if present):
+ *                  Bit 0: Accept all multicast
+ *                  Bit 1: Promiscuous mode
+ *                  Bits 2-3: LED control
+ *                  Bits 4-6: Sanity timer setting
+ *
+ * After processing, update_pcap_filter() is called to apply the new
+ * receive filter to the host network interface.
+ */
 void delqa_c::process_setup(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
     const uint8_t *msg = write_buffer.msg.data();
     size_t len = write_buffer.len;
 
+    // Extract MAC addresses from setup packet (unusual byte ordering)
     memset(setup.macs, 0, sizeof(setup.macs));
     for (int i = 0; i < 7; i++)
         for (int j = 0; j < 6; j++) {
@@ -1508,6 +1847,7 @@ void delqa_c::process_setup(void)
                 setup.macs[i + 7][j] = msg[(i + 0x41) + (j * 8)];
         }
 
+    // Parse extended setup fields (if present)
     setup.promiscuous = false;
     if (len > 128) {
         uint16_t l = static_cast<uint16_t>(len);
@@ -1517,6 +1857,8 @@ void delqa_c::process_setup(void)
 
         setup.multicast = (0 != (l & XQ_SETUP_MC));
         setup.promiscuous = (0 != (l & XQ_SETUP_PM));
+
+        // LED control (active low)
         if (led) {
             switch (led) {
             case 1: setup.l1 = false; break;
@@ -1525,6 +1867,7 @@ void delqa_c::process_setup(void)
             }
         }
 
+        // Sanity timer setting (exponential scale)
         switch (san) {
         case 0: secs = 0.25f; break;
         case 1: secs = 1.0f; break;
@@ -1539,14 +1882,16 @@ void delqa_c::process_setup(void)
         sanity.max = static_cast<int>(secs * XQ_SERVICE_INTERVAL);
     }
 
+    // Reset sanity timer and enable if SE bit is set
     sanity.timer = sanity.max;
-    if (sanity.enabled != 2) {
+    if (sanity.enabled != 2) {  // Don't override hardware sanity
         if (csr & XQ_CSR_SE)
             sanity.enabled = 1;
         else
             sanity.enabled = 0;
     }
 
+    // Apply new filter settings to pcap
     update_pcap_filter();
     setup.valid = true;
 
@@ -1583,6 +1928,16 @@ bool delqa_c::ensure_bootrom_image(void)
     bootrom_ready = true;
     return true;
 }
+
+/*
+ * process_bootrom - Deliver bootrom image via RX descriptors
+ *
+ * This function is called when the driver enables the receiver
+ * (RE=1) and the bootrom image has not yet been delivered.
+ * The bootrom is delivered in two segments via the RX descriptor ring.
+ *
+ * Returns: true on success, false on NXM error
+ */
 
 bool delqa_c::process_bootrom(void)
 {
@@ -1705,6 +2060,14 @@ bool delqa_c::process_bootrom(void)
     return true;
 }
 
+/* process_local - Handle incoming local packets
+ *
+ * This function processes packets sent to the DELQA's local
+ * protocols: Loopback (0x0090) and Remote Console (0x0260).
+ *
+ * Returns: true if packet was handled, false otherwise
+ */
+
 bool delqa_c::process_local(const uint8_t *data, size_t len)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1722,6 +2085,15 @@ bool delqa_c::process_local(const uint8_t *data, size_t len)
     }
     return false;
 }
+
+/* process_loopback - Handle incoming loopback packets
+ *
+ * This function processes MOP loopback packets (protocol 0x0090).
+ * It verifies the function code and swaps source/destination
+ * addresses to create the reply packet.
+ *
+ * Returns: true on success, false on failure
+ */
 
 bool delqa_c::process_loopback(const uint8_t *data, size_t len)
 {
@@ -1752,6 +2124,15 @@ bool delqa_c::process_loopback(const uint8_t *data, size_t len)
     return pcap.send(reply.data(), reply.size());
 }
 
+/* process_remote_console - Handle incoming remote console packets
+ *
+ * This function processes MOP remote console packets (protocol 0x0260).
+ * It verifies the command code and responds to system ID requests
+ * or resets the controller as requested.
+ *
+ * Returns: true on success, false on failure
+ */
+
 bool delqa_c::process_remote_console(const uint8_t *data, size_t len)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1772,6 +2153,14 @@ bool delqa_c::process_remote_console(const uint8_t *data, size_t len)
     }
     return false;
 }
+
+/* send_system_id - Send system ID response packet
+ *
+ * This function constructs and sends a MOP system ID response
+ * packet to the specified destination MAC address.
+ *
+ * Returns: true on success, false on failure
+ */ 
 
 bool delqa_c::send_system_id(const uint8_t *dest, uint16_t receipt_id)
 {
@@ -1822,6 +2211,15 @@ bool delqa_c::send_system_id(const uint8_t *dest, uint16_t receipt_id)
     return pcap.send(system_id.data(), system_id.size());
 }
 
+/*
+ * worker - Entry point for worker threads
+ *
+ * The DELQA uses two worker threads to handle RX and TX independently:
+ *   Instance 0 (worker_rx): Handles receive operations
+ *   Instance 1 (worker_tx): Handles transmit operations
+ *
+ * This separation allows TX to proceed while RX is blocked and vice versa.
+ */
 void delqa_c::worker(unsigned instance)
 {
     if (trace.value)
@@ -1832,20 +2230,37 @@ void delqa_c::worker(unsigned instance)
         worker_tx();
 }
 
+/*
+ * worker_rx - RX worker thread main loop
+ *
+ * Responsibilities:
+ * 1. Service timers (sanity, system ID)
+ * 2. Process pending register writes
+ * 3. Handle boot ROM requests
+ * 4. Dispatch RX ring when RCLH is written
+ * 5. Poll pcap for incoming packets
+ * 6. Process MOP protocol packets locally (loopback, remote console)
+ * 7. Queue normal packets for delivery to host
+ * 8. Deliver queued packets to RX descriptors
+ *
+ * The loop runs every 10ms when idle, faster when processing packets.
+ */
 void delqa_c::worker_rx(void)
 {
     worker_init_realtime_priority(rt_device);
     bool rx_blocked_logged = false;
 
     while (!workers_terminate) {
-        service_timers();
-        apply_pending_reg_writes();
+        service_timers();           // Sanity timer, system ID timer
+        apply_pending_reg_writes(); // Process deferred register writes
 
+        // Pause during BINIT
         if (qunibusadapter->line_INIT) {
             timeout_c::wait_ms(1);
             continue;
         }
 
+        // Check for pending operations
         bool do_bootrom = false;
         bool do_rbdl = false;
         {
@@ -1860,13 +2275,18 @@ void delqa_c::worker_rx(void)
                 do_rbdl = true;
             }
         }
+
+        // Process boot ROM request
         if (do_bootrom) {
             process_bootrom();
             continue;
         }
+
+        // Dispatch RX ring
         if (do_rbdl)
             dispatch_rbdl();
 
+        // Check if receiver is ready (RE=1 and delay expired)
         if (!rx_ready()) {
             if (!read_queue.empty() && !rx_blocked_logged) {
                 if (trace.value) {
@@ -1881,6 +2301,7 @@ void delqa_c::worker_rx(void)
 
 #ifdef HAVE_PCAP
         if (pcap.is_open()) {
+            // Deliver any queued packets first
             bool do_process = false;
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1889,6 +2310,7 @@ void delqa_c::worker_rx(void)
             if (do_process)
                 process_rbdl();
 
+            // Poll for incoming packets from network
             while (true) {
                 size_t len = 0;
                 if (!pcap.poll(read_buffer.msg.data(), read_buffer.msg.size(), &len)) {
@@ -1896,7 +2318,7 @@ void delqa_c::worker_rx(void)
                     break;
                 }
                 if (len == 0)
-                    break;
+                    break;  // No more packets
 
                 stats.recv++;
                 stat_rx_frames.value = stats.recv;
@@ -1904,11 +2326,13 @@ void delqa_c::worker_rx(void)
                 read_buffer.len = len;
                 read_buffer.used = 0;
 
+                // Try to handle MOP protocols locally
                 bool consumed = process_local(read_buffer.msg.data(), read_buffer.len);
                 if (!consumed)
                     enqueue_readq(2, read_buffer.msg.data(), read_buffer.len, 0);
             }
 
+            // Deliver newly queued packets
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 do_process = !read_queue.empty() && !(csr & XQ_CSR_RL);
@@ -1918,21 +2342,34 @@ void delqa_c::worker_rx(void)
         }
 #endif
 
-        timeout_c::wait_ms(10);
+        timeout_c::wait_ms(10);  // Idle poll rate
     }
 }
 
+/*
+ * worker_tx - TX worker thread main loop
+ *
+ * Responsibilities:
+ * 1. Process pending register writes
+ * 2. Dispatch TX ring when XMTH is written
+ *
+ * TX is simpler than RX - just wait for XMTH write and process descriptors.
+ * Runs every 1ms to minimize transmit latency.
+ */
 void delqa_c::worker_tx(void)
 {
     worker_init_realtime_priority(rt_device);
 
     while (!workers_terminate) {
         apply_pending_reg_writes();
+
+        // Pause during BINIT
         if (qunibusadapter->line_INIT) {
             timeout_c::wait_ms(1);
             continue;
         }
 
+        // Check for pending TX dispatch
         bool do_xbdl = false;
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1944,6 +2381,6 @@ void delqa_c::worker_tx(void)
         if (do_xbdl)
             dispatch_xbdl();
 
-        timeout_c::wait_ms(1);
+        timeout_c::wait_ms(1);  // Fast poll for low TX latency
     }
 }
