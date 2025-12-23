@@ -21,12 +21,13 @@ Code Changes
      while CSR accesses are still being processed by ARM.
 
 2) pru1_statemachine_arbitration.c
-   - Removed the SSYN wait in State 2 of sm_arb_worker_device().
-   - Arbitration now waits only for BG/NPG and BBSY to clear before granting.
-     SSYN may still be asserted due to CSR access; we no longer block NPR/BR
-     on that condition.
+   - Keep the SSYN wait in State 2 of sm_arb_worker_device().
+   - Arbitration can proceed while a deviceregister event is pending, but the
+     actual grant completion still waits for SSYN to deassert to avoid starting
+     DMA during an active slave cycle (which can cause DATO timeouts).
 
 Expected Effect
 DMA requests from devices (like DELQA) should no longer stall when the CPU is
-polling device registers. This aligns PRU arbitration closer to real bus
-master behavior and avoids priority inversion between CSR polling and DMA.
+polling device registers because arbitration still runs. At the same time, DMA
+won't begin while SSYN is asserted, preventing invalid bus cycles and DATO
+timeouts.

@@ -1014,6 +1014,7 @@ bool delqa_c::dispatch_rbdl(void)
 
 bool delqa_c::process_rbdl(void)
 {
+    bool ri_pending = false;
     while (true) {
         uint32_t cur_ba = 0;
         size_t queue_size = 0;
@@ -1208,9 +1209,14 @@ bool delqa_c::process_rbdl(void)
 
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(XQ_CSR_RI, 0);
             rbdl_ba = cur_ba + QE_RING_BYTES;
         }
+        ri_pending = true;
+    }
+
+    if (ri_pending) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        csr_set_clr(XQ_CSR_RI, 0);
     }
 
     return true;
