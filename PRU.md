@@ -21,13 +21,44 @@ Code Changes
      while CSR accesses are still being processed by ARM.
 
 2) pru1_statemachine_arbitration.c
-   - Keep the SSYN wait in State 2 of sm_arb_worker_device().
-   - Arbitration can proceed while a deviceregister event is pending, but the
-     actual grant completion still waits for SSYN to deassert to avoid starting
-     DMA during an active slave cycle (which can cause DATO timeouts).
+   - Removed the SSYN wait in State 2 of sm_arb_worker_device().
+   - Arbitration now waits only for BG/NPG and BBSY to clear before granting.
+     SSYN may still be asserted due to CSR access; we no longer block NPR/BR
+     on that condition.
 
 Expected Effect
 DMA requests from devices (like DELQA) should no longer stall when the CPU is
-polling device registers because arbitration still runs. At the same time, DMA
-won't begin while SSYN is asserted, preventing invalid bus cycles and DATO
-timeouts.
+polling device registers. This aligns PRU arbitration closer to real bus
+master behavior and avoids priority inversion between CSR polling and DMA.
+
+Note
+Q-bus Specification Reference
+Per DEC's Q-bus specification, NPR arbitration is asynchronous to the current
+bus cycle. A device may assert NPR at any time, and NPG is granted when:
+  - The current bus master releases BBSY
+  - No higher-priority request is pending
+SSYN is not part of the NPR/NPG handshake and should not gate arbitration.
+
+What Claude had to say:
+
+"Your analysis and proposed fix look correct to me. Here are my thoughts:
+
+Agreement with the Diagnosis
+The deadlock scenario you've identified is exactly what the logs showed:
+
+CPU polls CSR → SSYN asserted
+PRU waits for ARM to process the register access
+DELQA worker thread tries to do DMA
+PRU arbitration blocked waiting for SSYN to clear
+ARM can't complete register access until DMA finishes (or vice versa)
+Deadlock
+This matches the Q-bus specification: NPR/BR arbitration is independent of the current bus cycle. A device can request the bus (assert NPR) even while another cycle is in progress. The grant happens after BBSY clears, not after SSYN clears.
+
+The Fix is Architecturally Correct
+On real Q-bus hardware:
+
+SSYN indicates the slave is responding to the current address/data
+BBSY indicates the bus is actively being used for a transfer
+NPR/NPG arbitration should wait for BBSY to clear, not SSYN
+The previous PRU code was too conservative - waiting for SSYN essentially serialized everything through the ARM, which created the priority inversion."
+ß
