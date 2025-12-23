@@ -158,37 +158,33 @@ void main(void) {
 			}
 
 			// Priority Arbitration
-			// Delay INTR or DMA while BUS halted via SSYN.
-			// ARM may start DMA within deviceregister event!
-			if (EVENT_IS_ACKED(mailbox, deviceregister)) {
-				// execute one of the arbitration workers
+			// Execute arbitration even if a deviceregister event is pending to avoid
+			// deadlocks where CSR polling blocks DMA arbitration.
+			if (emulate_cpu) {
+				// handle GRANT/SACK/BBSY for emulated devices
+				cpu_grant_mask = sm_arb_worker_cpu(); // GRANT device requests
+				// do not read GRANT signals from UNIBUS, BG/NPGOUT not visible for
+				// emulated devices
+//				sm_arb.device_forwarded_grant_mask = 0 ;
+			} // else GRANTed by physical CPU, see above
 
-				if (emulate_cpu) {
-					// handle GRANT/SACK/BBSY for emulated devices
-					cpu_grant_mask = sm_arb_worker_cpu(); // GRANT device requests
-					// do not read GRANT signals from UNIBUS, BG/NPGOUT not visible for
-					// emulated devices
-//					sm_arb.device_forwarded_grant_mask = 0 ;
-				} // else GRANTEd by physical CPU, see above
+			uint8_t granted_request = sm_device_arb_worker(cpu_grant_mask); // devices process GRANT
+			// sm_device_arb_worker()s include State 2 "BBSYWAIT".
+			// So now SACK maybe set, even if grant_mask is still 0
 
-				uint8_t granted_request = sm_device_arb_worker(cpu_grant_mask); // devices process GRANT
-				// sm_device_arb_worker()s include State 2 "BBSYWAIT".
-				// So now SACK maybe set, even if grant_mask is still 0
+			if (granted_request & PRIORITY_ARBITRATION_BIT_NP) {
+				sm_data_master_state = (statemachine_state_func) &sm_dma_start;
+				// can data_master_state be overwritten in the midst of a running data_master_state ?
+				// no: when running, SACK is set, no new GRANTs
+			} else if (granted_request & PRIORITY_ARBITRATION_INTR_MASK) {
+				// convert bit in grant_mask to INTR index
+				uint8_t idx = PRIORITY_ARBITRATION_INTR_BIT2IDX(granted_request);
+				// now transfer INTR vector for interrupt of GRANted level.
+				// vector and ARM context have been setup by ARM before ARM2PRU_INTR already
+				sm_intr_master.vector = mailbox.intr.vector[idx];
+				sm_intr_master.level_index = idx; // to be returned to ARM on complete
 
-				if (granted_request & PRIORITY_ARBITRATION_BIT_NP) {
-					sm_data_master_state = (statemachine_state_func) &sm_dma_start;
-					// can data_master_state  be overwritten in the midst of a running data_master_state ?
-					// no: when running, SACK is set, no new GRANTs
-				} else if (granted_request & PRIORITY_ARBITRATION_INTR_MASK) {
-					// convert bit in grant_mask to INTR index
-					uint8_t idx = PRIORITY_ARBITRATION_INTR_BIT2IDX(granted_request);
-					// now transfer INTR vector for interrupt of GRANted level.
-					// vector and ARM context have been setup by ARM before ARM2PRU_INTR already
-					sm_intr_master.vector = mailbox.intr.vector[idx];
-					sm_intr_master.level_index = idx; // to be returned to ARM on complete
-
-					sm_data_master_state = (statemachine_state_func) &sm_intr_master_start;
-				}
+				sm_data_master_state = (statemachine_state_func) &sm_intr_master_start;
 			}
 		} else {
 			// State 3 "MASTER"
@@ -345,4 +341,3 @@ void main(void) {
 }
 
 #pragma diag_pop
-

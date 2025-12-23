@@ -632,13 +632,12 @@ void delqa_c::update_pcap_filter(void)
     if (setup.multicast)
         append_term("ether multicast");
 
+    add_mac(mac_addr);
     if (setup.valid) {
         for (int i = 0; i < XQ_FILTER_MAX; ++i) {
             if (!mac_is_zero(setup.macs[i]))
                 add_mac(setup.macs[i]);
         }
-    } else {
-        add_mac(mac_addr);
     }
 
     if (filter.empty())
@@ -669,19 +668,25 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     if (qunibus_control != QUNIBUS_CYCLE_DATO)
         return;
 
-    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-
     uint16_t val = get_register_dato_value(device_reg);
+    if (device_reg->index < 8) {
+        pending_reg_value[device_reg->index].store(val, std::memory_order_relaxed);
+        pending_reg_mask.fetch_or(static_cast<uint16_t>(1u << device_reg->index),
+                std::memory_order_release);
+    }
+}
 
+void delqa_c::handle_register_write(uint8_t reg_index, uint16_t val)
+{
     if (trace.value) {
         static const char *reg_names[] = {
             "STA0", "STA1", "RCLL", "RCLH", "XMTL", "XMTH", "VAR", "CSR"
         };
-        const char *rname = (device_reg->index < 8) ? reg_names[device_reg->index] : "???";
-        INFO("DELQA: Write %s (reg %d) = %06o", rname, device_reg->index, val);
+        const char *rname = (reg_index < 8) ? reg_names[reg_index] : "???";
+        INFO("DELQA: Write %s (reg %d) = %06o", rname, reg_index, val);
     }
 
-    switch (device_reg->index) {
+    switch (reg_index) {
     case DELQA_REG_RCVLIST_LO:
         rbdl[0] = val;
         break;
@@ -760,6 +765,21 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     }
 }
 
+void delqa_c::apply_pending_reg_writes(void)
+{
+    uint16_t mask = pending_reg_mask.exchange(0, std::memory_order_acquire);
+    if (!mask)
+        return;
+
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    for (uint8_t idx = 0; idx < 8; ++idx) {
+        if (mask & static_cast<uint16_t>(1u << idx)) {
+            uint16_t val = pending_reg_value[idx].load(std::memory_order_relaxed);
+            handle_register_write(idx, val);
+        }
+    }
+}
+
 bool delqa_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
@@ -827,15 +847,8 @@ bool delqa_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     }
 
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    for (size_t i = 0; i < wordcount; ++i) {
-        uint16_t word = 0;
-        qunibusadapter->cpu_DATA_transfer(dma_desc_request, QUNIBUS_CYCLE_DATI,
-                addr + static_cast<uint32_t>(i * 2), &word);
-        if (!dma_desc_request.success)
-            return false;
-        buffer[i] = word;
-    }
-    return true;
+    qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
+    return dma_desc_request.success;
 }
 
 bool delqa_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
@@ -856,14 +869,9 @@ bool delqa_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
     }
 
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    for (size_t i = 0; i < wordcount; ++i) {
-        uint16_t word = buffer[i];
-        qunibusadapter->cpu_DATA_transfer(dma_desc_request, QUNIBUS_CYCLE_DATO,
-                addr + static_cast<uint32_t>(i * 2), &word);
-        if (!dma_desc_request.success)
-            return false;
-    }
-    return true;
+    qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,
+            const_cast<uint16_t *>(buffer), wordcount);
+    return dma_desc_request.success;
 }
 
 bool delqa_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
@@ -1759,6 +1767,7 @@ void delqa_c::worker_rx(void)
 
     while (!workers_terminate) {
         service_timers();
+        apply_pending_reg_writes();
 
         if (qunibusadapter->line_INIT) {
             timeout_c::wait_ms(1);
@@ -1843,6 +1852,7 @@ void delqa_c::worker_tx(void)
     worker_init_realtime_priority(rt_device);
 
     while (!workers_terminate) {
+        apply_pending_reg_writes();
         if (qunibusadapter->line_INIT) {
             timeout_c::wait_ms(1);
             continue;

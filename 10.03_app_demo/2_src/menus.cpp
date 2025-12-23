@@ -210,10 +210,17 @@ void application_c::print_params(parameterized_c *parameterized, parameter_c *p)
     stringgrid_c grid;
     auto clamp_cell = [](const std::string &text) {
         const size_t max_len = 200;
-        if (text.size() <= max_len)
-            return text;
-        std::string out = text.substr(0, max_len - 16);
-        out += "...(len=" + std::to_string(text.size()) + ")";
+        std::string out;
+        out.reserve(text.size() < max_len ? text.size() : max_len);
+        for (unsigned char ch : text) {
+            if (ch == '\0')
+                break;
+            out.push_back(isprint(ch) ? static_cast<char>(ch) : '?');
+            if (out.size() >= max_len) {
+                out += "...(len=" + std::to_string(text.size()) + ")";
+                break;
+            }
+        }
         return out;
     };
     unsigned r;

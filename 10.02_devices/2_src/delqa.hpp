@@ -12,6 +12,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <atomic>
 
 #include "qunibusdevice.hpp"
 #include "priorityrequest.hpp"
@@ -85,6 +86,9 @@ private:
 
     std::recursive_mutex state_mutex;
     std::recursive_mutex dma_mutex;
+
+    std::atomic<uint16_t> pending_reg_mask{0};
+    std::atomic<uint16_t> pending_reg_value[8];
 
     struct setup_state {
         bool valid = false;
@@ -177,6 +181,9 @@ private:
 
     void worker_rx(void);
     void worker_tx(void);
+
+    void handle_register_write(uint8_t reg_index, uint16_t val);
+    void apply_pending_reg_writes(void);
 
     bool dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
     bool dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);

@@ -207,7 +207,7 @@ uint8_t sm_arb_worker_device(uint8_t granted_requests_mask) {
 		}
 		return 0; // no REQUEST, or no GRANT for us, or wait for BG/BPG & BBSY && SSYN
 	} else {
-		// State 2: got GRANT, wait for BG/NPG, BBSY and SSYN to clear
+		// State 2: got GRANT, wait for BG/NPG and BBSY to clear
 		// DMA and INTR:
 		// "After receiving the negation of BBSY, SSYN and BGn,
 		// the requesting device asserts BBSY"
@@ -215,8 +215,6 @@ uint8_t sm_arb_worker_device(uint8_t granted_requests_mask) {
 			return 0; // BG*/NPG still set
 		if (buslatches_getbyte(1) & BIT(6))
 			return 0; // BBSY still set
-		if (buslatches_getbyte(4) & BIT(5))
-			return 0; // SSYN still set
 		granted_requests_mask = sm_arb.grant_bbsy_ssyn_wait_grant_mask;
 		sm_arb.grant_bbsy_ssyn_wait_grant_mask = 0; // Next State is 1
 		return granted_requests_mask; // signal what request we got granted.
@@ -295,4 +293,3 @@ uint8_t sm_arb_worker_cpu() {
 	return sm_arb.arbitrator_grant_mask;
 
 }
-
