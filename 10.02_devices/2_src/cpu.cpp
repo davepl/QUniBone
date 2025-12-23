@@ -341,7 +341,9 @@ void cpu_c::start()
     runmode.value = true;
     mailbox->param = 1;
     mailbox_execute(ARM2PRU_CPU_ENABLE);
-    qunibus->set_arbitrator_active(true);
+    // Emulated CPU does not provide external DMA arbitration; allow devices to DMA without DMR/DMG.
+    qunibus->set_arbitrator_active(false);
+    WARNING("CPU emulation active: external DMA arbitration disabled");
     pc.readonly = true; // can only be set on stopped CPU
     ka11.state = KA11_STATE_RUNNING;
     // time base of all device emulators now based on CPU opcode execution
@@ -543,4 +545,3 @@ void cpu_c::on_interrupt(uint16_t vector) {
 // PSW := *(vector+2)
     ka11_setintr(&unibone_cpu->ka11, vector);
 }
-
