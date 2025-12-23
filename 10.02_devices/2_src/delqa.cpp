@@ -38,6 +38,7 @@
 #include "timeout.hpp"
 #include "qunibus.h"
 #include "qunibusadapter.hpp"
+#include "ddrmem.h"
 #include "delqa.hpp"
 #include "delqa_bootrom.h"
 
@@ -758,8 +759,20 @@ bool delqa_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
         return false;
 
+    if (ddrmem && ddrmem->enabled &&
+        addr >= ddrmem->qunibus_startaddr &&
+        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        for (size_t i = 0; i < wordcount; ++i) {
+            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
+                return false;
+        }
+        return true;
+    }
+
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
+    WARNING("DELQA: DMA read_words addr=%06o words=%zu", addr, wordcount);
     qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
+    WARNING("DELQA: DMA read_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
     return dma_request.success;
 }
 
@@ -770,9 +783,21 @@ bool delqa_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
     if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
         return false;
 
+    if (ddrmem && ddrmem->enabled &&
+        addr >= ddrmem->qunibus_startaddr &&
+        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        for (size_t i = 0; i < wordcount; ++i) {
+            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
+                return false;
+        }
+        return true;
+    }
+
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
+    WARNING("DELQA: DMA write_words addr=%06o words=%zu", addr, wordcount);
     qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
             const_cast<uint16_t *>(buffer), wordcount);
+    WARNING("DELQA: DMA write_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
     return dma_request.success;
 }
 
@@ -810,15 +835,28 @@ bool delqa_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     if (addr + len > qunibus->addr_space_byte_count)
         return false;
 
+    const size_t max_words_per_dma = 64;
     size_t full_words = len / 2;
     if (full_words) {
-        std::vector<uint16_t> words(full_words);
-        for (size_t i = 0; i < full_words; ++i) {
-            words[i] = static_cast<uint16_t>(buffer[2 * i])
-                    | static_cast<uint16_t>(buffer[2 * i + 1] << 8);
+        size_t word_index = 0;
+        while (word_index < full_words) {
+            size_t chunk_words = full_words - word_index;
+            if (chunk_words > max_words_per_dma)
+                chunk_words = max_words_per_dma;
+
+            std::vector<uint16_t> words(chunk_words);
+            for (size_t i = 0; i < chunk_words; ++i) {
+                size_t byte_index = (word_index + i) * 2;
+                words[i] = static_cast<uint16_t>(buffer[byte_index])
+                        | static_cast<uint16_t>(buffer[byte_index + 1] << 8);
+            }
+
+            uint32_t addr_offset = static_cast<uint32_t>(word_index * 2);
+            if (!dma_write_words(addr + addr_offset, words.data(), chunk_words))
+                return false;
+
+            word_index += chunk_words;
         }
-        if (!dma_write_words(addr, words.data(), full_words))
-            return false;
     }
 
     if (len & 1) {
@@ -866,12 +904,16 @@ bool delqa_c::dispatch_rbdl(void)
 
     WARNING("DELQA: RX list dispatch at %06o (csr=%06o queue=%zu)",
             rbdl_ba, csr, read_queue.size());
+    WARNING("DELQA: RX list dispatch after RL clear at %06o (csr=%06o)",
+            rbdl_ba, csr);
 
     // SimH: only READ the descriptor in dispatch, don't write 0xFFFF yet
     uint16_t words[4] = {0};
-    if (!dma_read_words(rbdl_ba, words, 4)) {
-        nxm_error();
-        return false;
+    for (size_t i = 0; i < 4; ++i) {
+        if (!dma_read_words(rbdl_ba + static_cast<uint32_t>(i * 2), &words[i], 1)) {
+            nxm_error();
+            return false;
+        }
     }
 
     WARNING("DELQA: RX dispatch read words0=%06o words1=%06o words2=%06o words3=%06o",
@@ -899,9 +941,11 @@ bool delqa_c::process_rbdl(void)
             return false;
         }
         WARNING("DELQA: RX desc fetch at %06o (pre-read)", rbdl_ba);
-        if (!dma_read_words(rbdl_ba + 2, &words[1], QE_RING_WORDS - 1)) {
-            nxm_error();
-            return false;
+        for (size_t i = 1; i < QE_RING_WORDS; ++i) {
+            if (!dma_read_words(rbdl_ba + 2 + static_cast<uint32_t>((i - 1) * 2), &words[i], 1)) {
+                nxm_error();
+                return false;
+            }
         }
         WARNING("DELQA: RX desc %06o words1=%06o words2=%06o words3=%06o",
                 rbdl_ba, words[1], words[2], words[3]);
@@ -1278,14 +1322,22 @@ bool delqa_c::process_bootrom(void)
     uint16_t flag = 0xFFFF;
 
     for (int part = 0; part < 2; ++part) {
-        if (!dma_write_words(rbdl_ba, &flag, 1)) {
+    WARNING("DELQA: RX list dispatch pre-write flag at %06o", rbdl_ba);
+    if (!dma_write_words(rbdl_ba, &flag, 1)) {
+        WARNING("DELQA: RX list dispatch flag write failed at %06o", rbdl_ba);
+        nxm_error();
+        return false;
+    }
+    WARNING("DELQA: RX list dispatch pre-read desc at %06o", rbdl_ba);
+    for (size_t i = 1; i < QE_RING_WORDS; ++i) {
+        if (!dma_read_words(rbdl_ba + 2 + static_cast<uint32_t>((i - 1) * 2), &words[i], 1)) {
+            WARNING("DELQA: RX list dispatch desc read failed at %06o", rbdl_ba);
             nxm_error();
             return false;
         }
-        if (!dma_read_words(rbdl_ba + 2, &words[1], QE_RING_WORDS - 1)) {
-            nxm_error();
-            return false;
-        }
+    }
+    WARNING("DELQA: RX dispatch read words0=%06o words1=%06o words2=%06o words3=%06o",
+            flag, words[1], words[2], words[3]);
 
         if (~words[1] & XQ_DSC_V) {
             WARNING("DELQA: Bootrom RX descriptor at %06o not valid (addr_hi=%06o)",
@@ -1315,9 +1367,16 @@ bool delqa_c::process_bootrom(void)
         }
 
         const uint8_t *src = bootrom_image.data() + part * (sizeof(delqa_bootrom) / 2);
-        if (!dma_write_bytes(address, src, sizeof(delqa_bootrom) / 2)) {
-            nxm_error();
-            return false;
+        const size_t bootrom_half = sizeof(delqa_bootrom) / 2;
+        const size_t chunk_bytes = 512;
+        for (size_t offset = 0; offset < bootrom_half; offset += chunk_bytes) {
+            size_t len = bootrom_half - offset;
+            if (len > chunk_bytes)
+                len = chunk_bytes;
+            if (!dma_write_bytes(address + offset, src + offset, len)) {
+                nxm_error();
+                return false;
+            }
         }
 
         // Status word 1 for bootrom: DELQA sets bit 15 on both packets,

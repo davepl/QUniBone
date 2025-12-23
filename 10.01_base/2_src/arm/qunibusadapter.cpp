@@ -53,6 +53,8 @@
 #include <pthread.h>
 #include <assert.h>
 #include <queue>
+#include <errno.h>
+#include <time.h>
 
 // TEST
 //#include <unistd.h> // sleep()
@@ -713,8 +715,18 @@ void qunibusadapter_c::DMA(dma_request_c& dma_request, bool blocking, uint8_t qu
         // DMA() is blocking: Wait for request to finish.
         //	pthread_mutex_lock(&dma_request.mutex);
         while (!dma_request.complete) {
-            int res = pthread_cond_wait(&dma_request.complete_cond,
-                                        &dma_request.complete_mutex);
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 1;
+            int res = pthread_cond_timedwait(&dma_request.complete_cond,
+                                             &dma_request.complete_mutex, &ts);
+            if (res == ETIMEDOUT) {
+                WARNING("DMA() wait timeout: dev %s, %s @ %s, wordcount %u",
+                        dma_request.device ? dma_request.device->name.value.c_str() : "none",
+                        qunibus_c::control2text(qunibus_cycle),
+                        qunibus->addr2text(unibus_addr), wordcount);
+                continue;
+            }
             assert(!res);
         }
         pthread_mutex_unlock(&dma_request.complete_mutex);
@@ -1403,4 +1415,3 @@ void qunibusadapter_c::debug_snapshot(void)
     break_here();			// pos for breakpoint
 
 }
-
