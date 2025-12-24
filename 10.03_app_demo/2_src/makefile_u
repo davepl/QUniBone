@@ -134,7 +134,7 @@ OBJECTS = $(OBJDIR)/application.o	\
 	$(OBJDIR)/rs232.o \
 	$(OBJDIR)/rs232adapter.o \
 	$(OBJDIR)/dl11w.o \
-	$(OBJDIR)/delqa.o \
+	$(OBJDIR)/deuna.o \
 	$(OBJDIR)/pcap_bridge.o \
 	$(OBJDIR)/m9312.o \
     $(OBJDIR)/ke11.o \

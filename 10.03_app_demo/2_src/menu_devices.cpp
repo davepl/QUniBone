@@ -61,9 +61,11 @@
 #include "uda.hpp"
 #include "dl11w.hpp"
 #include "ke11.hpp"
-#include "delqa.hpp"
 #if defined(UNIBUS)
+#include "deuna.hpp"
 #include "m9312.hpp"
+#elif defined(QBUS)
+#include "delqa.hpp"
 #endif
 #include "cpu.hpp"
 
@@ -217,9 +219,15 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
     DL11b->error_bits_enable.value = false ; // M7856 SW4-7 ?
     DL11b->break_enable.value = true ; // TU58 needs BREAK
 
+#if defined(UNIBUS)
+    // Create DEUNA (UNIBUS Ethernet)
+    deuna_c *DEUNA = new deuna_c();
+    (void)DEUNA;
+#elif defined(QBUS)
     // Create DELQA (QBUS Ethernet)
     delqa_c *DELQA = new delqa_c();
     (void)DELQA;  // Suppress unused variable warning - device self-registers
+#endif
 
     // to inject characters into DL11 receiver
     // only 1st SLU, use this for console
