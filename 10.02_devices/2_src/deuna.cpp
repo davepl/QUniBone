@@ -265,6 +265,13 @@ deuna_c::deuna_c() : qunibusdevice_c()
     reg_pcsr3->reset_value = 0;
     reg_pcsr3->writable_bits = 0x0003;
 
+    ifname.value = "eth0";
+    mac.value = "";
+    promisc.value = true;
+    rx_slots.value = 0;
+    tx_slots.value = 0;
+    trace.value = false;
+
     /* Default MAC in DEC range */
     mac_addr[0] = 0x08;
     mac_addr[1] = 0x00;
@@ -516,9 +523,14 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     if (reg_index >= 4)
         return;
 
-    pending_reg_value[reg_index].store(device_reg->active_dato_flipflops);
-    pending_reg_access[reg_index].store(static_cast<uint8_t>(access));
-    pending_reg_mask.fetch_or(static_cast<uint16_t>(1u << reg_index));
+    pending_reg_write write;
+    write.reg_index = reg_index;
+    write.value = device_reg->active_dato_flipflops;
+    write.access = static_cast<uint8_t>(access);
+    {
+        std::lock_guard<std::mutex> lock(pending_reg_mutex);
+        pending_reg_queue.push_back(write);
+    }
 }
 
 void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access)
@@ -584,16 +596,17 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
 
 void deuna_c::apply_pending_reg_writes(void)
 {
-    uint16_t mask = pending_reg_mask.exchange(0);
-    if (!mask)
-        return;
+    std::deque<pending_reg_write> writes;
+    {
+        std::lock_guard<std::mutex> lock(pending_reg_mutex);
+        if (pending_reg_queue.empty())
+            return;
+        writes.swap(pending_reg_queue);
+    }
 
-    for (uint8_t i = 0; i < 4; ++i) {
-        if (mask & (1u << i)) {
-            uint16_t val = pending_reg_value[i].load();
-            DATO_ACCESS access = static_cast<DATO_ACCESS>(pending_reg_access[i].load());
-            handle_register_write(i, val, access);
-        }
+    for (const auto &write : writes) {
+        handle_register_write(write.reg_index, write.value,
+            static_cast<DATO_ACCESS>(write.access));
     }
 }
 

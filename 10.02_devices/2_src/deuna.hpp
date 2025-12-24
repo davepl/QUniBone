@@ -20,7 +20,6 @@
 #include <vector>
 #include <deque>
 #include <mutex>
-#include <atomic>
 
 #include "qunibusdevice.hpp"
 #include "priorityrequest.hpp"
@@ -121,11 +120,15 @@ private:
     std::recursive_mutex dma_mutex;
 
     /*
-     * Pending register writes from PDP-11
+     * Pending register writes from PDP-11 (preserve write order)
      */
-    std::atomic<uint16_t> pending_reg_mask{0};
-    std::atomic<uint16_t> pending_reg_value[4];
-    std::atomic<uint8_t> pending_reg_access[4];
+    struct pending_reg_write {
+        uint8_t reg_index = 0;
+        uint16_t value = 0;
+        uint8_t access = 0;
+    };
+    std::mutex pending_reg_mutex;
+    std::deque<pending_reg_write> pending_reg_queue;
 
     /*
      * Setup packet state (MAC filtering)
