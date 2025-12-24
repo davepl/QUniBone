@@ -42,6 +42,8 @@
 #include <errno.h>
 #include <algorithm>
 #include <vector>
+#include <chrono>
+#include <condition_variable>
 
 #include "logger.hpp"
 #include "utils.hpp"
@@ -67,6 +69,11 @@ static const size_t XU_MAX_RCV_PACKET = 1600;
  * Queue and timer constants
  */
 static const unsigned XU_QUE_MAX = 500;
+
+/*
+ * Default DEUNA hardware address (DEC OUI)
+ */
+static const uint8_t DEUNA_DEFAULT_MAC[6] = {0x08, 0x00, 0x2b, 0xcc, 0xdd, 0xee};
 
 /*
  * PCSR0 register definitions
@@ -331,12 +338,7 @@ deuna_c::deuna_c() : qunibusdevice_c()
     trace.value = false;
 
     /* Default MAC in DEC range */
-    mac_addr[0] = 0x08;
-    mac_addr[1] = 0x00;
-    mac_addr[2] = 0x2b;
-    mac_addr[3] = 0xcc;
-    mac_addr[4] = 0xdd;
-    mac_addr[5] = 0xee;
+    memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
 
     read_buffer.msg.reserve(XU_MAX_RCV_PACKET);
     write_buffer.msg.reserve(XU_MAX_RCV_PACKET);
@@ -405,6 +407,12 @@ bool deuna_c::on_param_changed(parameter_c *param)
     } else if (param == &mac) {
         if (mac.new_value.empty()) {
             mac_override = false;
+            memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
+            memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
+            setup.valid = true;
+            if (setup.mac_count < 2)
+                setup.mac_count = 2;
+            update_pcap_filter();
         } else {
             uint8_t parsed[6] = {0};
             if (!parse_mac(mac.new_value, parsed)) {
@@ -641,6 +649,8 @@ void deuna_c::reset_controller(void)
     read_queue_loss = 0;
 
     setup = setup_state();
+    if (!mac_override && mac_is_zero(mac_addr))
+        memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
     memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
     for (int i = 0; i < 6; ++i)
         setup.macs[1][i] = 0xff;
@@ -659,8 +669,8 @@ void deuna_c::reset_controller(void)
 /*
  * deuna_c::on_after_register_access
  * Purpose: capture UNIBUS register writes from the PDP-11.
- * Behavior: queues writes in order for worker-thread processing.
- * Notes: this runs in a high-priority context; keep it lightweight.
+ * Behavior: queues writes for worker thread processing to avoid DMA deadlock.
+ * Notes: must be fast to not block the UNIBUS callback path.
  */
 void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
         DATO_ACCESS access)
@@ -686,14 +696,20 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         WARNING("DEUNA: on_after_register_access %s = %06o (access=%d)", rname, val, access);
     }
 
-    pending_reg_write write;
-    write.reg_index = reg_index;
-    write.value = val;
-    write.access = static_cast<uint8_t>(access);
+    // Queue the register write for worker thread processing.
+    // We cannot process synchronously because commands may need DMA,
+    // and DMA requires the UNIBUS which we're currently blocking.
     {
         std::lock_guard<std::mutex> lock(pending_reg_mutex);
+        pending_reg_write write;
+        write.reg_index = reg_index;
+        write.value = val;
+        write.access = static_cast<uint8_t>(access);
         pending_reg_queue.push_back(write);
     }
+    
+    // Signal the worker thread to wake up immediately
+    pending_cmd_cv.notify_one();
 }
 
 /*
@@ -746,10 +762,23 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
             uint16_t cmd = pcsr0 & PCSR0_PCMD;
             if (cmd != CMD_NOOP) {
                 if (trace.value)
-                    WARNING("DEUNA: PCSR0 write dispatching command %03o, pcsr0 before=%06o", cmd, pcsr0);
-                port_command(cmd);
-                if (trace.value)
-                    WARNING("DEUNA: PCSR0 after command, pcsr0=%06o", pcsr0);
+                    WARNING("DEUNA: PCSR0 write cmd=%03o, pcsr0=%06o", cmd, pcsr0);
+                
+                // Commands that require DMA must be queued for worker thread.
+                // Commands that don't need DMA can be processed immediately.
+                bool needs_dma = (cmd == CMD_GETCMD || cmd == CMD_PDMD);
+                if (needs_dma) {
+                    // Queue for worker thread - it will call port_command
+                    std::lock_guard<std::mutex> cmdlock(pending_cmd_mutex);
+                    pending_cmd = cmd;
+                    if (trace.value)
+                        WARNING("DEUNA: Queued command %03o for worker", cmd);
+                } else {
+                    // Safe to execute immediately (no DMA needed)
+                    port_command(cmd);
+                    if (trace.value)
+                        WARNING("DEUNA: PCSR0 after command, pcsr0=%06o", pcsr0);
+                }
             } else if (trace.value) {
                 WARNING("DEUNA: PCSR0 write with NOOP, pcsr0=%06o", pcsr0);
             }
@@ -793,6 +822,33 @@ void deuna_c::apply_pending_reg_writes(void)
     for (const auto &write : writes) {
         handle_register_write(write.reg_index, write.value,
             static_cast<DATO_ACCESS>(write.access));
+    }
+}
+
+/*
+ * deuna_c::process_pending_command
+ * Purpose: execute queued port command that requires DMA.
+ * Behavior: called by worker thread to safely execute GETCMD/PDMD.
+ * Notes: DMA is only safe from worker context, not from UNIBUS callback.
+ */
+void deuna_c::process_pending_command(void)
+{
+    uint16_t cmd = 0;
+    {
+        std::lock_guard<std::mutex> lock(pending_cmd_mutex);
+        cmd = pending_cmd;
+        pending_cmd = 0;
+    }
+
+    if (cmd != 0) {
+        if (trace.value)
+            WARNING("DEUNA: Worker processing queued command %03o", cmd);
+        
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        port_command(cmd);
+        
+        if (trace.value)
+            WARNING("DEUNA: Worker command done, pcsr0=%06o", pcsr0);
     }
 }
 
@@ -928,8 +984,19 @@ bool deuna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
     if (addr + len > qunibus->addr_space_byte_count)
         return false;
 
-    if ((addr & 1) == 0 && (len & 1) == 0)
-        return dma_read_words(addr, reinterpret_cast<uint16_t*>(buffer), len / 2);
+    if ((addr & 1) == 0 && (len & 1) == 0) {
+        std::vector<uint16_t> tmp(len / 2, 0);
+        if (!dma_read_words(addr, tmp.data(), tmp.size()))
+            return false;
+        for (size_t i = 0; i < len; ++i) {
+            size_t word_index = i / 2;
+            bool high = (i & 1) != 0;
+            uint16_t w = tmp[word_index];
+            buffer[i] = high ? static_cast<uint8_t>((w >> 8) & 0xff)
+                             : static_cast<uint8_t>(w & 0xff);
+        }
+        return true;
+    }
 
     std::vector<uint16_t> tmp((len + 1) / 2, 0);
     if (!dma_read_words(addr & ~1u, tmp.data(), tmp.size()))
@@ -959,8 +1026,20 @@ bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     if (addr + len > qunibus->addr_space_byte_count)
         return false;
 
-    if ((addr & 1) == 0 && (len & 1) == 0)
-        return dma_write_words(addr, reinterpret_cast<const uint16_t*>(buffer), len / 2);
+    if ((addr & 1) == 0 && (len & 1) == 0) {
+        std::vector<uint16_t> tmp(len / 2, 0);
+        for (size_t i = 0; i < len; ++i) {
+            size_t word_index = i / 2;
+            bool high = (i & 1) != 0;
+            uint16_t w = tmp[word_index];
+            if (high)
+                w = static_cast<uint16_t>((w & 0x00ff) | (static_cast<uint16_t>(buffer[i]) << 8));
+            else
+                w = static_cast<uint16_t>((w & 0xff00) | buffer[i]);
+            tmp[word_index] = w;
+        }
+        return dma_write_words(addr, tmp.data(), tmp.size());
+    }
 
     uint32_t aligned = addr & ~1u;
     size_t wordcount = (len + (addr & 1u) + 1) / 2;
@@ -981,6 +1060,106 @@ bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     }
 
     return dma_write_words(aligned, tmp.data(), wordcount);
+}
+
+/*
+ * deuna_c::cpu_read_words
+ * Purpose: CPU-visible read helper for debugging memory mapping issues.
+ * Behavior: performs CPU DATI cycles to read words from UNIBUS space.
+ * Notes: serialized with DMA to avoid interleaving with device DMA ops.
+ */
+bool deuna_c::cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
+{
+    if (wordcount == 0)
+        return true;
+
+    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+        return false;
+
+    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
+    for (size_t i = 0; i < wordcount; ++i) {
+        uint16_t word = 0;
+        qunibusadapter->cpu_DATA_transfer(*qunibus->dma_request, QUNIBUS_CYCLE_DATI,
+                                          addr + static_cast<uint32_t>(i * 2), &word);
+        if (!qunibus->dma_request->success)
+            return false;
+        buffer[i] = word;
+    }
+    return true;
+}
+
+/*
+ * deuna_c::cpu_read_bytes
+ * Purpose: CPU-visible byte reader layered over cpu_read_words.
+ * Behavior: reads aligned words and extracts bytes.
+ * Notes: used for diagnostics to compare CPU view with DMA view.
+ */
+bool deuna_c::cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
+{
+    if (len == 0)
+        return true;
+
+    if (addr + len > qunibus->addr_space_byte_count)
+        return false;
+
+    uint32_t aligned = addr & ~1u;
+    size_t wordcount = (len + (addr & 1u) + 1) / 2;
+    std::vector<uint16_t> tmp(wordcount, 0);
+    if (!cpu_read_words(aligned, tmp.data(), wordcount))
+        return false;
+
+    size_t offset = addr & 1u;
+    for (size_t i = 0; i < len; ++i) {
+        size_t word_index = (i + offset) / 2;
+        bool high = ((i + offset) & 1) != 0;
+        uint16_t w = tmp[word_index];
+        buffer[i] = high ? static_cast<uint8_t>((w >> 8) & 0xff)
+                         : static_cast<uint8_t>(w & 0xff);
+    }
+    return true;
+}
+
+/*
+ * deuna_c::log_pcbb_snapshot
+ * Purpose: dump DMA vs CPU-visible snapshots of PCBB and MAC bytes.
+ * Behavior: reads PCBB words and the 6-byte MAC via both DMA and CPU paths.
+ * Notes: intended for diagnosing mapping mismatches during GETCMD.
+ */
+void deuna_c::log_pcbb_snapshot(const char *tag, uint32_t addr)
+{
+    uint16_t dma_words[4] = {0};
+    uint16_t cpu_words[4] = {0};
+    uint8_t dma_mac[6] = {0};
+    uint8_t cpu_mac[6] = {0};
+
+    bool ok_dma = dma_read_words(addr, dma_words, 4);
+    bool ok_cpu = cpu_read_words(addr, cpu_words, 4);
+    bool ok_dma_mac = dma_read_bytes(addr + 2, dma_mac, 6);
+    bool ok_cpu_mac = cpu_read_bytes(addr + 2, cpu_mac, 6);
+
+    WARNING("DEUNA: %s PCBB@%08o dma=%s %06o %06o %06o %06o cpu=%s %06o %06o %06o %06o",
+            tag, addr,
+            ok_dma ? "ok" : "fail",
+            dma_words[0], dma_words[1], dma_words[2], dma_words[3],
+            ok_cpu ? "ok" : "fail",
+            cpu_words[0], cpu_words[1], cpu_words[2], cpu_words[3]);
+
+    WARNING("DEUNA: %s MAC@%08o dma=%s %02x:%02x:%02x:%02x:%02x:%02x cpu=%s %02x:%02x:%02x:%02x:%02x:%02x",
+            tag, addr + 2,
+            ok_dma_mac ? "ok" : "fail",
+            dma_mac[0], dma_mac[1], dma_mac[2], dma_mac[3], dma_mac[4], dma_mac[5],
+            ok_cpu_mac ? "ok" : "fail",
+            cpu_mac[0], cpu_mac[1], cpu_mac[2], cpu_mac[3], cpu_mac[4], cpu_mac[5]);
+
+    if (ok_dma && ok_cpu &&
+        (dma_words[0] != cpu_words[0] || dma_words[1] != cpu_words[1] ||
+         dma_words[2] != cpu_words[2] || dma_words[3] != cpu_words[3])) {
+        WARNING("DEUNA: %s PCBB mismatch (DMA vs CPU)", tag);
+    }
+    if (ok_dma_mac && ok_cpu_mac &&
+        memcmp(dma_mac, cpu_mac, sizeof(dma_mac)) != 0) {
+        WARNING("DEUNA: %s MAC mismatch (DMA vs CPU)", tag);
+    }
 }
 
 /*
@@ -1089,6 +1268,9 @@ void deuna_c::port_command(uint16_t cmd)
         break;
     }
 
+    // Clear command field after execution - driver expects PCMD=0 when done
+    pcsr0 &= ~PCSR0_PCMD;
+
     if (trace.value)
         WARNING("DEUNA: port_command done, pcsr0=%06o", pcsr0);
 
@@ -1103,11 +1285,20 @@ void deuna_c::port_command(uint16_t cmd)
  */
 bool deuna_c::execute_command(void)
 {
-    if (!dma_read_words(pcbb, pcb, 4))
+    if (!dma_read_words(pcbb, pcb, 4)) {
+        WARNING("DEUNA: PCB read failed pcbb=%08o", pcbb);
         return false;
+    }
 
-    if (pcb[0] & 0177400)
+    if (pcb[0] & 0177400) {
+        WARNING("DEUNA: PCB invalid pcbb0=%06o pcbb=%08o", pcb[0], pcbb);
         return false;
+    }
+
+    if (trace.value) {
+        WARNING("DEUNA: PCB %06o %06o %06o %06o", pcb[0], pcb[1], pcb[2], pcb[3]);
+        log_pcbb_snapshot("pre-cmd", pcbb);
+    }
 
     uint16_t fnc = pcb[0] & 0377;
     uint32_t udbb = 0;
@@ -1122,20 +1313,65 @@ bool deuna_c::execute_command(void)
     case FC_NOOP:
         break;
     case FC_RDPA:
+        if (!mac_override && mac_is_zero(mac_addr))
+            memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
+        if (trace.value) {
+            WARNING("DEUNA: FC_RDPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                    mac_addr[0], mac_addr[1], mac_addr[2],
+                    mac_addr[3], mac_addr[4], mac_addr[5]);
+        }
         if (!dma_write_bytes(pcbb + 2, mac_addr, 6))
             return false;
+        if (get_udb_addr(udbb) && udbb != pcbb + 2) {
+            if (!dma_write_bytes(udbb, mac_addr, 6))
+                return false;
+        }
+        if (trace.value)
+            log_pcbb_snapshot("post-rdpa", pcbb);
         break;
     case FC_RPA:
+        if (trace.value) {
+            WARNING("DEUNA: FC_RPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                    setup.macs[0][0], setup.macs[0][1], setup.macs[0][2],
+                    setup.macs[0][3], setup.macs[0][4], setup.macs[0][5]);
+        }
         if (!dma_write_bytes(pcbb + 2, setup.macs[0], 6))
             return false;
+        if (get_udb_addr(udbb) && udbb != pcbb + 2) {
+            if (!dma_write_bytes(udbb, setup.macs[0], 6))
+                return false;
+        }
+        if (trace.value) {
+            uint8_t verify[6] = {0};
+            if (dma_read_bytes(pcbb + 2, verify, 6)) {
+                WARNING("DEUNA: FC_RPA verify mem=%02x:%02x:%02x:%02x:%02x:%02x",
+                        verify[0], verify[1], verify[2],
+                        verify[3], verify[4], verify[5]);
+            }
+            log_pcbb_snapshot("post-rpa", pcbb);
+        }
         break;
     case FC_WPA:
-        if (!dma_read_bytes(pcbb + 2, setup.macs[0], 6))
-            return false;
-        setup.valid = true;
-        if (setup.mac_count < 2)
-            setup.mac_count = 2;
-        update_pcap_filter();
+        {
+            uint8_t tmp[6] = {0};
+            if (!dma_read_bytes(pcbb + 2, tmp, 6))
+                return false;
+            if (trace.value) {
+                WARNING("DEUNA: FC_WPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                        tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5]);
+            }
+            if (mac_is_zero(tmp)) {
+                memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
+            } else {
+                memcpy(setup.macs[0], tmp, sizeof(tmp));
+            }
+            setup.valid = true;
+            if (setup.mac_count < 2)
+                setup.mac_count = 2;
+            update_pcap_filter();
+            if (trace.value)
+                log_pcbb_snapshot("post-wpa", pcbb);
+        }
         break;
     case FC_RMAL: {
         int mtlen = (pcb[2] & 0xFF00) >> 8;
@@ -1403,7 +1639,7 @@ void deuna_c::update_pcap_filter(void)
     if (!pcap.is_open())
         return;
 
-    if (promisc.value || setup.promiscuous) {
+    if (setup.promiscuous) {
         if (!pcap.set_filter("ip or not ip"))
             WARNING("DEUNA: pcap filter set failed: %s", pcap.last_error().c_str());
         return;
@@ -1616,13 +1852,15 @@ bool deuna_c::process_transmit(void)
                     runt = true;
             }
 
-            if (write_buffer.len >= 12)
-                memcpy(write_buffer.msg.data() + 6, setup.macs[0], sizeof(mac_addr));
-
             if ((mode & MODE_LOOP) && (mode & MODE_INTL)) {
                 enqueue_readq(write_buffer.msg.data(), write_buffer.len, true);
             } else {
                 if (!pcap.is_open() || !pcap.send(write_buffer.msg.data(), write_buffer.len)) {
+                    if (!pcap.is_open()) {
+                        WARNING("DEUNA: TX pcap not open");
+                    } else {
+                        WARNING("DEUNA: TX pcap send failed: %s", pcap.last_error().c_str());
+                    }
                     txhdr[3] |= TXR_RTRY;
                     txhdr[2] |= TXR_ERRS;
                     stats.ftransa++;
@@ -1721,7 +1959,6 @@ void deuna_c::worker_rx(void)
     uint8_t pkt_buf[2048];
     while (!workers_terminate) {
         service_timers();
-        apply_pending_reg_writes();
 
         if (init_asserted) {
             timeout_c::wait_ms(1);
@@ -1749,23 +1986,33 @@ void deuna_c::worker_rx(void)
 
 /*
  * deuna_c::worker_tx
- * Purpose: TX thread loop for descriptor-driven transmit.
- * Behavior: drains pending register writes and calls process_transmit.
- * Notes: runs at RT priority; relies on RUNNING state and ring setup.
+ * Purpose: TX thread loop for descriptor-driven transmit and command processing.
+ * Behavior: processes queued register writes and port commands, then handles TX.
+ * Notes: uses condition variable for low-latency wakeup on new commands.
  */
 void deuna_c::worker_tx(void)
 {
     worker_init_realtime_priority(rt_device);
 
     while (!workers_terminate) {
-        apply_pending_reg_writes();
+        // Wait for work with a short timeout (for periodic TX polling)
+        {
+            std::unique_lock<std::mutex> lock(pending_cmd_mutex);
+            pending_cmd_cv.wait_for(lock, std::chrono::microseconds(100));
+        }
 
         if (init_asserted) {
             timeout_c::wait_ms(1);
             continue;
         }
 
+        // Process any queued register writes first (maintains PCSR2/3 -> PCSR0 ordering)
+        apply_pending_reg_writes();
+        
+        // Process any pending DMA-requiring command
+        process_pending_command();
+
+        // Normal TX ring processing
         process_transmit();
-        timeout_c::wait_ms(1);
     }
 }

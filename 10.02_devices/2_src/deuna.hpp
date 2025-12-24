@@ -20,6 +20,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <condition_variable>
 
 #include "qunibusdevice.hpp"
 #include "priorityrequest.hpp"
@@ -129,6 +130,13 @@ private:
     };
     std::mutex pending_reg_mutex;
     std::deque<pending_reg_write> pending_reg_queue;
+
+    /*
+     * Pending port command for worker thread (DMA required)
+     */
+    std::mutex pending_cmd_mutex;
+    std::condition_variable pending_cmd_cv;
+    uint16_t pending_cmd = 0;  // 0 = no command pending
 
     /*
      * Setup packet state (MAC filtering)
@@ -242,6 +250,7 @@ private:
      */
     void handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access);
     void apply_pending_reg_writes(void);
+    void process_pending_command(void);
 
     /*
      * DMA operations
@@ -252,6 +261,9 @@ private:
     bool desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
     bool dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len);
     bool dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len);
+    bool cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
+    bool cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len);
+    void log_pcbb_snapshot(const char *tag, uint32_t addr);
 
     uint32_t make_addr(uint16_t hi, uint16_t lo) const;
 
