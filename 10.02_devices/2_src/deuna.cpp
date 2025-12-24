@@ -1,5 +1,7 @@
 /*
  * DEUNA Ethernet Controller Emulation for QUniBone
+ * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
+ * Contributed under the GPL2 License
  *
  * This is a clean-room implementation based on:
  *   - DEC DEUNA User's Guide (EK-DEUNA-UG)
@@ -295,14 +297,14 @@ deuna_c::deuna_c() : qunibusdevice_c()
 
     reg_pcsr0 = &(this->registers[0]);
     strcpy(reg_pcsr0->name, "PCSR0");
-    reg_pcsr0->active_on_dati = true;  // Enable to trace reads
+    reg_pcsr0->active_on_dati = false;
     reg_pcsr0->active_on_dato = true;
     reg_pcsr0->reset_value = 0;
     reg_pcsr0->writable_bits = 0xffff;
 
     reg_pcsr1 = &(this->registers[1]);
     strcpy(reg_pcsr1->name, "PCSR1");
-    reg_pcsr1->active_on_dati = true;  // Enable to trace reads
+    reg_pcsr1->active_on_dati = false;
     reg_pcsr1->active_on_dato = false;
     reg_pcsr1->reset_value = 0;
     reg_pcsr1->writable_bits = 0x0000;  // Read-only
@@ -528,10 +530,6 @@ void deuna_c::on_init_changed(void)
  */
 void deuna_c::update_pcsr_regs(void)
 {
-    if (trace.value)
-        WARNING("DEUNA: update_pcsr_regs pcsr0=%06o pcsr1=%06o pcsr2=%06o pcsr3=%06o",
-                pcsr0, pcsr1, pcsr2, pcsr3);
-
     if (reg_pcsr0) {
         reg_pcsr0->active_dati_flipflops = pcsr0;
         reg_pcsr0->active_dato_flipflops = pcsr0;
@@ -548,6 +546,16 @@ void deuna_c::update_pcsr_regs(void)
         reg_pcsr3->active_dati_flipflops = pcsr3;
         reg_pcsr3->active_dato_flipflops = pcsr3;
     }
+
+    // Also update the PRU-visible register values (only if installed, i.e., pru_iopage_register is set)
+    if (reg_pcsr0 && reg_pcsr0->pru_iopage_register)
+        reg_pcsr0->pru_iopage_register->value = pcsr0;
+    if (reg_pcsr1 && reg_pcsr1->pru_iopage_register)
+        reg_pcsr1->pru_iopage_register->value = pcsr1;
+    if (reg_pcsr2 && reg_pcsr2->pru_iopage_register)
+        reg_pcsr2->pru_iopage_register->value = pcsr2;
+    if (reg_pcsr3 && reg_pcsr3->pru_iopage_register)
+        reg_pcsr3->pru_iopage_register->value = pcsr3;
 }
 
 /*
@@ -578,17 +586,20 @@ void deuna_c::update_intr(void)
     else
         pcsr0 &= ~PCSR0_INTR;
 
-    bool want = any && (pcsr0 & PCSR0_INTE);
-    if (want && !irq) {
-        qunibusadapter->INTR(intr_request, nullptr, 0);
-        irq = true;
-        if (trace.value)
-            WARNING("DEUNA: INTR assert pcsr0=%06o vec=%03o level=%d", pcsr0, intr_vector.value, intr_level.value);
-    } else if (!want && irq) {
-        qunibusadapter->cancel_INTR(intr_request);
-        irq = false;
-        if (trace.value)
-            WARNING("DEUNA: INTR deassert pcsr0=%06o", pcsr0);
+    // Only signal interrupts if device is installed on the UNIBUS (qunibusadapter set)
+    if (qunibusadapter) {
+        bool want = any && (pcsr0 & PCSR0_INTE);
+        if (want && !irq) {
+            qunibusadapter->INTR(intr_request, nullptr, 0);
+            irq = true;
+            if (trace.value)
+                WARNING("DEUNA: INTR assert pcsr0=%06o vec=%03o level=%d", pcsr0, intr_vector.value, intr_level.value);
+        } else if (!want && irq) {
+            qunibusadapter->cancel_INTR(intr_request);
+            irq = false;
+            if (trace.value)
+                WARNING("DEUNA: INTR deassert pcsr0=%06o", pcsr0);
+        }
     }
 
     update_pcsr_regs();
@@ -654,32 +665,14 @@ void deuna_c::reset_controller(void)
 void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
         DATO_ACCESS access)
 {
+    if (qunibus_control != QUNIBUS_CYCLE_DATO)
+        return;
+
     if (!device_reg)
         return;
 
     uint8_t reg_index = device_reg->index;
     if (reg_index >= 4)
-        return;
-
-    // Handle DATI (read) - trace what value is being returned
-    if (qunibus_control == QUNIBUS_CYCLE_DATI) {
-        if (trace.value) {
-            const char *rname = "?";
-            if (reg_index == DEUNA_REG_PCSR0) rname = "PCSR0";
-            else if (reg_index == DEUNA_REG_PCSR1) rname = "PCSR1";
-            else if (reg_index == DEUNA_REG_PCSR2) rname = "PCSR2";
-            else if (reg_index == DEUNA_REG_PCSR3) rname = "PCSR3";
-            WARNING("DEUNA: Read %s = %06o (flipflop=%06o)", rname,
-                    device_reg->active_dati_flipflops,
-                    reg_index == 0 ? pcsr0 : (reg_index == 1 ? pcsr1 : 0));
-        }
-        // Update flipflops before read completes (in case they're stale)
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        update_pcsr_regs();
-        return;
-    }
-
-    if (qunibus_control != QUNIBUS_CYCLE_DATO)
         return;
 
     uint16_t val = device_reg->active_dato_flipflops;
@@ -693,11 +686,14 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         WARNING("DEUNA: on_after_register_access %s = %06o (access=%d)", rname, val, access);
     }
 
-    // Process all register writes synchronously to avoid race conditions
-    // PCSR0 contains commands that require immediate execution
-    // PCSR2/PCSR3 must be updated before GETPCBB command reads them
-    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-    handle_register_write(reg_index, val, access);
+    pending_reg_write write;
+    write.reg_index = reg_index;
+    write.value = val;
+    write.access = static_cast<uint8_t>(access);
+    {
+        std::lock_guard<std::mutex> lock(pending_reg_mutex);
+        pending_reg_queue.push_back(write);
+    }
 }
 
 /*
@@ -740,26 +736,23 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
             return;
         }
 
-        // Handle INTE change - generates DNI when toggled
+        // Handle INTE interlock: if INTE toggles, no port command is executed.
         if ((pcsr0 ^ data) & PCSR0_INTE) {
             pcsr0 ^= PCSR0_INTE;
             pcsr0 |= PCSR0_DNI;
-        }
-
-        // Always process command if one is specified (not NOOP)
-        // This fixes the bug where command was ignored when INTE changed
-        uint16_t cmd = data & PCSR0_PCMD;
-        if (cmd != CMD_NOOP) {
-            if (trace.value)
-                WARNING("DEUNA: PCSR0 write dispatching command %03o, pcsr0 before=%06o", cmd, pcsr0);
-            pcsr0 &= ~PCSR0_PCMD;
-            pcsr0 |= cmd;
-            port_command(cmd);
-            if (trace.value)
-                WARNING("DEUNA: PCSR0 after command, pcsr0=%06o", pcsr0);
         } else {
-            if (trace.value)
+            pcsr0 &= ~PCSR0_PCMD;
+            pcsr0 |= (data & PCSR0_PCMD);
+            uint16_t cmd = pcsr0 & PCSR0_PCMD;
+            if (cmd != CMD_NOOP) {
+                if (trace.value)
+                    WARNING("DEUNA: PCSR0 write dispatching command %03o, pcsr0 before=%06o", cmd, pcsr0);
+                port_command(cmd);
+                if (trace.value)
+                    WARNING("DEUNA: PCSR0 after command, pcsr0=%06o", pcsr0);
+            } else if (trace.value) {
                 WARNING("DEUNA: PCSR0 write with NOOP, pcsr0=%06o", pcsr0);
+            }
         }
 
         update_intr();
@@ -1095,9 +1088,6 @@ void deuna_c::port_command(uint16_t cmd)
         pcsr0 |= PCSR0_DNI;
         break;
     }
-
-    // Clear command field after execution - driver polls for this
-    pcsr0 &= ~PCSR0_PCMD;
 
     if (trace.value)
         WARNING("DEUNA: port_command done, pcsr0=%06o", pcsr0);
