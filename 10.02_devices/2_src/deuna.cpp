@@ -1609,10 +1609,13 @@ bool deuna_c::accept_packet(const uint8_t *data, size_t len) const
     if (!data || len < 6)
         return false;
 
-    if (promisc.value || setup.promiscuous)
+    if (setup.promiscuous)
         return true;
 
     const uint8_t *dst = data;
+    if (!mac_is_zero(mac_addr) && mac_equal(dst, mac_addr))
+        return true;
+
     if (mac_is_broadcast(dst))
         return true;
 
@@ -1620,7 +1623,7 @@ bool deuna_c::accept_packet(const uint8_t *data, size_t len) const
         return true;
 
     for (int i = 0; i < setup.mac_count; ++i) {
-        if (mac_equal(dst, setup.macs[i]))
+        if (!mac_is_zero(setup.macs[i]) && mac_equal(dst, setup.macs[i]))
             return true;
     }
 
@@ -1662,10 +1665,10 @@ void deuna_c::update_pcap_filter(void)
     if (setup.multicast)
         append_term("ether multicast");
 
-    add_mac(setup.macs[0]);
+    add_mac(mac_addr);
     if (setup.valid) {
         for (int i = 0; i < setup.mac_count; ++i) {
-            if (!mac_is_zero(setup.macs[i]))
+            if (!mac_is_zero(setup.macs[i]) && !mac_equal(setup.macs[i], mac_addr))
                 add_mac(setup.macs[i]);
         }
     }
@@ -1850,6 +1853,10 @@ bool deuna_c::process_transmit(void)
                 write_buffer.len = ETH_MIN_PACKET;
                 if ((mode & MODE_TPAD) == 0)
                     runt = true;
+            }
+
+            if (write_buffer.len >= 12 && !mac_is_zero(setup.macs[0])) {
+                memcpy(write_buffer.msg.data() + 6, setup.macs[0], 6);
             }
 
             if ((mode & MODE_LOOP) && (mode & MODE_INTL)) {
