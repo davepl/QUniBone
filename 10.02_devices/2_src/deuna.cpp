@@ -588,29 +588,43 @@ void deuna_c::update_transceiver_bits(void)
  */
 void deuna_c::update_intr(void)
 {
-    bool any = (pcsr0 & PCSR0_W1C_MASK) != 0;
+    const bool any = (pcsr0 & PCSR0_W1C_MASK) != 0;
     if (any)
         pcsr0 |= PCSR0_INTR;
     else
         pcsr0 &= ~PCSR0_INTR;
 
-    // Only signal interrupts if device is installed on the UNIBUS (qunibusadapter set)
-    if (qunibusadapter) {
-        bool want = any && (pcsr0 & PCSR0_INTE);
-        if (want && !irq) {
-            qunibusadapter->INTR(intr_request, nullptr, 0);
-            irq = true;
-            if (trace.value)
-                WARNING("DEUNA: INTR assert pcsr0=%06o vec=%03o level=%d", pcsr0, intr_vector.value, intr_level.value);
-        } else if (!want && irq) {
+    // Make CSR view consistent before toggling interrupt line
+    update_pcsr_regs();
+
+    if (!qunibusadapter)
+        return;
+
+    const bool inte = (pcsr0 & PCSR0_INTE) != 0;
+    if (!inte) {
+        if (trace.value && any)
+            WARNING("DEUNA: INTR suppressed (INTE=0) pcsr0=%06o", pcsr0);
+        if (irq) {
             qunibusadapter->cancel_INTR(intr_request);
             irq = false;
             if (trace.value)
                 WARNING("DEUNA: INTR deassert pcsr0=%06o", pcsr0);
         }
+        return;
     }
 
-    update_pcsr_regs();
+    // Force a deassert/assert cycle to re-arm level-sensitive interrupt delivery
+    if (irq) {
+        qunibusadapter->cancel_INTR(intr_request);
+        irq = false;
+    }
+
+    if (any) {
+        qunibusadapter->INTR(intr_request, reg_pcsr0, pcsr0);
+        irq = true;
+        if (trace.value)
+            WARNING("DEUNA: INTR assert pcsr0=%06o vec=%03o level=%d", pcsr0, intr_vector.value, intr_level.value);
+    }
 }
 
 /*
@@ -686,6 +700,21 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         return;
 
     uint16_t val = device_reg->active_dato_flipflops;
+    uint16_t w1c_snapshot = 0;
+
+    if (reg_index == DEUNA_REG_PCSR0) {
+        uint16_t w1c_mask = 0;
+        if (access == DATO_WORD || access == DATO_BYTEH)
+            w1c_mask = static_cast<uint16_t>(val & PCSR0_W1C_MASK);
+        if (w1c_mask) {
+            uint16_t before = __atomic_fetch_and(&pcsr0,
+                static_cast<uint16_t>(~w1c_mask), __ATOMIC_RELAXED);
+            uint16_t cleared = static_cast<uint16_t>(before & w1c_mask);
+            if (trace.value && cleared)
+                WARNING("DEUNA: W1C immediate clear bits=%06o (was pcsr0=%06o)", cleared, before);
+            update_intr();
+        }
+    }
 
     if (trace.value) {
         const char *rname = "?";
@@ -705,6 +734,7 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         write.reg_index = reg_index;
         write.value = val;
         write.access = static_cast<uint8_t>(access);
+        write.w1c_snapshot = w1c_snapshot;
         pending_reg_queue.push_back(write);
     }
     
@@ -718,7 +748,8 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
  * Behavior: updates pcsr fields, latches commands, and triggers actions.
  * Notes: pcbb/cmd sequencing depends on write order; keep W1C rules intact.
  */
-void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access)
+void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access,
+        uint16_t w1c_snapshot)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
@@ -734,7 +765,10 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
     switch (reg_index) {
     case DEUNA_REG_PCSR0: {
         if (access == DATO_BYTEH) {
-            pcsr0 &= static_cast<uint16_t>(~(val & PCSR0_W1C_MASK));
+            uint16_t cleared = w1c_snapshot;
+            if (trace.value && cleared)
+                WARNING("DEUNA: W1C BYTEH clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
+            pcsr0 &= static_cast<uint16_t>(~w1c_snapshot);
             update_intr();
             return;
         }
@@ -744,7 +778,10 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
             data = static_cast<uint16_t>((pcsr0 & 0xff00) | (val & 0x00ff));
 
         if (access == DATO_WORD) {
-            pcsr0 &= static_cast<uint16_t>(~(data & PCSR0_W1C_MASK));
+            uint16_t cleared = w1c_snapshot;
+            if (trace.value && cleared)
+                WARNING("DEUNA: W1C WORD clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
+            pcsr0 &= static_cast<uint16_t>(~w1c_snapshot);
         }
 
         if (data & PCSR0_RSET) {
@@ -821,7 +858,7 @@ void deuna_c::apply_pending_reg_writes(void)
 
     for (const auto &write : writes) {
         handle_register_write(write.reg_index, write.value,
-            static_cast<DATO_ACCESS>(write.access));
+            static_cast<DATO_ACCESS>(write.access), write.w1c_snapshot);
     }
 }
 
@@ -1208,6 +1245,10 @@ void deuna_c::port_command(uint16_t cmd)
 
     switch (cmd) {
     case CMD_PDMD:
+        if (trace.value) {
+            WARNING("DEUNA: PDMD tdrb=%08o telen=%u trlen=%u txnext=%u",
+                    tdrb, telen, trlen, txnext);
+        }
         process_transmit();
         pcsr0 |= PCSR0_DNI;
         break;
@@ -1431,6 +1472,10 @@ bool deuna_c::execute_command(void)
         rrlen = udb[5];
         rxnext = 0;
         txnext = 0;
+        if (trace.value) {
+            WARNING("DEUNA: FC_WRF tx tdrb=%08o telen=%u trlen=%u", tdrb, telen, trlen);
+            WARNING("DEUNA: FC_WRF rx rdrb=%08o relen=%u rrlen=%u", rdrb, relen, rrlen);
+        }
         break;
     case FC_RDCTR:
     case FC_RDCLCTR: {
@@ -1699,6 +1744,11 @@ bool deuna_c::process_receive(void)
 
     if (rrlen == 0 || relen == 0)
         return false;
+    if (relen < 4) {
+        stat |= STAT_ERRS | STAT_RRNG;
+        pcsr0 |= PCSR0_SERI;
+        return false;
+    }
 
     unsigned limit = rx_slots.value ? rx_slots.value : rrlen;
     unsigned processed = 0;
@@ -1706,11 +1756,16 @@ bool deuna_c::process_receive(void)
 
     while (!read_queue.empty() && (limit == 0 || processed < limit)) {
         uint32_t desc_addr = rdrb + (relen * 2) * rxnext;
-        if (!desc_read_words(desc_addr, rxhdr, 4)) {
+        std::vector<uint16_t> desc(relen, 0);
+        if (!desc_read_words(desc_addr, desc.data(), relen)) {
             stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_RRNG;
             pcsr0 |= PCSR0_SERI;
             break;
         }
+        rxhdr[0] = desc[0];
+        rxhdr[1] = desc[1];
+        rxhdr[2] = desc[2];
+        rxhdr[3] = desc[3];
 
         if (!(rxhdr[2] & RXR_OWN))
             break;
@@ -1766,7 +1821,11 @@ bool deuna_c::process_receive(void)
         }
 
         rxhdr[2] &= ~RXR_OWN;
-        if (!desc_write_words(desc_addr, rxhdr, 4)) {
+        desc[0] = rxhdr[0];
+        desc[1] = rxhdr[1];
+        desc[2] = rxhdr[2];
+        desc[3] = rxhdr[3];
+        if (!desc_write_words(desc_addr, desc.data(), relen)) {
             pcsr0 |= PCSR0_PCEI;
             break;
         }
@@ -1797,23 +1856,82 @@ bool deuna_c::process_transmit(void)
 
     if (trlen == 0 || telen == 0)
         return false;
+    if (telen < 4) {
+        stat |= STAT_ERRS | STAT_TRNG;
+        pcsr0 |= PCSR0_SERI;
+        return false;
+    }
 
     unsigned limit = tx_slots.value ? tx_slots.value : trlen;
     unsigned processed = 0;
+    bool txi_set = false;
 
     bool giant = false;
     bool runt = false;
 
+    static unsigned tx_not_owned_squelch = 0;
+    static unsigned tx_ring_dump_squelch = 0;
+    auto find_owned_desc = [&](unsigned &owned_index) -> bool {
+        if (trlen == 0)
+            return false;
+        for (unsigned i = 0; i < trlen; ++i) {
+            uint32_t probe_addr = tdrb + (telen * 2) * i;
+            uint16_t probe[4] = {0};
+            if (!desc_read_words(probe_addr, probe, 4))
+                continue;
+            if (probe[2] & TXR_OWN) {
+                owned_index = i;
+                return true;
+            }
+        }
+        return false;
+    };
+    if (trace.value && tx_not_owned_squelch < 4) {
+        WARNING("DEUNA: TX start tdrb=%08o telen=%u trlen=%u txnext=%u limit=%u",
+                tdrb, telen, trlen, txnext, limit);
+    }
+
     while (limit == 0 || processed < limit) {
         uint32_t desc_addr = tdrb + (telen * 2) * txnext;
-        if (!desc_read_words(desc_addr, txhdr, 4)) {
+        std::vector<uint16_t> desc(telen, 0);
+        if (!desc_read_words(desc_addr, desc.data(), telen)) {
             stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_TRNG;
             pcsr0 |= PCSR0_SERI;
             break;
         }
+        txhdr[0] = desc[0];
+        txhdr[1] = desc[1];
+        txhdr[2] = desc[2];
+        txhdr[3] = desc[3];
 
-        if (!(txhdr[2] & TXR_OWN))
+        if (!(txhdr[2] & TXR_OWN)) {
+            unsigned owned_index = 0;
+            if (find_owned_desc(owned_index)) {
+                if (trace.value && tx_not_owned_squelch < 4) {
+                    WARNING("DEUNA: TX desc not owned at txnext=%u, jumping to owned=%u",
+                            txnext, owned_index);
+                }
+                txnext = owned_index;
+                tx_not_owned_squelch = 0;
+                continue;
+            }
+            if (trace.value && tx_ring_dump_squelch < 2) {
+                WARNING("DEUNA: TX ring has no owned descriptors, dumping ring");
+                dump_tx_ring(8);
+                tx_ring_dump_squelch++;
+            }
+            if (trace.value && tx_not_owned_squelch < 4) {
+                WARNING("DEUNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
+                        desc_addr, txhdr[0], txhdr[1], txhdr[2], txhdr[3]);
+                WARNING("DEUNA: TX desc not owned, stopping at txnext=%u", txnext);
+                tx_not_owned_squelch++;
+            }
             break;
+        }
+        if (trace.value) {
+            WARNING("DEUNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
+                    desc_addr, txhdr[0], txhdr[1], txhdr[2], txhdr[3]);
+        }
 
         uint16_t slen = txhdr[0];
         uint32_t segb = make_addr(txhdr[2] & 0x0003, txhdr[1]);
@@ -1888,6 +2006,7 @@ bool deuna_c::process_transmit(void)
             }
 
             pcsr0 |= PCSR0_TXI;
+            txi_set = true;
             stats.ftrans++;
             stats.tbytes += static_cast<uint32_t>(write_buffer.len > 14 ? write_buffer.len - 14 : 0);
             if (mac_is_multicast(write_buffer.msg.data())) {
@@ -1900,10 +2019,19 @@ bool deuna_c::process_transmit(void)
         }
 
         txhdr[2] &= ~TXR_OWN;
-        if (!desc_write_words(desc_addr, txhdr, 4)) {
+        desc[0] = txhdr[0];
+        desc[1] = txhdr[1];
+        desc[2] = txhdr[2];
+        desc[3] = txhdr[3];
+        if (!desc_write_words(desc_addr, desc.data(), telen)) {
             pcsr0 |= PCSR0_PCEI;
             stats.ftransa++;
             break;
+        }
+
+        if (trace.value) {
+            WARNING("DEUNA: TX desc writeback addr=%08o w2=%06o w3=%06o",
+                    desc_addr, txhdr[2], txhdr[3]);
         }
 
         txnext++;
@@ -1913,8 +2041,38 @@ bool deuna_c::process_transmit(void)
         processed++;
     }
 
+    if (processed > 0 && !txi_set) {
+        pcsr0 |= PCSR0_TXI;
+    }
+
     update_intr();
     return true;
+}
+
+/*
+ * deuna_c::dump_tx_ring
+ * Purpose: trace TX ring descriptor ownership and headers for debugging.
+ * Behavior: reads up to max_entries descriptors and logs their header words.
+ * Notes: trace-only diagnostic to correlate driver-owned vs device-owned slots.
+ */
+void deuna_c::dump_tx_ring(unsigned max_entries)
+{
+    if (trlen == 0 || telen < 4) {
+        WARNING("DEUNA: TX ring dump skipped (trlen=%u telen=%u)", trlen, telen);
+        return;
+    }
+
+    unsigned count = std::min(max_entries, trlen);
+    for (unsigned i = 0; i < count; ++i) {
+        uint32_t desc_addr = tdrb + (telen * 2) * i;
+        uint16_t words[4] = {0};
+        if (!desc_read_words(desc_addr, words, 4)) {
+            WARNING("DEUNA: TX ring[%u] addr=%08o read failed", i, desc_addr);
+            continue;
+        }
+        WARNING("DEUNA: TX ring[%u] addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
+                i, desc_addr, words[0], words[1], words[2], words[3]);
+    }
 }
 
 /*

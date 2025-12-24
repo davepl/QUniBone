@@ -127,6 +127,7 @@ private:
         uint8_t reg_index = 0;
         uint16_t value = 0;
         uint8_t access = 0;
+        uint16_t w1c_snapshot = 0;
     };
     std::mutex pending_reg_mutex;
     std::deque<pending_reg_write> pending_reg_queue;
@@ -248,7 +249,8 @@ private:
     /*
      * Register write handling
      */
-    void handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access);
+    void handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access,
+            uint16_t w1c_snapshot);
     void apply_pending_reg_writes(void);
     void process_pending_command(void);
 
@@ -279,6 +281,7 @@ private:
     void enqueue_readq(const uint8_t *data, size_t len, bool loopback);
     bool process_receive(void);
     bool process_transmit(void);
+    void dump_tx_ring(unsigned max_entries);
 
     /*
      * Packet filtering
