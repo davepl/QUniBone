@@ -1,5 +1,7 @@
 /*
- * DELQA/DEQNA Ethernet Controller Emulation for QUniBone
+ * DEQNA Ethernet Controller Emulation for QUniBone
+ * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
+ * Contributed under the GPL2 License
  *
  * This is a clean-room implementation based on:
  *   - DEC DELQA/DEQNA hardware documentation
@@ -552,7 +554,7 @@ bool delqa_c::rx_ready(void)
 {
     if (!(csr & XQ_CSR_RE))
         return false;
-    if (!rx_delay_active)
+    if (!rx_delay_active)ß
         return true;
     if (timeout_c::abstime_ns() >= rx_enable_deadline_ns) {
         rx_delay_active = false;
