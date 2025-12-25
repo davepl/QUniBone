@@ -112,9 +112,9 @@ public:
     parameter_bool_c promisc = parameter_bool_c(this, "promisc", "pr", false,
             "Enable libpcap promiscuous capture");
     parameter_unsigned_c rx_slots = parameter_unsigned_c(this, "rx_slots", "rx", false, "",
-            "%d", "RX ring scan limit (0 = no limit)", 16, 10);
+            "%d", "RX ring scan limit (0 = no limit)", 0, 10);
     parameter_unsigned_c tx_slots = parameter_unsigned_c(this, "tx_slots", "tx", false, "",
-            "%d", "TX ring scan limit (0 = no limit)", 16, 10);
+            "%d", "TX ring scan limit (0 = no limit)", 0, 10);
     parameter_unsigned_c rx_start_delay_ms = parameter_unsigned_c(this, "rx_start_delay_ms", "rxd", false, "",
             "%d", "Receiver start delay in ms", 16, 10);
     parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
@@ -199,11 +199,14 @@ private:
     /*
      * Thread synchronization
      * ----------------------
-     * state_mutex: Protects all device state (csr, rbdl_ba, read_queue, etc.)
+     * state_mutex: Protects device state (csr, rbdl_ba, ring state, setup, etc.)
      * dma_mutex: Serializes DMA operations (only one DMA at a time)
+     * queue_mutex: Serializes queue access from PCAP callbacks
      */
     std::recursive_mutex state_mutex;
     std::recursive_mutex dma_mutex;
+    std::mutex queue_mutex;  // New: Serialize queue access from PCAP callbacks
+    std::atomic<bool> reset_in_progress{false};  // New: Flag to abort worker operations during reset
 
     /*
      * Pending register writes from PDP-11

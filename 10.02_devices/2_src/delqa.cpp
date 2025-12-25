@@ -554,7 +554,7 @@ bool delqa_c::rx_ready(void)
 {
     if (!(csr & XQ_CSR_RE))
         return false;
-    if (!rx_delay_active)ß
+    if (!rx_delay_active)
         return true;
     if (timeout_c::abstime_ns() >= rx_enable_deadline_ns) {
         rx_delay_active = false;
@@ -655,6 +655,7 @@ void delqa_c::service_timers(void)
  */
 void delqa_c::reset_controller(void)
 {
+    reset_in_progress.store(true, std::memory_order_release);
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
     // Clear descriptor ring pointers
@@ -680,11 +681,14 @@ void delqa_c::reset_controller(void)
     intr_request.edge_detect_reset();
     intr_request.set_vector(var & XQ_VEC_IV);
 
-    if (!read_queue.empty()) {
-        WARNING("DELQA: reset_controller clearing RX queue (size=%zu)", read_queue.size());
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
+        if (!read_queue.empty()) {
+            WARNING("DELQA: reset_controller clearing RX queue (size=%zu)", read_queue.size());
+        }
+        read_queue.clear();
+        read_queue_loss = 0;
     }
-    read_queue.clear();
-    read_queue_loss = 0;
     write_buffer.len = 0;
     write_buffer.used = 0;
 
@@ -707,9 +711,10 @@ void delqa_c::reset_controller(void)
         csr_set_clr(XQ_CSR_OK, 0);
 
     update_pcap_filter();
+    reset_in_progress.store(false, std::memory_order_release);
 }
 
-/* ß
+/*
  * sw_reset - Software reset
  *
  * Clears all state, sets RL and XL (lists invalid), and updates all registers.
@@ -718,6 +723,7 @@ void delqa_c::reset_controller(void)
 
 void delqa_c::sw_reset(void)
 {
+    reset_in_progress.store(true, std::memory_order_release);
     const uint16_t set_bits = XQ_CSR_XL | XQ_CSR_RL;
 
     csr_set_clr(set_bits, static_cast<uint16_t>(~set_bits));
@@ -727,16 +733,20 @@ void delqa_c::sw_reset(void)
 
     clr_int();
 
-    if (!read_queue.empty()) {
-        WARNING("DELQA: sw_reset clearing RX queue (size=%zu)", read_queue.size());
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
+        if (!read_queue.empty()) {
+            WARNING("DELQA: sw_reset clearing RX queue (size=%zu)", read_queue.size());
+        }
+        read_queue.clear();
+        read_queue_loss = 0;
     }
-    read_queue.clear();
-    read_queue_loss = 0;
 
     setup.multicast = false;
     setup.promiscuous = false;
 
     update_pcap_filter();
+    reset_in_progress.store(false, std::memory_order_release);
 }
 
 /* update_pcap_filter - Update libpcap filter based on current setup
@@ -968,12 +978,15 @@ bool delqa_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
         return true;
-    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if (ddrmem && ddrmem->enabled &&
-        addr >= ddrmem->qunibus_startaddr &&
-        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        addr64 >= ddrmem->qunibus_startaddr &&
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
             if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
                 return false;
@@ -999,12 +1012,15 @@ bool delqa_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
 {
     if (wordcount == 0)
         return true;
-    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if (ddrmem && ddrmem->enabled &&
-        addr >= ddrmem->qunibus_startaddr &&
-        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        addr64 >= ddrmem->qunibus_startaddr &&
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
             if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
                 return false;
@@ -1031,12 +1047,15 @@ bool delqa_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
         return true;
-    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if (ddrmem && ddrmem->enabled &&
-        addr >= ddrmem->qunibus_startaddr &&
-        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        addr64 >= ddrmem->qunibus_startaddr &&
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
             if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
                 return false;
@@ -1060,12 +1079,15 @@ bool delqa_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
 {
     if (wordcount == 0)
         return true;
-    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if (ddrmem && ddrmem->enabled &&
-        addr >= ddrmem->qunibus_startaddr &&
-        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        addr64 >= ddrmem->qunibus_startaddr &&
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
             if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
                 return false;
@@ -1090,7 +1112,10 @@ bool delqa_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
 {
     if (len == 0)
         return true;
-    if (addr + len > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(len);
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     size_t full_words = len / 2;
@@ -1124,7 +1149,10 @@ bool delqa_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
 {
     if (len == 0)
         return true;
-    if (addr + len > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(len);
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     const size_t max_words_per_dma = 64;
@@ -1177,7 +1205,7 @@ bool delqa_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
  */
 void delqa_c::enqueue_readq(int type, const uint8_t *data, size_t len, int status)
 {
-    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    std::lock_guard<std::mutex> lock(queue_mutex);  // Fix: Use queue_mutex for queue access
     if (trace.value) {
         WARNING("DELQA: Enqueue RX type=%d len=%zu status=%06o queue=%zu",
                 type, len, static_cast<uint16_t>(status), read_queue.size());
@@ -1220,13 +1248,16 @@ bool delqa_c::dispatch_rbdl(void)
     uint16_t csr_snapshot = 0;
     size_t queue_size = 0;
     {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
+        queue_size = read_queue.size();
+    }
+    {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         // SimH: clear RL and recalculate rbdl_ba from base registers
         csr_set_clr(0, XQ_CSR_RL);
         rbdl_ba = make_addr(rbdl[1], static_cast<uint16_t>(rbdl[0] & ~1u));
         cur_ba = rbdl_ba;
         csr_snapshot = csr;
-        queue_size = read_queue.size();
     }
     if (cur_ba == 0)
         return false;
@@ -1256,7 +1287,7 @@ bool delqa_c::dispatch_rbdl(void)
     // Process any waiting packets in receive queue
     bool do_process = false;
     {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
         do_process = !read_queue.empty();
     }
     if (do_process)
@@ -1300,9 +1331,12 @@ bool delqa_c::process_rbdl(void)
         size_t queue_size = 0;
         uint16_t csr_snapshot = 0;
         {
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
+            queue_size = read_queue.size();
+        }
+        {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             cur_ba = rbdl_ba;
-            queue_size = read_queue.size();
             csr_snapshot = csr;
         }
         if (trace.value) {
@@ -1363,11 +1397,11 @@ bool delqa_c::process_rbdl(void)
         }
 
         {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
             if (read_queue.empty()) {
                 if (trace.value) {
-                    WARNING("DELQA: RX list idle at %06o (queue empty, csr=%06o)",
-                            cur_ba, csr);
+                    WARNING("DELQA: RX list idle at %06o (queue empty)",
+                            cur_ba);
                 }
                 break;
             }
@@ -1389,11 +1423,11 @@ bool delqa_c::process_rbdl(void)
 
         queue_item item;
         {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
             if (read_queue.empty()) {
                 if (trace.value) {
-                    WARNING("DELQA: RX list idle at %06o (queue empty, csr=%06o)",
-                            cur_ba, csr);
+                    WARNING("DELQA: RX list idle at %06o (queue empty)",
+                            cur_ba);
                 }
                 break;
             }
@@ -1479,7 +1513,7 @@ bool delqa_c::process_rbdl(void)
 
         bool loss = false;
         {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
             if (read_queue_loss) {
                 loss = true;
                 read_queue_loss = 0;
@@ -1500,7 +1534,7 @@ bool delqa_c::process_rbdl(void)
         }
 
         if (item.packet.used < item.packet.len) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
             read_queue.push_front(std::move(item));
         }
 
@@ -1523,11 +1557,17 @@ void delqa_c::touch_rbdl_if_idle(void)
 {
     // SimH doesn't have this function - descriptors are only touched when processing packets
     // Just log for debugging, no DMA operations
-    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-    if (!read_queue.empty())
+    bool is_empty = false;
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
+        is_empty = read_queue.empty();
+    }
+    if (!is_empty)
         return;
-    if (trace.value)
+    if (trace.value) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
         WARNING("DELQA: RX idle at %06o (queue empty)", rbdl_ba);
+    }
 }
 
 /*
@@ -2253,6 +2293,10 @@ void delqa_c::worker_rx(void)
     bool rx_blocked_logged = false;
 
     while (!workers_terminate) {
+        if (reset_in_progress.load(std::memory_order_acquire)) {
+            timeout_c::wait_ms(1);
+            continue;
+        }
         service_timers();           // Sanity timer, system ID timer
         apply_pending_reg_writes(); // Process deferred register writes
 
@@ -2290,9 +2334,14 @@ void delqa_c::worker_rx(void)
 
         // Check if receiver is ready (RE=1 and delay expired)
         if (!rx_ready()) {
-            if (!read_queue.empty() && !rx_blocked_logged) {
+            bool has_queued = false;
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex);
+                has_queued = !read_queue.empty();
+            }
+            if (has_queued && !rx_blocked_logged) {
                 if (trace.value) {
-                    WARNING("DELQA: RX blocked (RE=0) with queued packets=%zu", read_queue.size());
+                    WARNING("DELQA: RX blocked (RE=0) with queued packets");
                 }
                 rx_blocked_logged = true;
             }
@@ -2305,11 +2354,16 @@ void delqa_c::worker_rx(void)
         if (pcap.is_open()) {
             // Deliver any queued packets first
             bool do_process = false;
+            bool rx_list_ready = false;
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                do_process = !read_queue.empty() && !(csr & XQ_CSR_RL);
+                rx_list_ready = !(csr & XQ_CSR_RL);
             }
-            if (do_process)
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex);
+                do_process = !read_queue.empty();
+            }
+            if (do_process && rx_list_ready)
                 process_rbdl();
 
             // Poll for incoming packets from network
@@ -2336,8 +2390,15 @@ void delqa_c::worker_rx(void)
 
             // Deliver newly queued packets
             {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                do_process = !read_queue.empty() && !(csr & XQ_CSR_RL);
+                {
+                    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                    rx_list_ready = !(csr & XQ_CSR_RL);
+                }
+                {
+                    std::lock_guard<std::mutex> queue_lock(queue_mutex);
+                    do_process = !read_queue.empty();
+                }
+                do_process = do_process && rx_list_ready;
             }
             if (do_process)
                 process_rbdl();
@@ -2363,6 +2424,10 @@ void delqa_c::worker_tx(void)
     worker_init_realtime_priority(rt_device);
 
     while (!workers_terminate) {
+        if (reset_in_progress.load(std::memory_order_acquire)) {
+            timeout_c::wait_ms(1);
+            continue;
+        }
         apply_pending_reg_writes();
 
         // Pause during BINIT

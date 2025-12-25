@@ -42,6 +42,7 @@
 #include <errno.h>
 #include <algorithm>
 #include <vector>
+#include <memory>
 #include <chrono>
 #include <condition_variable>
 
@@ -635,6 +636,7 @@ void deuna_c::update_intr(void)
  */
 void deuna_c::reset_controller(void)
 {
+    reset_in_progress.store(true, std::memory_order_release);  // Fix: Signal reset start
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
     if (trace.value)
@@ -659,8 +661,11 @@ void deuna_c::reset_controller(void)
     rrlen = 0;
     rxnext = 0;
 
-    read_queue.clear();
-    read_queue_loss = 0;
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
+        read_queue.clear();
+        read_queue_loss = 0;
+    }
 
     setup = setup_state();
     if (!mac_override && mac_is_zero(mac_addr))
@@ -678,6 +683,7 @@ void deuna_c::reset_controller(void)
 
     update_pcap_filter();
     update_intr();
+    reset_in_progress.store(false, std::memory_order_release);  // Fix: Signal reset end
 }
 
 /*
@@ -900,15 +906,20 @@ bool deuna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     if (wordcount == 0)
         return true;
 
-    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if (ddrmem && ddrmem->enabled &&
-        addr >= ddrmem->qunibus_startaddr &&
-        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        addr64 >= ddrmem->qunibus_startaddr &&
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
+            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i])) {
+                WARNING("DEUNA: DDR exam failed");
                 return false;
+            }
         }
         return true;
     }
@@ -929,15 +940,20 @@ bool deuna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
     if (wordcount == 0)
         return true;
 
-    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if (ddrmem && ddrmem->enabled &&
-        addr >= ddrmem->qunibus_startaddr &&
-        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        addr64 >= ddrmem->qunibus_startaddr &&
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
+            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i])) {
+                WARNING("DEUNA: DDR deposit failed");
                 return false;
+            }
         }
         return true;
     }
@@ -959,12 +975,15 @@ bool deuna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     if (wordcount == 0)
         return true;
 
-    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if (ddrmem && ddrmem->enabled &&
-        addr >= ddrmem->qunibus_startaddr &&
-        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        addr64 >= ddrmem->qunibus_startaddr &&
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
             if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
                 return false;
@@ -988,12 +1007,15 @@ bool deuna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
     if (wordcount == 0)
         return true;
 
-    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if (ddrmem && ddrmem->enabled &&
-        addr >= ddrmem->qunibus_startaddr &&
-        (addr + wordcount * 2 - 2) <= ddrmem->qunibus_endaddr) {
+        addr64 >= ddrmem->qunibus_startaddr &&
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
             if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
                 return false;
@@ -1018,7 +1040,10 @@ bool deuna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
     if (len == 0)
         return true;
 
-    if (addr + len > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(len);
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if ((addr & 1) == 0 && (len & 1) == 0) {
@@ -1060,7 +1085,10 @@ bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     if (len == 0)
         return true;
 
-    if (addr + len > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(len);
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     if ((addr & 1) == 0 && (len & 1) == 0) {
@@ -1110,7 +1138,10 @@ bool deuna_c::cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     if (wordcount == 0)
         return true;
 
-    if (addr + wordcount * 2 > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
@@ -1136,7 +1167,10 @@ bool deuna_c::cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
     if (len == 0)
         return true;
 
-    if (addr + len > qunibus->addr_space_byte_count)
+    uint64_t addr64 = addr;
+    uint64_t byte_count = static_cast<uint64_t>(len);
+    uint64_t max = qunibus->addr_space_byte_count;
+    if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
     uint32_t aligned = addr & ~1u;
@@ -1616,28 +1650,36 @@ bool deuna_c::execute_command(void)
  */
 void deuna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
 {
-    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    bool dropped = false;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);  // Fix: Serialize queue access
 
-    if (!data || len == 0)
-        return;
+        if (!data || len == 0)
+            return;
 
-    if (len > ETH_MAX_PACKET)
-        len = ETH_MAX_PACKET;
+        if (len > ETH_MAX_PACKET)
+            len = ETH_MAX_PACKET;
 
-    queue_item item;
-    item.loopback = loopback;
-    item.packet.msg.assign(data, data + len);
-    if (item.packet.msg.size() < ETH_MIN_PACKET)
-        item.packet.msg.resize(ETH_MIN_PACKET, 0);
-    item.packet.len = item.packet.msg.size();
-    item.packet.crc_len = std::min(item.packet.len + 4, ETH_FRAME_SIZE);
-    if (item.packet.msg.size() < item.packet.crc_len)
-        item.packet.msg.resize(item.packet.crc_len, 0);
-    read_queue.push_back(item);
+        queue_item item;
+        item.loopback = loopback;
+        item.packet.msg.assign(data, data + len);
+        if (item.packet.msg.size() < ETH_MIN_PACKET)
+            item.packet.msg.resize(ETH_MIN_PACKET, 0);
+        item.packet.len = item.packet.msg.size();
+        item.packet.crc_len = std::min(item.packet.len + 4, ETH_FRAME_SIZE);
+        if (item.packet.msg.size() < item.packet.crc_len)
+            item.packet.msg.resize(item.packet.crc_len, 0);
+        read_queue.push_back(item);
 
-    if (read_queue.size() > XU_QUE_MAX) {
-        read_queue.pop_front();
-        read_queue_loss++;
+        if (read_queue.size() > XU_QUE_MAX) {
+            read_queue.pop_front();
+            read_queue_loss++;
+            dropped = true;
+        }
+    }
+
+    if (dropped) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
         stats.rlossl++;
         stat_rx_errors.value = stats.rlossl;
     }
@@ -1739,8 +1781,11 @@ bool deuna_c::process_receive(void)
     if ((pcsr1 & PCSR1_STATE) != STATE_RUNNING)
         return false;
 
-    if (read_queue.empty())
-        return false;
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
+        if (read_queue.empty())
+            return false;
+    }
 
     if (rrlen == 0 || relen == 0)
         return false;
@@ -1752,9 +1797,15 @@ bool deuna_c::process_receive(void)
 
     unsigned limit = rx_slots.value ? rx_slots.value : rrlen;
     unsigned processed = 0;
-    queue_item *item = nullptr;
+    std::unique_ptr<queue_item> current_item;
 
-    while (!read_queue.empty() && (limit == 0 || processed < limit)) {
+    while (true) {
+        bool can_continue = false;
+        {
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
+            can_continue = (!read_queue.empty() || current_item) && (limit == 0 || processed < limit);
+        }
+        if (!can_continue) break;
         uint32_t desc_addr = rdrb + (relen * 2) * rxnext;
         std::vector<uint16_t> desc(relen, 0);
         if (!desc_read_words(desc_addr, desc.data(), relen)) {
@@ -1770,8 +1821,13 @@ bool deuna_c::process_receive(void)
         if (!(rxhdr[2] & RXR_OWN))
             break;
 
-        if (!item)
-            item = &read_queue.front();
+        if (!current_item) {
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
+            if (read_queue.empty())
+                break;
+            current_item.reset(new queue_item(std::move(read_queue.front())));
+            read_queue.pop_front();
+        }
 
         uint16_t slen = rxhdr[0];
         uint32_t segb = make_addr(rxhdr[2] & 0x0003, rxhdr[1]);
@@ -1779,45 +1835,44 @@ bool deuna_c::process_receive(void)
         rxhdr[2] &= static_cast<uint16_t>(~(RXR_FRAM | RXR_OFLO | RXR_CRC | RXR_STF | RXR_ENF | RXR_ERRS));
         rxhdr[3] &= static_cast<uint16_t>(~(RXR_BUFL | RXR_UBTO | RXR_NCHN | RXR_OVRN | RXR_MLEN));
 
-        if (item->packet.used == 0)
+        if (current_item->packet.used == 0)
             rxhdr[2] |= RXR_STF;
 
-        size_t remaining = item->packet.crc_len - item->packet.used;
+        size_t remaining = current_item->packet.crc_len - current_item->packet.used;
         size_t wlen = std::min(static_cast<size_t>(slen), remaining);
 
         if (wlen > 0) {
-            if (!dma_write_bytes(segb, &item->packet.msg[item->packet.used], wlen)) {
+            if (!dma_write_bytes(segb, &current_item->packet.msg[current_item->packet.used], wlen)) {
                 stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_RRNG;
                 pcsr0 |= PCSR0_SERI;
                 break;
             }
         }
 
-        item->packet.used += wlen;
-        rxhdr[3] |= static_cast<uint16_t>(item->packet.crc_len & RXR_MLEN);
+        current_item->packet.used += wlen;
+        rxhdr[3] |= static_cast<uint16_t>(current_item->packet.crc_len & RXR_MLEN);
 
-        bool end_of_frame = (item->packet.used >= item->packet.crc_len) || (mode & MODE_DRDC);
+        bool end_of_frame = (current_item->packet.used >= current_item->packet.crc_len) || (mode & MODE_DRDC);
         if (end_of_frame) {
             rxhdr[2] |= RXR_ENF;
-            if ((mode & MODE_DRDC) && item->packet.used < item->packet.crc_len) {
+            if ((mode & MODE_DRDC) && current_item->packet.used < current_item->packet.crc_len) {
                 rxhdr[3] |= RXR_NCHN;
                 rxhdr[2] |= RXR_ERRS;
                 stats.frecve++;
             }
 
             stats.frecv++;
-            stats.rbytes += static_cast<uint32_t>(item->packet.len > 14 ? item->packet.len - 14 : 0);
-            if (mac_is_multicast(item->packet.msg.data())) {
+            stats.rbytes += static_cast<uint32_t>(current_item->packet.len > 14 ? current_item->packet.len - 14 : 0);
+            if (mac_is_multicast(current_item->packet.msg.data())) {
                 stats.mfrecv++;
-                stats.mrbytes += static_cast<uint32_t>(item->packet.len > 14 ? item->packet.len - 14 : 0);
+                stats.mrbytes += static_cast<uint32_t>(current_item->packet.len > 14 ? current_item->packet.len - 14 : 0);
             }
 
             pcsr0 |= PCSR0_RXI;
             stat_rx_frames.value = stats.frecv;
             stat_rx_errors.value = stats.frecve + stats.rlossl;
 
-            read_queue.pop_front();
-            item = nullptr;
+            current_item.reset();
         }
 
         rxhdr[2] &= ~RXR_OWN;
@@ -1835,6 +1890,12 @@ bool deuna_c::process_receive(void)
             rxnext = 0;
 
         processed++;
+    }
+
+    // If we were in the middle of a multi-segment frame, push remaining back
+    if (current_item) {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
+        read_queue.push_front(std::move(*current_item));
     }
 
     update_intr();
@@ -2123,6 +2184,10 @@ void deuna_c::worker_rx(void)
 
     uint8_t pkt_buf[2048];
     while (!workers_terminate) {
+        if (reset_in_progress.load(std::memory_order_acquire)) {  // Fix: Abort if resetting
+            timeout_c::wait_ms(1);
+            continue;
+        }
         service_timers();
 
         if (init_asserted) {
@@ -2138,8 +2203,12 @@ void deuna_c::worker_rx(void)
                 continue;
             }
             if (len > 0) {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                if (accept_packet(pkt_buf, len))
+                bool should_accept = false;
+                {
+                    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                    should_accept = accept_packet(pkt_buf, len);
+                }
+                if (should_accept)
                     enqueue_readq(pkt_buf, len, false);
             }
         }
@@ -2160,6 +2229,10 @@ void deuna_c::worker_tx(void)
     worker_init_realtime_priority(rt_device);
 
     while (!workers_terminate) {
+        if (reset_in_progress.load(std::memory_order_acquire)) {  // Fix: Abort if resetting
+            timeout_c::wait_ms(1);
+            continue;
+        }
         // Wait for work with a short timeout (for periodic TX polling)
         {
             std::unique_lock<std::mutex> lock(pending_cmd_mutex);

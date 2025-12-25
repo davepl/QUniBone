@@ -21,6 +21,7 @@
 #include <deque>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 
 #include "qunibusdevice.hpp"
 #include "priorityrequest.hpp"
@@ -59,9 +60,9 @@ public:
     parameter_bool_c promisc = parameter_bool_c(this, "promisc", "pr", false,
             "Enable libpcap promiscuous capture");
     parameter_unsigned_c rx_slots = parameter_unsigned_c(this, "rx_slots", "rx", false, "",
-            "%d", "RX ring scan limit (0 = no limit)", 16, 10);
+            "%d", "RX ring scan limit (0 = no limit)", 0, 10);
     parameter_unsigned_c tx_slots = parameter_unsigned_c(this, "tx_slots", "tx", false, "",
-            "%d", "TX ring scan limit (0 = no limit)", 16, 10);
+            "%d", "TX ring scan limit (0 = no limit)", 0, 10);
     parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
             "Trace CSR/ring events to log");
 
@@ -119,6 +120,8 @@ private:
      */
     std::recursive_mutex state_mutex;
     std::recursive_mutex dma_mutex;
+    std::mutex queue_mutex;  // New: Serialize queue access from PCAP callbacks
+    std::atomic<bool> reset_in_progress{false};  // New: Flag to abort worker operations during reset
 
     /*
      * Pending register writes from PDP-11 (preserve write order)

@@ -22,7 +22,7 @@ The runtime uses the device parameter interface (menu `p` command) to configure 
 - `ifname` (string): host interface name (e.g., `eth0`).
 - `mac` (string): MAC override (`aa:bb:cc:dd:ee:ff`), empty = device default.
 - `promisc` (bool): enable promiscuous capture (default true).
-- `rx_slots` / `tx_slots` (unsigned): ring scan limit per poll (0 = default 32).
+- `rx_slots` / `tx_slots` (unsigned): ring scan limit per poll (0 = unlimited).
 - `base_addr`, `intr_vector`, `intr_level`, `priority_slot`: normal qunibus device params.
 
 ## Quickstart (QBUS / 2.11BSD)
