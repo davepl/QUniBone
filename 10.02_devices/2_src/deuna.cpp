@@ -6,7 +6,6 @@
  * This is a clean-room implementation based on:
  *   - DEC DEUNA User's Guide (EK-DEUNA-UG)
  *   - UNIBUS specification
- *   - OpenSIMH pdp11_xu.c behavioral reference (no code copied)
  *
  * Theory of Operation
  * -------------------
@@ -65,12 +64,12 @@
 static const size_t ETH_MIN_PACKET = 60;    // Minimum Ethernet frame (no CRC)
 static const size_t ETH_MAX_PACKET = 1514;  // Maximum Ethernet frame (no CRC)
 static const size_t ETH_FRAME_SIZE = 1518;  // Frame + CRC space
-static const size_t XU_MAX_RCV_PACKET = 1600;
+static const size_t UNA_MAX_RCV_PACKET = 1600;
 
 /*
  * Queue and timer constants
  */
-static const unsigned XU_QUE_MAX = 500;
+static const unsigned UNA_QUE_MAX = 500;
 
 /*
  * Internal memory sizes (word counts)
@@ -229,7 +228,7 @@ static const uint16_t RXR_MLEN = 0007777;
 /*
  * Version string
  */
-static const char *DEUNA_VERSION = "v001";
+static const char *DEUNA_VERSION = "v002";  // Only poll pcap when STATE_RUNNING
 
 /*
  * mac_is_zero
@@ -348,8 +347,8 @@ deuna_c::deuna_c() : qunibusdevice_c()
     /* Default MAC in DEC range */
     memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
 
-    read_buffer.msg.reserve(XU_MAX_RCV_PACKET);
-    write_buffer.msg.reserve(XU_MAX_RCV_PACKET);
+    read_buffer.msg.reserve(UNA_MAX_RCV_PACKET);
+    write_buffer.msg.reserve(UNA_MAX_RCV_PACKET);
 
     wcs_mem.assign(DEUNA_WCS_WORDS, 0);
     link_mem.assign(DEUNA_LINK_WORDS, 0);
@@ -1822,7 +1821,7 @@ void deuna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
             item.packet.msg.resize(item.packet.crc_len, 0);
         read_queue.push_back(item);
 
-        if (read_queue.size() > XU_QUE_MAX) {
+        if (read_queue.size() > UNA_QUE_MAX) {
             read_queue.pop_front();
             read_queue_loss++;
             dropped = true;
@@ -2381,8 +2380,15 @@ void deuna_c::worker_rx(void)
             continue;
         }
 
+        // Only poll pcap when state is RUNNING (driver has initialized the controller)
+        bool is_running = false;
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            is_running = ((pcsr1 & PCSR1_STATE) == STATE_RUNNING);
+        }
+
         size_t len = 0;
-        if (pcap.is_open()) {
+        if (pcap.is_open() && is_running) {
             if (!pcap.poll(pkt_buf, sizeof(pkt_buf), &len)) {
                 WARNING("DEUNA: pcap poll error: %s", pcap.last_error().c_str());
                 timeout_c::wait_ms(10);

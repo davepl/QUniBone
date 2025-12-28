@@ -37,8 +37,8 @@
 #define DEUNA_DEFAULT_VECTOR 0120
 #define DEUNA_DEFAULT_LEVEL 5
 
-#define DEUNA_FILTER_MAX 12
-#define DEUNA_UDB_WORDS 200
+#define DEUNA_FILTER_MAX 12 
+#define DEUNA_UDB_WORDS 200 
 
 #define DEUNA_REG_PCSR0 0
 #define DEUNA_REG_PCSR1 1
@@ -282,15 +282,15 @@ private:
     /*
      * Port command processing
      */
-    void port_command(uint16_t cmd);
-    bool execute_command(void);
+    void port_command(uint16_t cmd); 
+    bool execute_command(void); 
 
     /*
      * Receive/transmit ring processing
      */
     void enqueue_readq(const uint8_t *data, size_t len, bool loopback);
-    bool process_receive(void);
-    bool process_transmit(unsigned max_descriptors = 0);
+    bool process_receive(void); 
+    bool process_transmit(unsigned max_descriptors = 0); 
     void dump_tx_ring(unsigned max_entries);
 
     /*

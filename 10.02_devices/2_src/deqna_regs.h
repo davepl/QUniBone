@@ -3,22 +3,22 @@
  * (c) 2026 Plummer's Software LLC
  * Contributed under the GPL2 License
  */
-#ifndef _DELQA_REGS_H_
-#define _DELQA_REGS_H_
+#ifndef _DEQNA_REGS_H_
+#define _DEQNA_REGS_H_
 
 #include <stdint.h>
 
 // Register indices (word offsets from CSR base)
-#define DELQA_REG_STA0        0
-#define DELQA_REG_STA1        1
-#define DELQA_REG_RCVLIST_LO  2
-#define DELQA_REG_RCVLIST_HI  3
-#define DELQA_REG_XMTLIST_LO  4
-#define DELQA_REG_XMTLIST_HI  5
-#define DELQA_REG_VECTOR      6
-#define DELQA_REG_CSR         7
+#define DEQNA_REG_STA0        0
+#define DEQNA_REG_STA1        1
+#define DEQNA_REG_RCVLIST_LO  2
+#define DEQNA_REG_RCVLIST_HI  3
+#define DEQNA_REG_XMTLIST_LO  4
+#define DEQNA_REG_XMTLIST_HI  5
+#define DEQNA_REG_VECTOR      6
+#define DEQNA_REG_CSR         7
 
-// CSR bits (DEQNA/DELQA)
+// CSR bits (DEQNA)
 #define QE_RCV_ENABLE   0x0001
 #define QE_RESET        0x0002
 #define QE_NEX_MEM_INT  0x0004
@@ -66,7 +66,7 @@
 #define QE_RING_CHAIN        0x4000
 #define QE_RING_VALID        0x8000
 
-// Receive status word 1 values (DEQNA/DELQA)
+// Receive status word 1 values (DEQNA)
 #define QE_RST_UNUSED    0x8000  // Unused buffer
 #define QE_RST_LASTNOT   0xC000  // Used, not last segment
 #define QE_RST_LASTERR   0x4000  // Used, last segment with errors
@@ -99,6 +99,6 @@
 #define QE_NOTYET     0x8000
 #define QE_INUSE      0x4000
 // Maximum number of MAC address filters
-#define XQ_FILTER_MAX 14
+#define QNA_FILTER_MAX 14
 
-#endif // _DELQA_REGS_H_
+#endif // _DEQNA_REGS_H_

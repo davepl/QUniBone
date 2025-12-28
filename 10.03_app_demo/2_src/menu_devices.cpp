@@ -66,7 +66,6 @@
 #include "m9312.hpp"
 #elif defined(QBUS)
 #include "deqna.hpp"
-#include "delqa.hpp"
 #endif
 #include "cpu.hpp"
 
@@ -228,9 +227,6 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
     // Create DEQNA (QBUS Ethernet)
     deqna_c *DEQNA = new deqna_c();
     (void)DEQNA;  // Suppress unused variable warning - device self-registers
-    // Create DELQA (QBUS Ethernet)
-    delqa_c *DELQA = new delqa_c();
-    (void)DELQA;  // Suppress unused variable warning - device self-registers
 #endif
 
     // to inject characters into DL11 receiver
