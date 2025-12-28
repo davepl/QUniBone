@@ -1427,21 +1427,28 @@ bool deqna_c::dispatch_rbdl(void)
  */
 bool deqna_c::process_rbdl(void)
 {
+    // UNCONDITIONAL log to verify entry
+    WARNING("DEQNA: process_rbdl() entered");
+    
     // Serialize concurrent calls from TX and RX threads
     std::lock_guard<std::mutex> process_lock(rx_process_mutex);
 
     // Check if RX list is valid (like DEUNA checks STATE_RUNNING)
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        if (csr & QNA_CSR_RL)
+        if (csr & QNA_CSR_RL) {
+            WARNING("DEQNA: process_rbdl() RX list invalid (RL set)");
             return false;  // RX list invalid
+        }
     }
 
     // Check if queue has packets to deliver
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
-        if (read_queue.empty())
+        if (read_queue.empty()) {
+            WARNING("DEQNA: process_rbdl() queue empty");
             return false;
+        }
     }
 
     bool ri_pending = false;
@@ -1581,10 +1588,9 @@ bool deqna_c::process_rbdl(void)
         if (overflow)
             item.packet.used = item.packet.len;
 
-        if (trace.value) {
-            DEBUG("DEQNA: RX deliver type=%d len=%zu to addr=%08o desc_ba=%06o",
-                    item.type, rbl, address, cur_ba);
-        }
+        // UNCONDITIONAL log to verify code path
+        WARNING("DEQNA: RX deliver type=%d len=%zu to addr=%08o desc_ba=%06o",
+                item.type, rbl, address, cur_ba);
 
         bool dma_failed = false;
         if (!dma_write_bytes(address, rbuf, rbl)) {
@@ -1593,9 +1599,7 @@ bool deqna_c::process_rbdl(void)
             dma_failed = true;
             rbl = 0;
             item.packet.used = item.packet.len;
-            if (trace.value) {
-                DEBUG("DEQNA: RX DMA write failed at addr=%08o", address);
-            }
+            WARNING("DEQNA: RX DMA write failed at addr=%08o", address);
         }
 
         uint16_t status1 = 0;
@@ -1605,6 +1609,14 @@ bool deqna_c::process_rbdl(void)
             stats.setup++;
             // Use a constant 0x2700 for setup status1 (ESETUP + RBL 10:8 = 7).
             status1 = static_cast<uint16_t>(QE_ESETUP | 0x0700);
+            // DEQNA hardware quirk: write 0xC000 word after setup packet data.
+            // This is documented as "Strange DEQNA behavior" in SIMH.
+            // RSX DECnet driver may depend on this behavior.   Kudos to whomever
+            // figured this out the first time, it burned me for days.
+            if (b_length >= rbl + 2) {
+                uint16_t qdtc_chip_extra = 0xC000;
+                dma_write_bytes(address + rbl, reinterpret_cast<uint8_t*>(&qdtc_chip_extra), 2);
+            }
             break;
         case 1:
             stats.loop++;
