@@ -1427,28 +1427,21 @@ bool deqna_c::dispatch_rbdl(void)
  */
 bool deqna_c::process_rbdl(void)
 {
-    // UNCONDITIONAL log to verify entry
-    WARNING("DEQNA: process_rbdl() entered");
-    
     // Serialize concurrent calls from TX and RX threads
     std::lock_guard<std::mutex> process_lock(rx_process_mutex);
 
     // Check if RX list is valid (like DEUNA checks STATE_RUNNING)
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        if (csr & QNA_CSR_RL) {
-            WARNING("DEQNA: process_rbdl() RX list invalid (RL set)");
+        if (csr & QNA_CSR_RL)
             return false;  // RX list invalid
-        }
     }
 
     // Check if queue has packets to deliver
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
-        if (read_queue.empty()) {
-            WARNING("DEQNA: process_rbdl() queue empty");
+        if (read_queue.empty())
             return false;
-        }
     }
 
     bool ri_pending = false;
