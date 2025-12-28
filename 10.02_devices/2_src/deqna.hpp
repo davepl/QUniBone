@@ -3,16 +3,16 @@
  * (c) 2026 Plummer's Software LLC
  * Contributed under the GPL2 License
  *
- * DEUNA Ethernet Controller Emulation for QUniBone
+ * DEQNA Ethernet Controller Emulation for QUniBone
  * ================================================
  *
- * This module emulates the DEC DEUNA (UNIBUS Ethernet controller).
+ * This module emulates the DEC DEQNA (QBUS Ethernet controller).
  * It provides a port-command interface (PCSR0-3) with descriptor
  * rings in host memory, and bridges Ethernet frames to a host
  * interface using libpcap.
  */
-#ifndef _DEUNA_HPP_
-#define _DEUNA_HPP_
+#ifndef _DEQNA_HPP_
+#define _DEQNA_HPP_
 
 #include <stdint.h>
 #include <stddef.h>
@@ -29,26 +29,27 @@
 #include "pcap_bridge.hpp"
 
 /*
- * Default DEUNA I/O page parameters
- * Base address is a typical DEUNA CSR location (octal)
+ * Default DEQNA I/O page parameters
+ * Base address is a typical DEQNA CSR location (octal)
  */
-#define DEUNA_DEFAULT_ADDR 0174510
-#define DEUNA_DEFAULT_SLOT 18
-#define DEUNA_DEFAULT_VECTOR 0120
-#define DEUNA_DEFAULT_LEVEL 5
+#define DEQNA_DEFAULT_ADDR 014440
+#define DEQNA_DEFAULT_SLOT 18
+#define DEQNA_DEFAULT_VECTOR 0120
+#define DEQNA_DEFAULT_LEVEL 5
 
-#define DEUNA_FILTER_MAX 12
-#define DEUNA_UDB_WORDS 200
+#define DEQNA_FILTER_MAX 12
+#define DEQNA_UDB_WORDS 200
+#define DEQNA_SANITY_DEFAULT_MS 3000
 
-#define DEUNA_REG_PCSR0 0
-#define DEUNA_REG_PCSR1 1
-#define DEUNA_REG_PCSR2 2
-#define DEUNA_REG_PCSR3 3
+#define DEQNA_REG_PCSR0 0
+#define DEQNA_REG_PCSR1 1
+#define DEQNA_REG_PCSR2 2
+#define DEQNA_REG_PCSR3 3
 
-class deuna_c : public qunibusdevice_c {
+class deqna_c : public qunibusdevice_c {
 public:
-    deuna_c();
-    ~deuna_c() override;
+    deqna_c();
+    ~deqna_c() override;
 
     /*
      * User-configurable parameters (set via menu system before install)
@@ -65,6 +66,10 @@ public:
             "%d", "TX ring scan limit (0 = no limit)", 0, 10);
     parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
             "Trace CSR/ring events to log");
+    parameter_bool_c sanity_enable = parameter_bool_c(this, "sanity_enable", "san", false,
+            "Enable DEQNA sanity timer (host inactivity watchdog)");
+    parameter_unsigned_c sanity_timeout_ms = parameter_unsigned_c(this, "sanity_timeout_ms", "stm", false, "",
+            "%d", "Sanity timeout in ms", 16, 10);
 
     /*
      * Read-only statistics (updated during operation, visible in menu)
@@ -150,7 +155,7 @@ private:
         bool promiscuous = false;
         bool multicast = false;
         int mac_count = 0;
-        uint8_t macs[DEUNA_FILTER_MAX][6] = {{0}};
+        uint8_t macs[DEQNA_FILTER_MAX][6] = {{0}};
     } setup;
 
     /*
@@ -180,6 +185,16 @@ private:
         uint16_t bablcnt = 0;
         uint64_t last_update_ns = 0;
     } stats;
+
+    /*
+     * Sanity timer state (host inactivity watchdog)
+     */
+    struct sanity_state {
+        bool enabled = false;
+        uint64_t timeout_ns = 0;
+        uint64_t last_kick_ns = 0;
+        bool tripped = false;
+    } sanity;
 
     /*
      * Packet buffer for RX/TX operations
@@ -228,7 +243,7 @@ private:
     std::vector<uint16_t> link_mem;
 
     uint16_t pcb[4] = {0};
-    uint16_t udb[DEUNA_UDB_WORDS] = {0};
+    uint16_t udb[DEQNA_UDB_WORDS] = {0};
     uint16_t rxhdr[4] = {0};
     uint16_t txhdr[4] = {0};
 
@@ -303,6 +318,7 @@ private:
      * Timer services
      */
     void service_timers(void);
+    void kick_sanity_timer(void);
 
     /*
      * Worker thread entry points

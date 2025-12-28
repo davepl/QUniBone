@@ -58,7 +58,7 @@
  * hardware documentation is ambiguous. Key SimH-compatible behaviors:
  *   - Descriptor base address is recalculated from registers on each dispatch
  *   - Loopback is IL=0 OR EL=1 (not AND, not dependent on RE)
- *   - Boot ROM returns status 0xC000 (first segment) then 0x8000 (last)
+ *   - Boot ROM handling is disabled until a clean ROM source is available
  */
 #ifndef _DELQA_HPP_
 #define _DELQA_HPP_
@@ -202,10 +202,12 @@ private:
      * state_mutex: Protects device state (csr, rbdl_ba, ring state, setup, etc.)
      * dma_mutex: Serializes DMA operations (only one DMA at a time)
      * queue_mutex: Serializes queue access from PCAP callbacks
+     * rx_process_mutex: Serializes process_rbdl() calls between TX and RX threads
      */
     std::recursive_mutex state_mutex;
     std::recursive_mutex dma_mutex;
     std::mutex queue_mutex;  // New: Serialize queue access from PCAP callbacks
+    std::mutex rx_process_mutex;  // New: Serialize process_rbdl() calls
     std::atomic<bool> reset_in_progress{false};  // New: Flag to abort worker operations during reset
 
     /*
@@ -295,7 +297,7 @@ private:
      * Queue item for received packets waiting to be delivered
      * --------------------------------------------------------
      * type: Packet type for status word generation
-     *       0 = setup echo (special status 0x2700)
+     *       0 = setup (ESETUP + length)
      *       1 = loopback (status 0x2000 + length)
      *       2 = normal receive (length only in status)
      */
@@ -353,7 +355,6 @@ private:
      * deqna_lock: DEQNA compatibility mode locked (MS bit cleared)
      * rx_delay_active: Artificial RX delay in effect (for timing compat)
      * rx_enable_deadline_ns: Absolute time when RX delay expires
-     * bootrom_pending: Boot ROM request pending (BP bits set in CSR)
      * rbdl_pending: RX list needs dispatching (RCLH written)
      * xbdl_pending: TX list needs dispatching (XMTH written)
      * idtmr: System ID timer countdown (sends MOP system ID periodically)
@@ -361,21 +362,10 @@ private:
     bool deqna_lock = false;
     bool rx_delay_active = false;
     uint64_t rx_enable_deadline_ns = 0;
-    bool bootrom_pending = false;
     bool rbdl_pending = false;
     bool xbdl_pending = false;
 
     int idtmr = 0;
-
-    /*
-     * Boot ROM image (loaded on demand)
-     * ----------------------------------
-     * The DELQA contains a diagnostic/boot ROM that can be requested by
-     * setting the BP bits in CSR. The ROM image is copied from the static
-     * delqa_bootrom[] array and patched for compatibility.
-     */
-    std::vector<uint8_t> bootrom_image;
-    bool bootrom_ready = false;
 
     /*
      * Controller reset/initialization
@@ -504,16 +494,7 @@ private:
      * Parses the 128-byte setup frame to configure receive filters,
      * promiscuous mode, sanity timer, etc.
      */
-    void process_setup(void);
-
-    /*
-     * Boot ROM handling
-     * ------------------
-     * process_bootrom: DMA the diagnostic boot ROM to host memory
-     * ensure_bootrom_image: Load/patch the ROM image on first use
-     */
-    bool process_bootrom(void);
-    bool ensure_bootrom_image(void);
+    void process_setup(uint16_t raw_len_word);
 
     /*
      * Idle RX ring touch (debugging only, no DMA)

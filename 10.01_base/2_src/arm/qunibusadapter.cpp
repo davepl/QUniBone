@@ -1046,8 +1046,15 @@ void qunibusadapter_c::worker_device_dma_chunk_complete_event()
 
     dma_request_c *dmareq = dynamic_cast<dma_request_c *>(prl->active);
     if (!dmareq) {
-        WARNING("DMA complete event with no active DMA request (cur_status=%u buscycle=%u)",
+        bool ignore = line_INIT || line_DCLO || (prl->slot_request_mask == 0);
+        if (ignore) {
+            DEBUG_FAST(
+                "DMA complete event with no active DMA request (ignored, cur_status=%u buscycle=%u)",
                 mailbox->dma.cur_status, mailbox->dma.buscycle);
+        } else {
+            WARNING("DMA complete event with no active DMA request (cur_status=%u buscycle=%u)",
+                    mailbox->dma.cur_status, mailbox->dma.buscycle);
+        }
         return;
     }
     // fix PRU data struct: remove IOPAGE bit from mailbox struct, was set im mailbox_execute()

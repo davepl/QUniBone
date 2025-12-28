@@ -62,7 +62,6 @@
 #include "qunibusadapter.hpp"
 #include "ddrmem.h"
 #include "delqa.hpp"
-#include "delqa_bootrom.h"
 
 #if !defined(QBUS)
 #error "DELQA is a QBUS-only device"
@@ -115,7 +114,6 @@ static const uint16_t XQ_CSR_XI = QE_XMIT_INT;      // Transmit interrupt pendin
 static const uint16_t XQ_CSR_IE = QE_INT_ENABLE;    // Interrupt enable
 static const uint16_t XQ_CSR_RL = QE_RL_INVALID;    // Receive list invalid
 static const uint16_t XQ_CSR_XL = QE_XL_INVALID;    // Transmit list invalid
-static const uint16_t XQ_CSR_BD = QE_LOAD_ROM;      // Boot/diagnostic ROM bit
 static const uint16_t XQ_CSR_NI = QE_NEX_MEM_INT;   // Non-existent memory interrupt
 static const uint16_t XQ_CSR_SR = QE_RESET;         // Software reset
 static const uint16_t XQ_CSR_RE = QE_RCV_ENABLE;    // Receive enable
@@ -134,13 +132,14 @@ static const uint16_t XQ_VEC_OS = QE_VEC_OS;  // Option switch
 static const uint16_t XQ_VEC_RS = QE_VEC_RS;  // Request self-test
 static const uint16_t XQ_VEC_ST = QE_VEC_ST;  // Self-test status
 static const uint16_t XQ_VEC_IV = QE_VEC_IV;  // Interrupt vector mask
+static const uint16_t XQ_VEC_ID = QE_VEC_ID;  // Identity test bit
 static const uint16_t XQ_VEC_RO = QE_VEC_RO;  // Read-only bits mask
 static const uint16_t XQ_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DELQA_VERSION = "v012";  // Added comprehensive documentation
+static const char *DELQA_VERSION = "v019";  // Align setup/TX status semantics with OpenSIMH
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -544,7 +543,7 @@ void delqa_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
 
 void delqa_c::nxm_error(void)
 {
-    const uint16_t set_bits = XQ_CSR_XI | XQ_CSR_XL | XQ_CSR_RL;
+    const uint16_t set_bits = XQ_CSR_XI | XQ_CSR_XL | XQ_CSR_RL | XQ_CSR_NI;
     csr_set_clr(set_bits, 0);
     stats.fail++;
     stat_tx_errors.value = stats.fail;
@@ -698,7 +697,6 @@ void delqa_c::reset_controller(void)
 
     rbdl_pending = false;
     xbdl_pending = false;
-    bootrom_pending = false;
 
     sanity.enabled = 0;
     sanity.quarter_secs = XQ_HW_SANITY_SECS * 4;
@@ -840,6 +838,14 @@ void delqa_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         handle_register_write(static_cast<uint8_t>(device_reg->index), val);
         return;
     }
+    if (device_reg->index == DELQA_REG_RCVLIST_LO ||
+        device_reg->index == DELQA_REG_RCVLIST_HI ||
+        device_reg->index == DELQA_REG_XMTLIST_LO ||
+        device_reg->index == DELQA_REG_XMTLIST_HI) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        handle_register_write(static_cast<uint8_t>(device_reg->index), val);
+        return;
+    }
     if (device_reg->index < 8) {
         pending_reg_value[device_reg->index].store(val, std::memory_order_relaxed);
         pending_reg_mask.fetch_or(static_cast<uint16_t>(1u << device_reg->index),
@@ -891,8 +897,10 @@ void delqa_c::handle_register_write(uint8_t reg_index, uint16_t val)
         uint16_t new_var;
 
         new_var = static_cast<uint16_t>((var & XQ_VEC_RO) | (val & XQ_VEC_RW));
-        if (!(new_var & XQ_VEC_MS))
+        if (!(new_var & XQ_VEC_MS)) {
             new_var &= ~(XQ_VEC_OS | XQ_VEC_RS | XQ_VEC_ST);
+            new_var &= ~XQ_VEC_ID;  // DEQNA-lock: ID bit always reads as 0.
+        }
 
         if ((old_var ^ new_var) & XQ_VEC_MS) {
             if (!(new_var & XQ_VEC_MS))
@@ -916,7 +924,7 @@ void delqa_c::handle_register_write(uint8_t reg_index, uint16_t val)
                                                   (val & XQ_CSR_W1) |
                                                   ((val & XQ_CSR_XI) ? XQ_CSR_NI : 0));
 
-        if ((prev & XQ_CSR_SR) && !(val & XQ_CSR_SR)) {
+        if (val & XQ_CSR_SR) {
             sw_reset();
             return;
         }
@@ -935,8 +943,8 @@ void delqa_c::handle_register_write(uint8_t reg_index, uint16_t val)
 
         if ((csr & XQ_CSR_BP) == XQ_CSR_BP) {
             if (trace.value)
-                WARNING("DELQA: Boot/diagnostic ROM request (BP bits set)");
-            bootrom_pending = true;
+                WARNING("DELQA: Boot/diagnostic ROM request ignored (ROM disabled)");
+            csr_set_clr(0, XQ_CSR_BP);
         }
         break;
     }
@@ -1047,6 +1055,13 @@ bool delqa_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
         return true;
+    if (addr & 1) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            WARNING("DELQA: odd descriptor address %06o, forcing alignment", addr);
+        }
+        addr &= ~1u;
+    }
     uint64_t addr64 = addr;
     uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
     uint64_t max = qunibus->addr_space_byte_count;
@@ -1079,6 +1094,13 @@ bool delqa_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
 {
     if (wordcount == 0)
         return true;
+    if (addr & 1) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            WARNING("DELQA: odd descriptor address %06o, forcing alignment", addr);
+        }
+        addr &= ~1u;
+    }
     uint64_t addr64 = addr;
     uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
     uint64_t max = qunibus->addr_space_byte_count;
@@ -1118,6 +1140,16 @@ bool delqa_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
     if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
+    if (addr & 1) {
+        uint16_t word = 0;
+        if (addr == 0 || !dma_read_words(addr - 1, &word, 1))
+            return false;
+        buffer[0] = word_high(word);
+        addr += 1;
+        buffer += 1;
+        len -= 1;
+    }
+
     size_t full_words = len / 2;
     if (full_words) {
         std::vector<uint16_t> words(full_words);
@@ -1154,6 +1186,18 @@ bool delqa_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     uint64_t max = qunibus->addr_space_byte_count;
     if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
+
+    if (addr & 1) {
+        uint16_t word = 0;
+        if (addr == 0 || !dma_read_words(addr - 1, &word, 1))
+            return false;
+        word = static_cast<uint16_t>((word & 0x00ff) | (buffer[0] << 8));
+        if (!dma_write_words(addr - 1, &word, 1))
+            return false;
+        addr += 1;
+        buffer += 1;
+        len -= 1;
+    }
 
     const size_t max_words_per_dma = 64;
     size_t full_words = len / 2;
@@ -1284,13 +1328,18 @@ bool delqa_c::dispatch_rbdl(void)
                 words[0], words[1], words[2], words[3]);
     }
 
-    // Process any waiting packets in receive queue
+    // Process any waiting packets in receive queue.
+    // Setup/loopback packets (types 0,1) can be processed without RE.
+    // Normal packets (type 2) require RE=1.
     bool do_process = false;
+    bool has_loopback = false;
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
         do_process = !read_queue.empty();
+        if (do_process && read_queue.front().type < 2)
+            has_loopback = true;
     }
-    if (do_process)
+    if (do_process && (has_loopback || rx_ready()))
         return process_rbdl();
 
     return true;
@@ -1322,26 +1371,52 @@ bool delqa_c::dispatch_rbdl(void)
  *   0xC000 = not last segment (QE_RST_LASTNOT)
  *   0x8000 = unused/bootrom special (QE_RST_UNUSED)
  *   + error bits if applicable
+ *
+ * RE (Receive Enable) handling:
+ *   Setup (type 0) and loopback (type 1) packets are delivered regardless
+ *   of RE state - they are internal to the controller. Normal network
+ *   packets (type 2) require RE=1 to be delivered.
+ *
+ * Thread safety:
+ *   This function is protected by rx_process_mutex to prevent concurrent
+ *   calls from the TX thread (after loopback) and RX worker thread.
  */
 bool delqa_c::process_rbdl(void)
 {
+    // Serialize concurrent calls from TX and RX threads
+    std::lock_guard<std::mutex> process_lock(rx_process_mutex);
+
     bool ri_pending = false;
     while (true) {
         uint32_t cur_ba = 0;
         size_t queue_size = 0;
         uint16_t csr_snapshot = 0;
+        int front_type = 2;  // Default to normal packet type
         {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
             queue_size = read_queue.size();
+            if (!read_queue.empty())
+                front_type = read_queue.front().type;
         }
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             cur_ba = rbdl_ba;
             csr_snapshot = csr;
         }
+
+        // Check if we can process the next packet
+        // Setup (type 0) and loopback (type 1) bypass RE check - they're internal
+        // Normal packets (type 2) require RE=1
+        if (queue_size > 0 && front_type == 2 && !rx_ready()) {
+            if (trace.value) {
+                WARNING("DELQA: RX process blocked (RE=0, normal packet) csr=%06o", csr_snapshot);
+            }
+            return true;
+        }
+
         if (trace.value) {
-            WARNING("DELQA: RX process start at %06o (queue=%zu csr=%06o)",
-                    cur_ba, queue_size, csr_snapshot);
+            WARNING("DELQA: RX process start at %06o (queue=%zu type=%d csr=%06o)",
+                    cur_ba, queue_size, front_type, csr_snapshot);
         }
         if (queue_size == 0) {
             if (trace.value) {
@@ -1388,7 +1463,7 @@ bool delqa_c::process_rbdl(void)
         }
 
         if (words[1] & XQ_DSC_C) {
-            uint32_t next_ba = make_addr(words[1], words[2]);
+            uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 rbdl_ba = next_ba;
@@ -1416,8 +1491,11 @@ bool delqa_c::process_rbdl(void)
         uint32_t address = make_addr(words[1], words[2]);
         uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
         uint16_t b_length = static_cast<uint16_t>(w_length * 2);
-        if (words[1] & XQ_DSC_H)
+        if (words[1] & XQ_DSC_H) {
+            if ((address & 1) == 0)
+                address += 1;
             b_length -= 1;
+        }
         if (words[1] & XQ_DSC_L)
             b_length -= 1;
 
@@ -1462,7 +1540,6 @@ bool delqa_c::process_rbdl(void)
         }
 
         size_t used_before = item.packet.used;
-        size_t remaining = item.packet.len - used_before;
         bool overflow = false;
         if (rbl > b_length) {
             rbl = b_length;
@@ -1481,35 +1558,45 @@ bool delqa_c::process_rbdl(void)
             item.packet.used = item.packet.len;
         }
 
-        // Status word 1: start with 0 (last segment, no errors), add type-specific bits
-        words[4] = 0;
+        uint16_t status1 = 0;
+        uint16_t rbl_status = static_cast<uint16_t>(rbl & 0xFFFF);
         switch (item.type) {
         case 0:
             stats.setup++;
-            words[4] |= 0x2700;
+            // OpenSIMH uses a constant 0x2700 for setup status1 (ESETUP + RBL 10:8 = 7).
+            status1 = static_cast<uint16_t>(QE_ESETUP | 0x0700);
             break;
         case 1:
             stats.loop++;
-            words[4] |= 0x2000;
-            words[4] |= static_cast<uint16_t>(rbl & 0x0700);
+            status1 = QE_RST_LASTNOERR;
+            status1 |= static_cast<uint16_t>(rbl_status & 0x0700);
+            if (csr_snapshot & XQ_CSR_EL)
+                status1 |= QE_ESETUP;
             break;
         case 2:
         default:
-            rbl -= 60;
-            words[4] |= static_cast<uint16_t>(rbl & 0x0700);
+            if (rbl_status >= 60)
+                rbl_status = static_cast<uint16_t>(rbl_status - 60);
+            else
+                rbl_status = 0;
+            status1 = static_cast<uint16_t>((rbl_status & 0x0700) | QE_RST_RSVD);
             break;
         }
 
         if (dma_failed) {
-            words[4] |= QE_RST_LASTERR;
-            words[4] |= QE_DISCARD;
+            status1 |= QE_RST_LASTERR;
+            status1 |= QE_DISCARD;
         } else if (overflow) {
-            words[4] |= QE_RST_LASTERR;
-            words[4] |= QE_OVF | QE_DISCARD;
+            status1 |= QE_RST_LASTERR;
+            status1 |= QE_OVF | QE_DISCARD;
         } else if (item.packet.used < item.packet.len) {
-            words[4] |= QE_RST_LASTNOT;  // 0xC000 = not last segment
+            status1 |= QE_RST_LASTNOT;  // 0xC000 = not last segment
         }
-        words[5] = static_cast<uint16_t>(((rbl & 0x00FF) << 8) | (rbl & 0x00FF));
+        words[4] = status1;
+        {
+            uint16_t rbl_low = static_cast<uint16_t>(rbl_status & 0x00FF);
+            words[5] = static_cast<uint16_t>((rbl_low << 8) | rbl_low);
+        }
 
         bool loss = false;
         {
@@ -1520,7 +1607,7 @@ bool delqa_c::process_rbdl(void)
             }
         }
         if (loss)
-            words[4] |= 0x0001;
+            words[4] |= QE_OVF;
 
         if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1548,6 +1635,18 @@ bool delqa_c::process_rbdl(void)
     if (ri_pending) {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         csr_set_clr(XQ_CSR_RI, 0);
+    }
+    {
+        uint16_t next_word1 = 0;
+        uint32_t next_ba = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            next_ba = rbdl_ba;
+        }
+        if (!desc_read_words(next_ba + 2, &next_word1, 1) || ((next_word1 & XQ_DSC_V) == 0)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(XQ_CSR_RL, 0);
+        }
     }
 
     return true;
@@ -1614,7 +1713,7 @@ bool delqa_c::dispatch_xbdl(void)
  * @param status  0 = success, non-zero = failure
  *
  * Called after pcap.send() completes. Updates descriptor status words,
- * clears V bit to return descriptor to driver, sets XI interrupt,
+ * sets XI interrupt,
  * and continues processing any remaining TX descriptors.
  *
  * TDR (Transmit Delay Report) is a rough estimate of transmission time
@@ -1630,7 +1729,7 @@ void delqa_c::write_callback(int status)
         len_snapshot = write_buffer.len;
     }
     const uint16_t TDR = static_cast<uint16_t>(100 + len_snapshot * 8);
-    uint16_t write_success[2] = {0, static_cast<uint16_t>(TDR & 0x03FF)};
+    uint16_t write_success[2] = {0x2000, static_cast<uint16_t>(TDR & 0x03FF)};
     uint16_t write_failure[2] = {XQ_DSC_C, static_cast<uint16_t>(TDR & 0x03FF)};
 
     stats.xmit++;
@@ -1641,15 +1740,6 @@ void delqa_c::write_callback(int status)
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         nxm_error();
         return;
-    }
-
-    // Clear V bit to return descriptor to driver
-    {
-        uint16_t word1 = 0;
-        if (desc_read_words(cur_ba + 2, &word1, 1)) {
-            word1 = static_cast<uint16_t>(word1 & ~XQ_DSC_V);
-            desc_write_words(cur_ba + 2, &word1, 1);
-        }
     }
 
     {
@@ -1663,6 +1753,19 @@ void delqa_c::write_callback(int status)
         write_buffer.len = 0;
         write_buffer.used = 0;
         xbdl_ba = cur_ba + QE_RING_BYTES;  // Advance to next descriptor
+    }
+
+    {
+        uint16_t next_word1 = 0;
+        uint32_t next_ba = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            next_ba = xbdl_ba;
+        }
+        if (!desc_read_words(next_ba + 2, &next_word1, 1) || ((next_word1 & XQ_DSC_V) == 0)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(XQ_CSR_XL, 0);
+        }
     }
 
     reset_sanity_timer();
@@ -1683,7 +1786,7 @@ void delqa_c::write_callback(int status)
  *    - Check for loopback mode (IL=0 OR EL=1)
  *    - Check for setup packet (S bit)
  *    - Either loopback/setup locally, or send via pcap
- * 7. Write status words and clear V bit
+ * 7. Write status words
  *
  * LOOPBACK LOGIC (SimH-compatible):
  * Loopback is enabled when IL=0 (internal loopback) OR EL=1 (external
@@ -1722,10 +1825,8 @@ bool delqa_c::process_xbdl(void)
                 WARNING("DELQA: TX descriptor at %06o not valid (addr_hi=%06o)",
                         cur_ba, words[1]);
             }
-            {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                csr_set_clr(XQ_CSR_XL, 0);  // Mark list invalid
-            }
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(XQ_CSR_XL, 0);
             return false;
         }
 
@@ -1733,8 +1834,11 @@ bool delqa_c::process_xbdl(void)
         uint32_t address = make_addr(words[1], words[2]);
         uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);  // One's complement
         uint16_t b_length = static_cast<uint16_t>(w_length * 2);
-        if (words[1] & XQ_DSC_H)  // Odd byte at start
+        if (words[1] & XQ_DSC_H) {  // Odd byte at start
+            if ((address & 1) == 0)
+                address += 1;
             b_length -= 1;
+        }
         if (words[1] & XQ_DSC_L)  // Odd byte at end
             b_length -= 1;
 
@@ -1742,7 +1846,7 @@ bool delqa_c::process_xbdl(void)
         if (words[1] & XQ_DSC_C) {
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                xbdl_ba = address;
+                xbdl_ba = address & ~1u;
             }
             continue;
         }
@@ -1775,6 +1879,11 @@ bool delqa_c::process_xbdl(void)
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 il_clear = !(csr & XQ_CSR_IL);
                 el_set = (csr & XQ_CSR_EL) != 0;
+                if (write_buffer.len < ETH_MIN_PACKET) {
+                    size_t pad = ETH_MIN_PACKET - write_buffer.len;
+                    memset(write_buffer.msg.data() + write_buffer.len, 0, pad);
+                    write_buffer.len = ETH_MIN_PACKET;
+                }
                 len_snapshot = write_buffer.len;
                 csr_snapshot = csr;
             }
@@ -1787,27 +1896,31 @@ bool delqa_c::process_xbdl(void)
                         il_clear ? 1 : 0, el_set ? 1 : 0, csr_snapshot);
             }
 
-        if (loopback || setup_packet) {
-            if (setup_packet) {
-                process_setup();
-                enqueue_readq(0, write_buffer.msg.data(), write_buffer.len, 0);
-            } else {
+            if (loopback || setup_packet) {
+                bool enqueued = false;
+                uint16_t write_success[2] = {0x2000, 1};
+                if (setup_packet) {
+                    process_setup(words[3]);
+                    // Setup packets force loopback regardless of CSR loopback state.
+                    // Modify the response to have all even bytes to work around driver bugs
+                    // that might use packet data as addresses.
+                    std::vector<uint8_t> modified_response = write_buffer.msg;
+                    for (size_t i = 0; i < modified_response.size(); ++i) {
+                        modified_response[i] &= ~1;  // Clear low bit to make even
+                    }
+                    enqueue_readq(0, modified_response.data(), write_buffer.len, 0);
+                    enqueued = true;
+                    write_success[0] = 0x200C;
+                    write_success[1] = 0x0860;
+                } else {
                     enqueue_readq(1, write_buffer.msg.data(), write_buffer.len, 0);
+                    enqueued = true;
+                    write_success[0] |= QE_FAIL;
                 }
-
-                uint16_t write_success[2] = {0, 1};
                 if (!desc_write_words(cur_ba + 8, write_success, 2)) {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
                     nxm_error();
                     return false;
-                }
-
-                {
-                    uint16_t word1 = 0;
-                    if (desc_read_words(cur_ba + 2, &word1, 1)) {
-                        word1 = static_cast<uint16_t>(word1 & ~XQ_DSC_V);
-                        desc_write_words(cur_ba + 2, &word1, 1);
-                    }
                 }
 
                 {
@@ -1823,7 +1936,7 @@ bool delqa_c::process_xbdl(void)
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
                     do_process = !(csr & XQ_CSR_RL);
                 }
-                if (do_process)
+                if (enqueued && do_process)
                     process_rbdl();
 
             } else {
@@ -1839,21 +1952,24 @@ bool delqa_c::process_xbdl(void)
                 nxm_error();
                 return false;
             }
-
-            // Clear V bit to return descriptor
-            {
-                uint16_t word1 = 0;
-                if (desc_read_words(cur_ba + 2, &word1, 1)) {
-                    word1 = static_cast<uint16_t>(word1 & ~XQ_DSC_V);
-                    desc_write_words(cur_ba + 2, &word1, 1);
-                }
-            }
         }
 
         // Advance to next descriptor
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             xbdl_ba = cur_ba + QE_RING_BYTES;
+        }
+        {
+            uint16_t next_word1 = 0;
+            uint32_t next_ba = 0;
+            {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                next_ba = xbdl_ba;
+            }
+            if (!desc_read_words(next_ba + 2, &next_word1, 1) || ((next_word1 & XQ_DSC_V) == 0)) {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                csr_set_clr(XQ_CSR_XL, 0);
+            }
         }
     }
 }
@@ -1871,12 +1987,17 @@ bool delqa_c::process_xbdl(void)
  *                  Bits 2-3: LED control
  *                  Bits 4-6: Sanity timer setting
  *
+ * The setup flags are encoded in the low bits of the descriptor length word,
+ * NOT in extra bytes. The raw_len_word is the one's complement length from
+ * the TX descriptor.
+ *
  * After processing, update_pcap_filter() is called to apply the new
  * receive filter to the host network interface.
  */
-void delqa_c::process_setup(void)
+void delqa_c::process_setup(uint16_t raw_len_word)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    (void)raw_len_word;
     const uint8_t *msg = write_buffer.msg.data();
     size_t len = write_buffer.len;
 
@@ -1889,27 +2010,31 @@ void delqa_c::process_setup(void)
                 setup.macs[i + 7][j] = msg[(i + 0x41) + (j * 8)];
         }
 
-    // Parse extended setup fields (if present)
+    // OpenSIMH behavior: extended setup fields are only parsed when length > 128.
     setup.promiscuous = false;
+    uint16_t setup_flags = 0;
+    uint16_t led = 0;
+    uint16_t san = 0;
+    float secs = 0.25f;
     if (len > 128) {
-        uint16_t l = static_cast<uint16_t>(len);
-        uint16_t led = static_cast<uint16_t>((l & XQ_SETUP_LD) >> 2);
-        uint16_t san = static_cast<uint16_t>((l & XQ_SETUP_ST) >> 4);
-        float secs = 0.25f;
+        setup_flags = static_cast<uint16_t>(static_cast<uint16_t>(len) & 0x007F);
+        setup.multicast = (0 != (setup_flags & XQ_SETUP_MC));
+        setup.promiscuous = (0 != (setup_flags & XQ_SETUP_PM));
+        led = static_cast<uint16_t>((setup_flags & XQ_SETUP_LD) >> 2);
+        san = static_cast<uint16_t>((setup_flags & XQ_SETUP_ST) >> 4);
+    }
 
-        setup.multicast = (0 != (l & XQ_SETUP_MC));
-        setup.promiscuous = (0 != (l & XQ_SETUP_PM));
-
-        // LED control (active low)
-        if (led) {
-            switch (led) {
-            case 1: setup.l1 = false; break;
-            case 2: setup.l2 = false; break;
-            case 3: setup.l3 = false; break;
-            }
+    // LED control (active low)
+    if (led) {
+        switch (led) {
+        case 1: setup.l1 = false; break;
+        case 2: setup.l2 = false; break;
+        case 3: setup.l3 = false; break;
         }
+    }
 
-        // Sanity timer setting (exponential scale)
+    // Sanity timer setting (exponential scale) for extended setup packets only.
+    if (len > 128) {
         switch (san) {
         case 0: secs = 0.25f; break;
         case 1: secs = 1.0f; break;
@@ -1938,168 +2063,9 @@ void delqa_c::process_setup(void)
     setup.valid = true;
 
     if (trace.value) {
-        WARNING("DELQA: Setup packet processed: len=%zu, promisc=%d multicast=%d",
-                len, setup.promiscuous ? 1 : 0, setup.multicast ? 1 : 0);
+        WARNING("DELQA: Setup packet processed: len=%zu, promisc=%d multicast=%d flags=%04o",
+                write_buffer.len, setup.promiscuous ? 1 : 0, setup.multicast ? 1 : 0, setup_flags);
     }
-}
-
-bool delqa_c::ensure_bootrom_image(void)
-{
-    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-    if (bootrom_ready)
-        return true;
-
-    bootrom_image.resize(sizeof(delqa_bootrom));
-    memcpy(bootrom_image.data(), delqa_bootrom, sizeof(delqa_bootrom));
-
-    uint16_t *words = reinterpret_cast<uint16_t *>(bootrom_image.data());
-    for (size_t i = 0; i < sizeof(delqa_bootrom) / 2; i++) {
-        if (words[i] == 011200) {
-            words[i] = 005000;
-            break;
-        }
-    }
-
-    uint8_t *bytes = bootrom_image.data();
-    int checksum = 0;
-    for (size_t i = 0; i < sizeof(delqa_bootrom) - 2; i++)
-        checksum += bytes[i];
-
-    words[(sizeof(delqa_bootrom) / 2) - 1] = static_cast<uint16_t>(checksum);
-
-    bootrom_ready = true;
-    return true;
-}
-
-/*
- * process_bootrom - Deliver bootrom image via RX descriptors
- *
- * This function is called when the driver enables the receiver
- * (RE=1) and the bootrom image has not yet been delivered.
- * The bootrom is delivered in two segments via the RX descriptor ring.
- *
- * Returns: true on success, false on NXM error
- */
-
-bool delqa_c::process_bootrom(void)
-{
-    if (!ensure_bootrom_image())
-        return false;
-
-    uint16_t words[QE_RING_WORDS] = {0};
-    uint16_t flag = 0xFFFF;
-
-    for (int part = 0; part < 2; ++part) {
-        uint32_t cur_ba = 0;
-        {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            cur_ba = rbdl_ba;
-        }
-        if (trace.value)
-            WARNING("DELQA: RX list dispatch pre-write flag at %06o", cur_ba);
-        if (!desc_write_words(cur_ba, &flag, 1)) {
-            WARNING("DELQA: RX list dispatch flag write failed at %06o", cur_ba);
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            return false;
-        }
-        if (trace.value)
-            WARNING("DELQA: RX list dispatch pre-read desc at %06o", cur_ba);
-        for (size_t i = 1; i < QE_RING_WORDS; ++i) {
-            if (!desc_read_words(cur_ba + 2 + static_cast<uint32_t>((i - 1) * 2), &words[i], 1)) {
-                WARNING("DELQA: RX list dispatch desc read failed at %06o", cur_ba);
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                nxm_error();
-                return false;
-            }
-        }
-        if (trace.value) {
-            WARNING("DELQA: RX dispatch read words0=%06o words1=%06o words2=%06o words3=%06o",
-                    flag, words[1], words[2], words[3]);
-        }
-
-        if (~words[1] & XQ_DSC_V) {
-            if (trace.value) {
-                WARNING("DELQA: Bootrom RX descriptor at %06o not valid (addr_hi=%06o)",
-                        cur_ba, words[1]);
-            }
-            {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                csr_set_clr(XQ_CSR_RL, 0);
-            }
-            return false;
-        }
-
-        if (!desc_read_words(cur_ba + 8, &words[4], 2)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            return false;
-        }
-
-        uint32_t address = make_addr(words[1], words[2]);
-        uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
-        uint16_t b_length = static_cast<uint16_t>(w_length * 2);
-        if (words[1] & XQ_DSC_H)
-            b_length -= 1;
-        if (words[1] & XQ_DSC_L)
-            b_length -= 1;
-
-        if (b_length < (sizeof(delqa_bootrom) / 2)) {
-            WARNING("DELQA: Bootrom RX buffer too small at %06o (len=%u)",
-                    cur_ba, b_length);
-            {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                csr_set_clr(XQ_CSR_RL, 0);
-            }
-            return false;
-        }
-
-        const uint8_t *src = bootrom_image.data() + part * (sizeof(delqa_bootrom) / 2);
-        const size_t bootrom_half = sizeof(delqa_bootrom) / 2;
-        const size_t chunk_bytes = 512;
-        for (size_t offset = 0; offset < bootrom_half; offset += chunk_bytes) {
-            size_t len = bootrom_half - offset;
-            if (len > chunk_bytes)
-                len = chunk_bytes;
-            if (!dma_write_bytes(address + offset, src + offset, len)) {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                nxm_error();
-                return false;
-            }
-        }
-
-        // Status word 1 for bootrom: DELQA sets bit 15 on both packets,
-        // and additionally bit 14 if not the last segment.
-        // First descriptor = 0xC000 (bits 15,14), Second = 0x8000 (bit 15 only)
-        if (part == 0)
-            words[4] = QE_RST_LASTNOT;  // 0xC000 = not last segment
-        else
-            words[4] = QE_RST_UNUSED;   // 0x8000 = last segment (bootrom special)
-        words[5] = 0;
-        if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            return false;
-        }
-
-        if (trace.value) {
-            uint32_t remaining = (sizeof(delqa_bootrom) / 2) * (1 - part);
-            WARNING("DELQA: Bootrom desc_addr=%06o status1=%06o status2=%06o remaining=%u",
-                    cur_ba, words[4], words[5], remaining);
-        }
-
-        {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            rbdl_ba = cur_ba + QE_RING_BYTES;
-        }
-    }
-
-    {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        csr_set_clr(XQ_CSR_RI, 0);
-    }
-    reset_sanity_timer();
-    return true;
 }
 
 /* process_local - Handle incoming local packets
@@ -2278,12 +2244,11 @@ void delqa_c::worker(unsigned instance)
  * Responsibilities:
  * 1. Service timers (sanity, system ID)
  * 2. Process pending register writes
- * 3. Handle boot ROM requests
- * 4. Dispatch RX ring when RCLH is written
- * 5. Poll pcap for incoming packets
- * 6. Process MOP protocol packets locally (loopback, remote console)
- * 7. Queue normal packets for delivery to host
- * 8. Deliver queued packets to RX descriptors
+ * 3. Dispatch RX ring when RCLH is written
+ * 4. Poll pcap for incoming packets
+ * 5. Process MOP protocol packets locally (loopback, remote console)
+ * 6. Queue normal packets for delivery to host
+ * 7. Deliver queued packets to RX descriptors
  *
  * The loop runs every 10ms when idle, faster when processing packets.
  */
@@ -2307,14 +2272,10 @@ void delqa_c::worker_rx(void)
         }
 
         // Check for pending operations
-        bool do_bootrom = false;
         bool do_rbdl = false;
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            if (bootrom_pending) {
-                bootrom_pending = false;
-                do_bootrom = true;
-            } else if (rbdl_pending) {
+            if (rbdl_pending) {
                 if (trace.value)
                     WARNING("DELQA: RX list pending set (csr=%06o)", csr);
                 rbdl_pending = false;
@@ -2322,26 +2283,46 @@ void delqa_c::worker_rx(void)
             }
         }
 
-        // Process boot ROM request
-        if (do_bootrom) {
-            process_bootrom();
-            continue;
-        }
-
         // Dispatch RX ring
         if (do_rbdl)
             dispatch_rbdl();
 
-        // Check if receiver is ready (RE=1 and delay expired)
+        // Check if receiver is ready for normal packets (RE=1 and delay expired)
+        // Setup/loopback packets (types 0,1) bypass this check and are processed
+        // by process_rbdl() regardless of RE state
+        bool has_loopback = false;
+        {
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
+            if (!read_queue.empty() && read_queue.front().type < 2)
+                has_loopback = true;
+        }
+
+        // If there are loopback/setup packets waiting, process them now
+        if (has_loopback) {
+            bool rx_list_ready = false;
+            {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                rx_list_ready = !(csr & XQ_CSR_RL);
+            }
+            if (rx_list_ready)
+                process_rbdl();
+        }
+
         if (!rx_ready()) {
-            bool has_queued = false;
+            bool has_normal = false;
             {
                 std::lock_guard<std::mutex> queue_lock(queue_mutex);
-                has_queued = !read_queue.empty();
+                // Only log if we have normal (type 2) packets waiting
+                for (const auto &item : read_queue) {
+                    if (item.type == 2) {
+                        has_normal = true;
+                        break;
+                    }
+                }
             }
-            if (has_queued && !rx_blocked_logged) {
+            if (has_normal && !rx_blocked_logged) {
                 if (trace.value) {
-                    WARNING("DELQA: RX blocked (RE=0) with queued packets");
+                    WARNING("DELQA: RX blocked (RE=0) with normal packets queued");
                 }
                 rx_blocked_logged = true;
             }

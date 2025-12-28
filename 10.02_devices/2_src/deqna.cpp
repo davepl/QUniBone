@@ -1,18 +1,17 @@
 /*
- * DEUNA Ethernet Controller Emulation for QUniBone
+ * DEQNA Ethernet Controller Emulation for QUniBone
  * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
  * Contributed under the GPL2 License
  *
  * This is a clean-room implementation based on:
- *   - DEC DEUNA User's Guide (EK-DEUNA-UG)
- *   - UNIBUS specification
- *   - OpenSIMH pdp11_xu.c behavioral reference (no code copied)
+ *   - DEC DEQNA User's Guide (EK-DEQNA-UG)
+ *   - QBUS specification
  *
  * Theory of Operation
  * -------------------
- * The DEUNA exposes four UNIBUS registers (PCSR0-3). PCSR0 is the command/status
+ * The DEQNA exposes four QBUS registers (PCSR0-3). PCSR0 is the command/status
  * register (port commands, interrupts, W1C bits). PCSR2/3 provide the PCBB
- * pointer, which is a UNIBUS address to the PCB command block. The driver
+ * pointer, which is a QBUS address to the PCB command block. The driver
  * programs PCSR2/3, then issues PCSR0 GETPCBB/GETCMD commands to let the
  * controller fetch the PCB and perform a command (configure, set mode, etc).
  *
@@ -22,12 +21,12 @@
  * being copied into host memory. TX frames are DMA-read and injected via pcap.
  *
  * Two worker threads drive the device: instance 0 handles RX (pcap poll, queue,
- * process_receive), instance 1 handles TX (process_transmit). All UNIBUS
+ * process_receive), instance 1 handles TX (process_transmit). All QBUS
  * register writes are captured in order and replayed by the workers to preserve
  * PCSR2/3 -> PCSR0 command sequencing (critical for GETPCBB).
  *
  * Interrupt behavior mirrors hardware: PCSR0 summary bits and INTE gate the
- * UNIBUS interrupt. The code maintains PCSR0/1 state and updates the visible
+ * QBUS interrupt. The code maintains PCSR0/1 state and updates the visible
  * register latches after each operation.
  *
  * Defaults are set for operator convenience (ifname=eth0, promisc on, etc),
@@ -46,17 +45,17 @@
 #include <chrono>
 #include <condition_variable>
 
-#include "deuna_bootrom.h"
+#include "deqna_bootrom.h"
 #include "logger.hpp"
 #include "utils.hpp"
 #include "timeout.hpp"
 #include "qunibus.h"
 #include "qunibusadapter.hpp"
 #include "ddrmem.h"
-#include "deuna.hpp"
+#include "deqna.hpp"
 
-#if !defined(UNIBUS)
-#error "DEUNA is a UNIBUS-only device"
+#if !defined(QBUS)
+#error "DEQNA is a QBUS-only device"
 #endif
 
 /*
@@ -75,13 +74,14 @@ static const unsigned XU_QUE_MAX = 500;
 /*
  * Internal memory sizes (word counts)
  */
-static const size_t DEUNA_WCS_WORDS = 8192;
-static const size_t DEUNA_LINK_WORDS = 1024;
+static const size_t DEQNA_WCS_WORDS = 8192;
+static const size_t DEQNA_LINK_WORDS = 1024;
 
 /*
- * Default DEUNA hardware address (DEC OUI)
+ * Default DEQNA hardware address (DEC OUI)
  */
-static const uint8_t DEUNA_DEFAULT_MAC[6] = {0x08, 0x00, 0x2b, 0xcc, 0xdd, 0xee};
+static const uint8_t DEQNA_DEFAULT_MAC[6] = {0x08, 0x00, 0x2b, 0xcc, 0xdd, 0xee};
+static const uint16_t DEQNA_ADDR_HI_MASK = 0x003f;
 
 /*
  * PCSR0 register definitions
@@ -123,7 +123,7 @@ static const uint16_t PCSR1_PCTO  = 0000200;  // Port Command Timeout
 static const uint16_t PCSR1_TYPE  = 0000160;  // Interface type
 static const uint16_t PCSR1_STATE = 0000017;  // State
 
-static const uint16_t TYPE_DEUNA = (0 << 4);
+static const uint16_t TYPE_DEQNA = (0 << 4);
 static const uint16_t TYPE_DELUA = (1 << 4);
 
 static const uint16_t STATE_RESET   = 000;
@@ -229,7 +229,7 @@ static const uint16_t RXR_MLEN = 0007777;
 /*
  * Version string
  */
-static const char *DEUNA_VERSION = "v001";
+static const char *DEQNA_VERSION = "v001";
 
 /*
  * mac_is_zero
@@ -278,23 +278,23 @@ static bool mac_equal(const uint8_t *a, const uint8_t *b)
 }
 
 /*
- * DEUNA Constructor
+ * DEQNA Constructor
  */
 /*
- * deuna_c::deuna_c
- * Purpose: construct the DEUNA device with sane defaults and register layout.
+ * deqna_c::deqna_c
+ * Purpose: construct the DEQNA device with sane defaults and register layout.
  * Behavior: initializes registers, defaults, MAC, and buffers for emulation.
  * Notes: sets host-interface defaults (e.g., ifname) and DEC-range MAC.
  */
-deuna_c::deuna_c() : qunibusdevice_c()
+deqna_c::deqna_c() : qunibusdevice_c()
 {
     set_workers_count(2);  // Instance 0 = RX, Instance 1 = TX
 
-    name.value = "deuna";
-    type_name.value = "DEUNA";
-    log_label = "deuna";
+    name.value = "deqna";
+    type_name.value = "DEQNA";
+    log_label = "deqna";
 
-    set_default_bus_params(DEUNA_DEFAULT_ADDR, DEUNA_DEFAULT_SLOT, DEUNA_DEFAULT_VECTOR, DEUNA_DEFAULT_LEVEL);
+    set_default_bus_params(DEQNA_DEFAULT_ADDR, DEQNA_DEFAULT_SLOT, DEQNA_DEFAULT_VECTOR, DEQNA_DEFAULT_LEVEL);
     dma_request.set_priority_slot(priority_slot.value);
     dma_desc_request.set_priority_slot(priority_slot.value);
     intr_request.set_priority_slot(priority_slot.value);
@@ -336,7 +336,7 @@ deuna_c::deuna_c() : qunibusdevice_c()
     reg_pcsr3->active_on_dati = false;
     reg_pcsr3->active_on_dato = true;
     reg_pcsr3->reset_value = 0;
-    reg_pcsr3->writable_bits = 0x0003;
+    reg_pcsr3->writable_bits = DEQNA_ADDR_HI_MASK;
 
     ifname.value = "eth0";
     mac.value = "";
@@ -344,24 +344,30 @@ deuna_c::deuna_c() : qunibusdevice_c()
     rx_slots.value = 0;
     tx_slots.value = 0;
     trace.value = false;
+    sanity_enable.value = false;
+    sanity_timeout_ms.value = DEQNA_SANITY_DEFAULT_MS;
+    sanity.enabled = false;
+    sanity.timeout_ns = static_cast<uint64_t>(sanity_timeout_ms.value) * 1000000ull;
+    sanity.last_kick_ns = 0;
+    sanity.tripped = false;
 
     /* Default MAC in DEC range */
-    memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
+    memcpy(mac_addr, DEQNA_DEFAULT_MAC, sizeof(mac_addr));
 
     read_buffer.msg.reserve(XU_MAX_RCV_PACKET);
     write_buffer.msg.reserve(XU_MAX_RCV_PACKET);
 
-    wcs_mem.assign(DEUNA_WCS_WORDS, 0);
-    link_mem.assign(DEUNA_LINK_WORDS, 0);
+    wcs_mem.assign(DEQNA_WCS_WORDS, 0);
+    link_mem.assign(DEQNA_LINK_WORDS, 0);
 }
 
 /*
- * deuna_c::~deuna_c
- * Purpose: clean shutdown of DEUNA resources.
+ * deqna_c::~deqna_c
+ * Purpose: clean shutdown of DEQNA resources.
  * Behavior: closes pcap handle if compiled in.
  * Notes: workers are managed by the base framework; this just releases pcap.
  */
-deuna_c::~deuna_c()
+deqna_c::~deqna_c()
 {
 #ifdef HAVE_PCAP
     pcap.close();
@@ -369,12 +375,12 @@ deuna_c::~deuna_c()
 }
 
 /*
- * deuna_c::parse_mac
+ * deqna_c::parse_mac
  * Purpose: accept operator-provided MAC strings for overrides.
  * Behavior: parses aa:bb:cc:dd:ee:ff into six bytes; returns false on error.
  * Notes: empty string is treated as "no override" and returns false.
  */
-bool deuna_c::parse_mac(const std::string &text, uint8_t out[6])
+bool deqna_c::parse_mac(const std::string &text, uint8_t out[6])
 {
     if (text.empty())
         return false;
@@ -393,12 +399,12 @@ bool deuna_c::parse_mac(const std::string &text, uint8_t out[6])
 }
 
 /*
- * deuna_c::on_param_changed
+ * deqna_c::on_param_changed
  * Purpose: react to menu/runtime parameter changes.
  * Behavior: updates DMA/interrupt routing, MAC override, and pcap filtering.
  * Notes: ifname is locked while installed; MAC parsing is strict.
  */
-bool deuna_c::on_param_changed(parameter_c *param)
+bool deqna_c::on_param_changed(parameter_c *param)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
@@ -412,13 +418,13 @@ bool deuna_c::on_param_changed(parameter_c *param)
         intr_request.set_vector(intr_vector.new_value);
     } else if (param == &ifname) {
         if (handle) {
-            WARNING("DEUNA: ifname cannot be changed while device is installed");
+            WARNING("DEQNA: ifname cannot be changed while device is installed");
             return false;
         }
     } else if (param == &mac) {
         if (mac.new_value.empty()) {
             mac_override = false;
-            memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
+            memcpy(mac_addr, DEQNA_DEFAULT_MAC, sizeof(mac_addr));
             memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
             setup.valid = true;
             if (setup.mac_count < 2)
@@ -427,7 +433,7 @@ bool deuna_c::on_param_changed(parameter_c *param)
         } else {
             uint8_t parsed[6] = {0};
             if (!parse_mac(mac.new_value, parsed)) {
-                ERROR("DEUNA: invalid MAC format '%s'", mac.new_value.c_str());
+                ERROR("DEQNA: invalid MAC format '%s'", mac.new_value.c_str());
                 return false;
             }
             mac_override = true;
@@ -438,36 +444,49 @@ bool deuna_c::on_param_changed(parameter_c *param)
         }
     } else if (param == &promisc) {
         update_pcap_filter();
+    } else if (param == &sanity_enable) {
+        uint64_t timeout_ns = static_cast<uint64_t>(sanity_timeout_ms.value) * 1000000ull;
+        sanity.timeout_ns = timeout_ns;
+        sanity.enabled = sanity_enable.new_value && timeout_ns > 0;
+        sanity.tripped = false;
+        kick_sanity_timer();
+    } else if (param == &sanity_timeout_ms) {
+        uint64_t timeout_ns = static_cast<uint64_t>(sanity_timeout_ms.new_value) * 1000000ull;
+        sanity.timeout_ns = timeout_ns;
+        if (sanity.enabled && timeout_ns == 0)
+            sanity.enabled = false;
+        sanity.tripped = false;
+        kick_sanity_timer();
     }
 
     return qunibusdevice_c::on_param_changed(param);
 }
 
 /*
- * deuna_c::on_before_install
+ * deqna_c::on_before_install
  * Purpose: validate config and open host networking before device is active.
  * Behavior: ensures pcap support, ifname set, and opens pcap handle.
  * Notes: failure here prevents device installation and avoids a stuck PDP-11.
  */
-bool deuna_c::on_before_install(void)
+bool deqna_c::on_before_install(void)
 {
 #ifndef HAVE_PCAP
-    ERROR("DEUNA: libpcap support not compiled in - install libpcap-dev and rebuild with HAVE_PCAP");
+    ERROR("DEQNA: libpcap support not compiled in - install libpcap-dev and rebuild with HAVE_PCAP");
     return false;
 #else
 
     if (ifname.value.empty()) {
-        ERROR("DEUNA: ifname must be set");
+        ERROR("DEQNA: ifname must be set");
         return false;
     }
 
     if (!pcap.open(ifname.value, promisc.value, 2048, 1)) {
-        ERROR("DEUNA: failed to open pcap on %s: %s", ifname.value.c_str(),
+        ERROR("DEQNA: failed to open pcap on %s: %s", ifname.value.c_str(),
               pcap.last_error().c_str());
         return false;
     }
 
-    INFO("DEUNA: PCAP opened successfully on interface %s", ifname.value.c_str());
+    INFO("DEQNA: PCAP opened successfully on interface %s", ifname.value.c_str());
 
     ifname.readonly = true;
     mac.readonly = true;
@@ -484,23 +503,23 @@ bool deuna_c::on_before_install(void)
 }
 
 /*
- * deuna_c::on_after_install
- * Purpose: finalize device state once installed in the UNIBUS.
+ * deqna_c::on_after_install
+ * Purpose: finalize device state once installed in the QBUS.
  * Behavior: marks parameters read-only and updates link status bits.
  * Notes: called after register space is live; avoid heavy operations here.
  */
-void deuna_c::on_after_install(void)
+void deqna_c::on_after_install(void)
 {
     reset_controller();
 }
 
 /*
- * deuna_c::on_after_uninstall
+ * deqna_c::on_after_uninstall
  * Purpose: unwind installation state.
  * Behavior: clears readonly flags and refreshes status bits.
  * Notes: pcap close is handled in destructor or when disabling.
  */
-void deuna_c::on_after_uninstall(void)
+void deqna_c::on_after_uninstall(void)
 {
 #ifdef HAVE_PCAP
     pcap.close();
@@ -517,12 +536,12 @@ void deuna_c::on_after_uninstall(void)
 }
 
 /*
- * deuna_c::on_power_changed
- * Purpose: respond to UNIBUS power transitions.
+ * deqna_c::on_power_changed
+ * Purpose: respond to QBUS power transitions.
  * Behavior: resets controller on DCLO assert edge.
  * Notes: matches DEC power/reset semantics for device state.
  */
-void deuna_c::on_power_changed(signal_edge_enum aclo_edge, signal_edge_enum dclo_edge)
+void deqna_c::on_power_changed(signal_edge_enum aclo_edge, signal_edge_enum dclo_edge)
 {
     UNUSED(aclo_edge);
     if (dclo_edge == SIGNAL_EDGE_RAISING)
@@ -530,24 +549,24 @@ void deuna_c::on_power_changed(signal_edge_enum aclo_edge, signal_edge_enum dclo
 }
 
 /*
- * deuna_c::on_init_changed
+ * deqna_c::on_init_changed
  * Purpose: respond to INIT line assertion.
  * Behavior: resets the controller when INIT is asserted.
  * Notes: keeps device state consistent with PDP-11 initialization.
  */
-void deuna_c::on_init_changed(void)
+void deqna_c::on_init_changed(void)
 {
     if (init_asserted)
         reset_controller();
 }
 
 /*
- * deuna_c::update_pcsr_regs
- * Purpose: sync internal PCS register state to UNIBUS-visible latches.
+ * deqna_c::update_pcsr_regs
+ * Purpose: sync internal PCS register state to QBUS-visible latches.
  * Behavior: copies pcsr0-3 into active DATI/DATO flipflops.
- * Notes: call after any pcsr change to keep the CPU’s view coherent.
+ * Notes: call after any pcsr change to keep the CPU's view coherent.
  */
-void deuna_c::update_pcsr_regs(void)
+void deqna_c::update_pcsr_regs(void)
 {
     if (reg_pcsr0) {
         reg_pcsr0->active_dati_flipflops = pcsr0;
@@ -578,12 +597,12 @@ void deuna_c::update_pcsr_regs(void)
 }
 
 /*
- * deuna_c::update_transceiver_bits
+ * deqna_c::update_transceiver_bits
  * Purpose: reflect link/transceiver status in PCSR1.
  * Behavior: updates XPWR/ICAB bits based on pcap status and overrides.
  * Notes: called on install/uninstall and during reset.
  */
-void deuna_c::update_transceiver_bits(void)
+void deqna_c::update_transceiver_bits(void)
 {
     if (pcap.is_open())
         pcsr1 &= ~PCSR1_XPWR;
@@ -592,12 +611,12 @@ void deuna_c::update_transceiver_bits(void)
 }
 
 /*
- * deuna_c::update_intr
- * Purpose: raise/cancel UNIBUS interrupt based on pcsr0 status.
+ * deqna_c::update_intr
+ * Purpose: raise/cancel QBUS interrupt based on pcsr0 status.
  * Behavior: sets INTR summary and signals/cancels interrupt requests.
  * Notes: requires pcsr0 W1C and INTE semantics to be respected.
  */
-void deuna_c::update_intr(void)
+void deqna_c::update_intr(void)
 {
     const bool any = (pcsr0 & PCSR0_W1C_MASK) != 0;
     if (any)
@@ -614,12 +633,12 @@ void deuna_c::update_intr(void)
     const bool inte = (pcsr0 & PCSR0_INTE) != 0;
     if (!inte) {
         if (trace.value && any)
-            WARNING("DEUNA: INTR suppressed (INTE=0) pcsr0=%06o", pcsr0);
+            WARNING("DEQNA: INTR suppressed (INTE=0) pcsr0=%06o", pcsr0);
         if (irq) {
             qunibusadapter->cancel_INTR(intr_request);
             irq = false;
             if (trace.value)
-                WARNING("DEUNA: INTR deassert pcsr0=%06o", pcsr0);
+                WARNING("DEQNA: INTR deassert pcsr0=%06o", pcsr0);
         }
         return;
     }
@@ -634,26 +653,31 @@ void deuna_c::update_intr(void)
         qunibusadapter->INTR(intr_request, reg_pcsr0, pcsr0);
         irq = true;
         if (trace.value)
-            WARNING("DEUNA: INTR assert pcsr0=%06o vec=%03o level=%d", pcsr0, intr_vector.value, intr_level.value);
+            WARNING("DEQNA: INTR assert pcsr0=%06o vec=%03o level=%d", pcsr0, intr_vector.value, intr_level.value);
     }
 }
 
 /*
- * deuna_c::reset_controller
- * Purpose: central reset path for DEUNA state.
+ * deqna_c::reset_controller
+ * Purpose: central reset path for DEQNA state.
  * Behavior: reinitializes pcsr state, descriptor pointers, filters, and stats.
  * Notes: called on INIT, power transitions, and software reset.
  */
-void deuna_c::reset_controller(void)
+void deqna_c::reset_controller(void)
 {
     reset_in_progress.store(true, std::memory_order_release);  // Fix: Signal reset start
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
     if (trace.value)
-        WARNING("DEUNA: reset_controller called");
+        WARNING("DEQNA: reset_controller called");
 
     pcsr0 = PCSR0_DNI;  // Done on reset
-    pcsr1 = TYPE_DEUNA | STATE_READY;
+    pcsr1 = TYPE_DEQNA | STATE_READY;
+    if (sanity.tripped) {
+        pcsr1 |= PCSR1_PCTO;
+        pcsr0 |= PCSR0_SERI;
+        sanity.tripped = false;
+    }
     update_transceiver_bits();
 
     pcsr2 = 0;
@@ -679,7 +703,7 @@ void deuna_c::reset_controller(void)
 
     setup = setup_state();
     if (!mac_override && mac_is_zero(mac_addr))
-        memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
+        memcpy(mac_addr, DEQNA_DEFAULT_MAC, sizeof(mac_addr));
     memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
     for (int i = 0; i < 6; ++i)
         setup.macs[1][i] = 0xff;
@@ -689,6 +713,10 @@ void deuna_c::reset_controller(void)
     stats = stats_state();
     stats.last_update_ns = timeout_c::abstime_ns();
 
+    sanity.timeout_ns = static_cast<uint64_t>(sanity_timeout_ms.value) * 1000000ull;
+    sanity.enabled = sanity_enable.value && sanity.timeout_ns > 0;
+    sanity.last_kick_ns = sanity.enabled ? stats.last_update_ns : 0;
+
     memset(load_server, 0, sizeof(load_server));
     init_internal_memory();
 
@@ -697,19 +725,19 @@ void deuna_c::reset_controller(void)
     reset_in_progress.store(false, std::memory_order_release);  // Fix: Signal reset end
 }
 
-void deuna_c::init_internal_memory(void)
+void deqna_c::init_internal_memory(void)
 {
-    wcs_mem.assign(DEUNA_WCS_WORDS, 014000);
-    link_mem.assign(DEUNA_LINK_WORDS, 0100000);
+    wcs_mem.assign(DEQNA_WCS_WORDS, 014000);
+    link_mem.assign(DEQNA_LINK_WORDS, 0100000);
 }
 
 /*
- * deuna_c::on_after_register_access
- * Purpose: capture UNIBUS register writes from the PDP-11.
+ * deqna_c::on_after_register_access
+ * Purpose: capture QBUS register writes from the PDP-11.
  * Behavior: queues writes for worker thread processing to avoid DMA deadlock.
- * Notes: must be fast to not block the UNIBUS callback path.
+ * Notes: must be fast to not block the QBUS callback path.
  */
-void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
+void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
         DATO_ACCESS access)
 {
     if (qunibus_control != QUNIBUS_CYCLE_DATO)
@@ -725,7 +753,7 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     uint16_t val = device_reg->active_dato_flipflops;
     uint16_t w1c_snapshot = 0;
 
-    if (reg_index == DEUNA_REG_PCSR0) {
+    if (reg_index == DEQNA_REG_PCSR0) {
         uint16_t w1c_mask = 0;
         if (access == DATO_WORD || access == DATO_BYTEH)
             w1c_mask = static_cast<uint16_t>(val & PCSR0_W1C_MASK);
@@ -734,29 +762,29 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
                 static_cast<uint16_t>(~w1c_mask), __ATOMIC_RELAXED);
             uint16_t cleared = static_cast<uint16_t>(before & w1c_mask);
             if (trace.value && cleared)
-                WARNING("DEUNA: W1C immediate clear bits=%06o (was pcsr0=%06o)", cleared, before);
+                WARNING("DEQNA: W1C immediate clear bits=%06o (was pcsr0=%06o)", cleared, before);
             update_intr();
         }
     }
 
     if (trace.value) {
         const char *rname = "?";
-        if (reg_index == DEUNA_REG_PCSR0) rname = "PCSR0";
-        else if (reg_index == DEUNA_REG_PCSR1) rname = "PCSR1";
-        else if (reg_index == DEUNA_REG_PCSR2) rname = "PCSR2";
-        else if (reg_index == DEUNA_REG_PCSR3) rname = "PCSR3";
-        WARNING("DEUNA: on_after_register_access %s = %06o (access=%d)", rname, val, access);
+        if (reg_index == DEQNA_REG_PCSR0) rname = "PCSR0";
+        else if (reg_index == DEQNA_REG_PCSR1) rname = "PCSR1";
+        else if (reg_index == DEQNA_REG_PCSR2) rname = "PCSR2";
+        else if (reg_index == DEQNA_REG_PCSR3) rname = "PCSR3";
+        WARNING("DEQNA: on_after_register_access %s = %06o (access=%d)", rname, val, access);
     }
 
     // PCSR2/3 are safe to apply immediately; diagnostics read back right away.
-    if (reg_index == DEUNA_REG_PCSR2 || reg_index == DEUNA_REG_PCSR3) {
+    if (reg_index == DEQNA_REG_PCSR2 || reg_index == DEQNA_REG_PCSR3) {
         handle_register_write(reg_index, val, access, w1c_snapshot);
         return;
     }
 
     // Queue the register write for worker thread processing.
     // We cannot process synchronously because commands may need DMA,
-    // and DMA requires the UNIBUS which we're currently blocking.
+    // and DMA requires the QBUS which we're currently blocking.
     {
         std::lock_guard<std::mutex> lock(pending_reg_mutex);
         pending_reg_write write;
@@ -772,31 +800,31 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
 }
 
 /*
- * deuna_c::handle_register_write
+ * deqna_c::handle_register_write
  * Purpose: implement PCSR0-3 semantics for writes.
  * Behavior: updates pcsr fields, latches commands, and triggers actions.
  * Notes: pcbb/cmd sequencing depends on write order; keep W1C rules intact.
  */
-void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access,
+void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access,
         uint16_t w1c_snapshot)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
     if (trace.value) {
         const char *rname = "?";
-        if (reg_index == DEUNA_REG_PCSR0) rname = "PCSR0";
-        else if (reg_index == DEUNA_REG_PCSR1) rname = "PCSR1";
-        else if (reg_index == DEUNA_REG_PCSR2) rname = "PCSR2";
-        else if (reg_index == DEUNA_REG_PCSR3) rname = "PCSR3";
-        WARNING("DEUNA: Write %s (reg %d) = %06o", rname, reg_index, val);
+        if (reg_index == DEQNA_REG_PCSR0) rname = "PCSR0";
+        else if (reg_index == DEQNA_REG_PCSR1) rname = "PCSR1";
+        else if (reg_index == DEQNA_REG_PCSR2) rname = "PCSR2";
+        else if (reg_index == DEQNA_REG_PCSR3) rname = "PCSR3";
+        WARNING("DEQNA: Write %s (reg %d) = %06o", rname, reg_index, val);
     }
 
     switch (reg_index) {
-    case DEUNA_REG_PCSR0: {
+    case DEQNA_REG_PCSR0: {
         if (access == DATO_BYTEH) {
             uint16_t cleared = w1c_snapshot;
             if (trace.value && cleared)
-                WARNING("DEUNA: W1C BYTEH clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
+                WARNING("DEQNA: W1C BYTEH clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
             pcsr0 &= static_cast<uint16_t>(~w1c_snapshot);
             update_intr();
             return;
@@ -809,7 +837,7 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         if (access == DATO_WORD) {
             uint16_t cleared = w1c_snapshot;
             if (trace.value && cleared)
-                WARNING("DEUNA: W1C WORD clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
+                WARNING("DEQNA: W1C WORD clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
             pcsr0 &= static_cast<uint16_t>(~w1c_snapshot);
         }
 
@@ -828,7 +856,7 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
             uint16_t cmd = pcsr0 & PCSR0_PCMD;
             if (cmd != CMD_NOOP) {
                 if (trace.value)
-                    WARNING("DEUNA: PCSR0 write cmd=%03o, pcsr0=%06o", cmd, pcsr0);
+                    WARNING("DEQNA: PCSR0 write cmd=%03o, pcsr0=%06o", cmd, pcsr0);
                 
                 // Commands that require DMA must be queued for worker thread.
                 // Commands that don't need DMA can be processed immediately.
@@ -838,30 +866,30 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
                     std::lock_guard<std::mutex> cmdlock(pending_cmd_mutex);
                     pending_cmd = cmd;
                     if (trace.value)
-                        WARNING("DEUNA: Queued command %03o for worker", cmd);
+                        WARNING("DEQNA: Queued command %03o for worker", cmd);
                 } else {
                     // Safe to execute immediately (no DMA needed)
                     port_command(cmd);
                     if (trace.value)
-                        WARNING("DEUNA: PCSR0 after command, pcsr0=%06o", pcsr0);
+                        WARNING("DEQNA: PCSR0 after command, pcsr0=%06o", pcsr0);
                 }
             } else if (trace.value) {
-                WARNING("DEUNA: PCSR0 write with NOOP, pcsr0=%06o", pcsr0);
+                WARNING("DEQNA: PCSR0 write with NOOP, pcsr0=%06o", pcsr0);
             }
         }
 
         update_intr();
         break;
     }
-    case DEUNA_REG_PCSR1:
+    case DEQNA_REG_PCSR1:
         // read-only
         break;
-    case DEUNA_REG_PCSR2:
+    case DEQNA_REG_PCSR2:
         pcsr2 = val & 0177776;  // MBZ LSB
         update_pcsr_regs();
         break;
-    case DEUNA_REG_PCSR3:
-        pcsr3 = val & 0000003;
+    case DEQNA_REG_PCSR3:
+        pcsr3 = val & DEQNA_ADDR_HI_MASK;
         update_pcsr_regs();
         break;
     default:
@@ -870,12 +898,12 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
 }
 
 /*
- * deuna_c::apply_pending_reg_writes
- * Purpose: drain queued register writes in original UNIBUS order.
+ * deqna_c::apply_pending_reg_writes
+ * Purpose: drain queued register writes in original QBUS order.
  * Behavior: dequeues and dispatches to handle_register_write.
  * Notes: ordering matters for GETPCBB; this runs in worker threads.
  */
-void deuna_c::apply_pending_reg_writes(void)
+void deqna_c::apply_pending_reg_writes(void)
 {
     std::deque<pending_reg_write> writes;
     {
@@ -892,12 +920,12 @@ void deuna_c::apply_pending_reg_writes(void)
 }
 
 /*
- * deuna_c::process_pending_command
+ * deqna_c::process_pending_command
  * Purpose: execute queued port command that requires DMA.
  * Behavior: called by worker thread to safely execute GETCMD/PDMD.
- * Notes: DMA is only safe from worker context, not from UNIBUS callback.
+ * Notes: DMA is only safe from worker context, not from QBUS callback.
  */
-void deuna_c::process_pending_command(void)
+void deqna_c::process_pending_command(void)
 {
     uint16_t cmd = 0;
     {
@@ -908,23 +936,23 @@ void deuna_c::process_pending_command(void)
 
     if (cmd != 0) {
         if (trace.value)
-            WARNING("DEUNA: Worker processing queued command %03o", cmd);
+            WARNING("DEQNA: Worker processing queued command %03o", cmd);
         
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         port_command(cmd);
         
         if (trace.value)
-            WARNING("DEUNA: Worker command done, pcsr0=%06o", pcsr0);
+            WARNING("DEQNA: Worker command done, pcsr0=%06o", pcsr0);
     }
 }
 
 /*
- * deuna_c::dma_read_words
+ * deqna_c::dma_read_words
  * Purpose: DMA read helper for device descriptors and buffers.
- * Behavior: reads from UNIBUS or DDR-backed memory into a word buffer.
+ * Behavior: reads from QBUS or DDR-backed memory into a word buffer.
  * Notes: returns false on NXM; callers must handle failures.
  */
-bool deuna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
+bool deqna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
         return true;
@@ -940,7 +968,7 @@ bool deuna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
         (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
             if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i])) {
-                WARNING("DEUNA: DDR exam failed");
+                WARNING("DEQNA: DDR exam failed");
                 return false;
             }
         }
@@ -953,12 +981,12 @@ bool deuna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 }
 
 /*
- * deuna_c::dma_write_words
+ * deqna_c::dma_write_words
  * Purpose: DMA write helper for descriptors and status back to PDP-11 memory.
- * Behavior: writes word buffers into UNIBUS or DDR-backed memory.
+ * Behavior: writes word buffers into QBUS or DDR-backed memory.
  * Notes: returns false on NXM; callers should set PCEI/ERR as needed.
  */
-bool deuna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
+bool deqna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
         return true;
@@ -974,7 +1002,7 @@ bool deuna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
         (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
         for (size_t i = 0; i < wordcount; ++i) {
             if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i])) {
-                WARNING("DEUNA: DDR deposit failed");
+                WARNING("DEQNA: DDR deposit failed");
                 return false;
             }
         }
@@ -988,12 +1016,12 @@ bool deuna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
 }
 
 /*
- * deuna_c::desc_read_words
+ * deqna_c::desc_read_words
  * Purpose: descriptor read wrapper with NXM handling.
  * Behavior: performs DMA reads and updates error status on failure.
  * Notes: used by RX/TX descriptor processing; keep error semantics consistent.
  */
-bool deuna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
+bool deqna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
         return true;
@@ -1020,12 +1048,12 @@ bool deuna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 }
 
 /*
- * deuna_c::desc_write_words
+ * deqna_c::desc_write_words
  * Purpose: descriptor write wrapper with NXM handling.
  * Behavior: performs DMA writes and updates error status on failure.
  * Notes: used when returning ownership or status to the PDP-11.
  */
-bool deuna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
+bool deqna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
         return true;
@@ -1053,12 +1081,12 @@ bool deuna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
 }
 
 /*
- * deuna_c::dma_read_bytes
+ * deqna_c::dma_read_bytes
  * Purpose: byte-granular DMA reader for Ethernet frames.
  * Behavior: reads bytes from PDP-11 memory using aligned word reads.
  * Notes: handles odd-byte alignment; expects len <= frame size.
  */
-bool deuna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
+bool deqna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
 {
     if (len == 0)
         return true;
@@ -1098,12 +1126,12 @@ bool deuna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
 }
 
 /*
- * deuna_c::dma_write_bytes
+ * deqna_c::dma_write_bytes
  * Purpose: byte-granular DMA writer for Ethernet frames.
  * Behavior: writes bytes into PDP-11 memory using aligned word writes.
  * Notes: handles odd alignment; callers should verify buffer lengths.
  */
-bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
+bool deqna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
 {
     if (len == 0)
         return true;
@@ -1151,12 +1179,12 @@ bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
 }
 
 /*
- * deuna_c::cpu_read_words
+ * deqna_c::cpu_read_words
  * Purpose: CPU-visible read helper for debugging memory mapping issues.
- * Behavior: performs CPU DATI cycles to read words from UNIBUS space.
+ * Behavior: performs CPU DATI cycles to read words from QBUS space.
  * Notes: serialized with DMA to avoid interleaving with device DMA ops.
  */
-bool deuna_c::cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
+bool deqna_c::cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
         return true;
@@ -1180,12 +1208,12 @@ bool deuna_c::cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 }
 
 /*
- * deuna_c::cpu_read_bytes
+ * deqna_c::cpu_read_bytes
  * Purpose: CPU-visible byte reader layered over cpu_read_words.
  * Behavior: reads aligned words and extracts bytes.
  * Notes: used for diagnostics to compare CPU view with DMA view.
  */
-bool deuna_c::cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
+bool deqna_c::cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
 {
     if (len == 0)
         return true;
@@ -1214,23 +1242,23 @@ bool deuna_c::cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
 }
 
 /*
- * deuna_c::process_bootrom
- * Purpose: DMA the DEUNA boot ROM into host memory for CMD_BOOT.
+ * deqna_c::process_bootrom
+ * Purpose: DMA the DEQNA boot ROM into host memory for CMD_BOOT.
  * Behavior: writes the combined EPROM image to the destination address.
  * Notes: caller must hold state_mutex; uses dma_write_bytes for transfer.
  */
-bool deuna_c::process_bootrom(uint32_t dst_addr)
+bool deqna_c::process_bootrom(uint32_t dst_addr)
 {
-    if (dst_addr == 0 || deuna_bootrom_size == 0)
+    if (dst_addr == 0 || deqna_bootrom_size == 0)
         return false;
 
     const size_t chunk_bytes = 512;
-    for (size_t offset = 0; offset < deuna_bootrom_size; offset += chunk_bytes) {
-        size_t len = deuna_bootrom_size - offset;
+    for (size_t offset = 0; offset < deqna_bootrom_size; offset += chunk_bytes) {
+        size_t len = deqna_bootrom_size - offset;
         if (len > chunk_bytes)
             len = chunk_bytes;
         if (!dma_write_bytes(dst_addr + static_cast<uint32_t>(offset),
-                             &deuna_bootrom[offset], len)) {
+                             &deqna_bootrom[offset], len)) {
             return false;
         }
     }
@@ -1238,30 +1266,30 @@ bool deuna_c::process_bootrom(uint32_t dst_addr)
     return true;
 }
 
-bool deuna_c::load_system_microcode(uint32_t udbb)
+bool deqna_c::load_system_microcode(uint32_t udbb)
 {
     if (udbb != 0) {
         if (transfer_internal_memory(udbb, true))
             return true;
     }
 
-    size_t word_count = deuna_bootrom_size / 2;
+    size_t word_count = deqna_bootrom_size / 2;
     size_t limit = word_count;
     if (limit > wcs_mem.size())
         limit = wcs_mem.size();
     for (size_t i = 0; i < limit; ++i) {
-        uint16_t word = static_cast<uint16_t>(deuna_bootrom[i * 2] |
-                                              (static_cast<uint16_t>(deuna_bootrom[i * 2 + 1]) << 8));
+        uint16_t word = static_cast<uint16_t>(deqna_bootrom[i * 2] |
+                                              (static_cast<uint16_t>(deqna_bootrom[i * 2 + 1]) << 8));
         wcs_mem[i] = word;
     }
 
     if (trace.value)
-        WARNING("DEUNA: LSM loaded %zu words of microcode", limit);
+        WARNING("DEQNA: LSM loaded %zu words of microcode", limit);
 
     return true;
 }
 
-bool deuna_c::transfer_internal_memory(uint32_t udbb, bool to_internal)
+bool deqna_c::transfer_internal_memory(uint32_t udbb, bool to_internal)
 {
     uint16_t hdr[4] = {0};
     if (!dma_read_words(udbb, hdr, 4))
@@ -1269,11 +1297,11 @@ bool deuna_c::transfer_internal_memory(uint32_t udbb, bool to_internal)
 
     uint16_t mem_addr = hdr[0];
     uint16_t wordcount = hdr[1];
-    uint32_t host_addr = make_addr(static_cast<uint16_t>(hdr[3] & 0x0003),
+    uint32_t host_addr = make_addr(static_cast<uint16_t>(hdr[3] & DEQNA_ADDR_HI_MASK),
                                    static_cast<uint16_t>(hdr[2] & 0177776));
 
     if (trace.value) {
-        WARNING("DEUNA: %s internal mem addr=%06o words=%u host=%08o",
+        WARNING("DEQNA: %s internal mem addr=%06o words=%u host=%08o",
                 to_internal ? "LIM" : "DIM",
                 mem_addr, wordcount, host_addr);
     }
@@ -1305,12 +1333,12 @@ bool deuna_c::transfer_internal_memory(uint32_t udbb, bool to_internal)
 }
 
 /*
- * deuna_c::log_pcbb_snapshot
+ * deqna_c::log_pcbb_snapshot
  * Purpose: dump DMA vs CPU-visible snapshots of PCBB and MAC bytes.
  * Behavior: reads PCBB words and the 6-byte MAC via both DMA and CPU paths.
  * Notes: intended for diagnosing mapping mismatches during GETCMD.
  */
-void deuna_c::log_pcbb_snapshot(const char *tag, uint32_t addr)
+void deqna_c::log_pcbb_snapshot(const char *tag, uint32_t addr)
 {
     uint16_t dma_words[4] = {0};
     uint16_t cpu_words[4] = {0};
@@ -1322,14 +1350,14 @@ void deuna_c::log_pcbb_snapshot(const char *tag, uint32_t addr)
     bool ok_dma_mac = dma_read_bytes(addr + 2, dma_mac, 6);
     bool ok_cpu_mac = cpu_read_bytes(addr + 2, cpu_mac, 6);
 
-    WARNING("DEUNA: %s PCBB@%08o dma=%s %06o %06o %06o %06o cpu=%s %06o %06o %06o %06o",
+    WARNING("DEQNA: %s PCBB@%08o dma=%s %06o %06o %06o %06o cpu=%s %06o %06o %06o %06o",
             tag, addr,
             ok_dma ? "ok" : "fail",
             dma_words[0], dma_words[1], dma_words[2], dma_words[3],
             ok_cpu ? "ok" : "fail",
             cpu_words[0], cpu_words[1], cpu_words[2], cpu_words[3]);
 
-    WARNING("DEUNA: %s MAC@%08o dma=%s %02x:%02x:%02x:%02x:%02x:%02x cpu=%s %02x:%02x:%02x:%02x:%02x:%02x",
+    WARNING("DEQNA: %s MAC@%08o dma=%s %02x:%02x:%02x:%02x:%02x:%02x cpu=%s %02x:%02x:%02x:%02x:%02x:%02x",
             tag, addr + 2,
             ok_dma_mac ? "ok" : "fail",
             dma_mac[0], dma_mac[1], dma_mac[2], dma_mac[3], dma_mac[4], dma_mac[5],
@@ -1339,23 +1367,23 @@ void deuna_c::log_pcbb_snapshot(const char *tag, uint32_t addr)
     if (ok_dma && ok_cpu &&
         (dma_words[0] != cpu_words[0] || dma_words[1] != cpu_words[1] ||
          dma_words[2] != cpu_words[2] || dma_words[3] != cpu_words[3])) {
-        WARNING("DEUNA: %s PCBB mismatch (DMA vs CPU)", tag);
+        WARNING("DEQNA: %s PCBB mismatch (DMA vs CPU)", tag);
     }
     if (ok_dma_mac && ok_cpu_mac &&
         memcmp(dma_mac, cpu_mac, sizeof(dma_mac)) != 0) {
-        WARNING("DEUNA: %s MAC mismatch (DMA vs CPU)", tag);
+        WARNING("DEQNA: %s MAC mismatch (DMA vs CPU)", tag);
     }
 }
 
 /*
- * deuna_c::make_addr
+ * deqna_c::make_addr
  * Purpose: build a PDP-11 physical address from high/low words.
- * Behavior: masks upper bits based on bus width (16/18-bit).
- * Notes: DEUNA uses 18-bit addressing by default.
+ * Behavior: masks upper bits based on bus width (16/18/22-bit).
+ * Notes: QBUS defaults to 22-bit addressing (6 high bits).
  */
-uint32_t deuna_c::make_addr(uint16_t hi, uint16_t lo) const
+uint32_t deqna_c::make_addr(uint16_t hi, uint16_t lo) const
 {
-    uint16_t mask = 0x0003;  // DEUNA uses 18-bit addressing (2 high bits)
+    uint16_t mask = DEQNA_ADDR_HI_MASK;
     if (qunibus) {
         if (qunibus->addr_width <= 16)
             mask = 0x0000;
@@ -1366,14 +1394,15 @@ uint32_t deuna_c::make_addr(uint16_t hi, uint16_t lo) const
 }
 
 /*
- * deuna_c::port_command
+ * deqna_c::port_command
  * Purpose: execute PCSR0 port commands from the driver.
  * Behavior: handles GETPCBB/GETCMD/START/STOP/etc and updates state.
  * Notes: sets PCSR0.DNI/PCEI and drives state transitions.
  */
-void deuna_c::port_command(uint16_t cmd)
+void deqna_c::port_command(uint16_t cmd)
 {
     uint16_t state = pcsr1 & PCSR1_STATE;
+    kick_sanity_timer();
 
     if (trace.value) {
         const char *cmdname = "?";
@@ -1388,13 +1417,13 @@ void deuna_c::port_command(uint16_t cmd)
         case CMD_HALT: cmdname = "HALT"; break;
         case CMD_STOP: cmdname = "STOP"; break;
         }
-        WARNING("DEUNA: port_command(%s/%03o) state=%03o pcsr0=%06o", cmdname, cmd, state, pcsr0);
+        WARNING("DEQNA: port_command(%s/%03o) state=%03o pcsr0=%06o", cmdname, cmd, state, pcsr0);
     }
 
     switch (cmd) {
     case CMD_PDMD:
         if (trace.value) {
-            WARNING("DEUNA: PDMD tdrb=%08o telen=%u trlen=%u txnext=%u",
+            WARNING("DEQNA: PDMD tdrb=%08o telen=%u trlen=%u txnext=%u",
                     tdrb, telen, trlen, txnext);
         }
         process_transmit(1);  // Process only one descriptor for PDMD
@@ -1409,7 +1438,7 @@ void deuna_c::port_command(uint16_t cmd)
         pcbb = (static_cast<uint32_t>(pcsr3) << 16) | pcsr2;
         pcsr0 |= PCSR0_DNI;
         if (trace.value)
-            WARNING("DEUNA: GETPCBB pcbb=%08o (pcsr2=%06o pcsr3=%06o) pcsr0=%06o", pcbb, pcsr2, pcsr3, pcsr0);
+            WARNING("DEQNA: GETPCBB pcbb=%08o (pcsr2=%06o pcsr3=%06o) pcsr0=%06o", pcbb, pcsr2, pcsr3, pcsr0);
         break;
     case CMD_SELFTEST:
         init_internal_memory();
@@ -1463,7 +1492,7 @@ void deuna_c::port_command(uint16_t cmd)
         {
             uint32_t boot_addr = (static_cast<uint32_t>(pcsr3) << 16) | (pcsr2 & 0177776);
             if (trace.value)
-                WARNING("DEUNA: BOOT requested, dest=%08o size=%u", boot_addr, deuna_bootrom_size);
+                WARNING("DEQNA: BOOT requested, dest=%08o size=%u", boot_addr, deqna_bootrom_size);
             if (boot_addr == 0 || !process_bootrom(boot_addr))
                 pcsr0 |= PCSR0_PCEI;
             else
@@ -1481,40 +1510,40 @@ void deuna_c::port_command(uint16_t cmd)
     pcsr0 &= ~PCSR0_PCMD;
 
     if (trace.value)
-        WARNING("DEUNA: port_command done, pcsr0=%06o", pcsr0);
+        WARNING("DEQNA: port_command done, pcsr0=%06o", pcsr0);
 
     update_intr();
 }
 
 /*
- * deuna_c::execute_command
+ * deqna_c::execute_command
  * Purpose: interpret and execute the PCB command block.
  * Behavior: reads PCB/UDW pointers and services function codes.
  * Notes: returns false on invalid PCB or DMA failure to signal PCEI.
  */
-bool deuna_c::execute_command(void)
+bool deqna_c::execute_command(void)
 {
     if (!dma_read_words(pcbb, pcb, 4)) {
-        WARNING("DEUNA: PCB read failed pcbb=%08o", pcbb);
+        WARNING("DEQNA: PCB read failed pcbb=%08o", pcbb);
         return false;
     }
 
     if (pcb[0] & 0177400) {
-        WARNING("DEUNA: PCB invalid pcbb0=%06o pcbb=%08o", pcb[0], pcbb);
+        WARNING("DEQNA: PCB invalid pcbb0=%06o pcbb=%08o", pcb[0], pcbb);
         return false;
     }
 
     if (trace.value) {
-        WARNING("DEUNA: PCB %06o %06o %06o %06o", pcb[0], pcb[1], pcb[2], pcb[3]);
+        WARNING("DEQNA: PCB %06o %06o %06o %06o", pcb[0], pcb[1], pcb[2], pcb[3]);
         log_pcbb_snapshot("pre-cmd", pcbb);
     }
 
     uint16_t fnc = pcb[0] & 0377;
     uint32_t udbb = 0;
     auto get_udb_addr = [&](uint32_t &out) -> bool {
-        if ((pcb[1] & 1) || (pcb[2] & 0374))
+        if ((pcb[1] & 1) || (pcb[2] & ~DEQNA_ADDR_HI_MASK))
             return false;
-        out = make_addr(pcb[2] & 0x0003, pcb[1] & 0177776);
+        out = make_addr(pcb[2] & DEQNA_ADDR_HI_MASK, pcb[1] & 0177776);
         return true;
     };
 
@@ -1523,9 +1552,9 @@ bool deuna_c::execute_command(void)
         break;
     case FC_RDPA:
         if (!mac_override && mac_is_zero(mac_addr))
-            memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
+            memcpy(mac_addr, DEQNA_DEFAULT_MAC, sizeof(mac_addr));
         if (trace.value) {
-            WARNING("DEUNA: FC_RDPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
+            WARNING("DEQNA: FC_RDPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
                     mac_addr[0], mac_addr[1], mac_addr[2],
                     mac_addr[3], mac_addr[4], mac_addr[5]);
         }
@@ -1540,7 +1569,7 @@ bool deuna_c::execute_command(void)
         break;
     case FC_RPA:
         if (trace.value) {
-            WARNING("DEUNA: FC_RPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
+            WARNING("DEQNA: FC_RPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
                     setup.macs[0][0], setup.macs[0][1], setup.macs[0][2],
                     setup.macs[0][3], setup.macs[0][4], setup.macs[0][5]);
         }
@@ -1553,7 +1582,7 @@ bool deuna_c::execute_command(void)
         if (trace.value) {
             uint8_t verify[6] = {0};
             if (dma_read_bytes(pcbb + 2, verify, 6)) {
-                WARNING("DEUNA: FC_RPA verify mem=%02x:%02x:%02x:%02x:%02x:%02x",
+                WARNING("DEQNA: FC_RPA verify mem=%02x:%02x:%02x:%02x:%02x:%02x",
                         verify[0], verify[1], verify[2],
                         verify[3], verify[4], verify[5]);
             }
@@ -1566,7 +1595,7 @@ bool deuna_c::execute_command(void)
             if (!dma_read_bytes(pcbb + 2, tmp, 6))
                 return false;
             if (trace.value) {
-                WARNING("DEUNA: FC_WPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                WARNING("DEQNA: FC_WPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
                         tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5]);
             }
             if (mac_is_zero(tmp)) {
@@ -1598,7 +1627,7 @@ bool deuna_c::execute_command(void)
             return false;
         if (!get_udb_addr(udbb))
             return false;
-        for (int i = 2; i < DEUNA_FILTER_MAX; ++i)
+        for (int i = 2; i < DEQNA_FILTER_MAX; ++i)
             memset(setup.macs[i], 0, 6);
         if (!dma_read_bytes(udbb, reinterpret_cast<uint8_t*>(&setup.macs[2]), mtlen * 6))
             return false;
@@ -1608,13 +1637,13 @@ bool deuna_c::execute_command(void)
         break;
     }
     case FC_RRF:
-        if ((pcb[1] & 1) || (pcb[2] & 0374))
+        if ((pcb[1] & 1) || (pcb[2] & ~DEQNA_ADDR_HI_MASK))
             return false;
         udb[0] = tdrb & 0177776;
-        udb[1] = static_cast<uint16_t>((telen << 8) + ((tdrb >> 16) & 3));
+        udb[1] = static_cast<uint16_t>((telen << 8) + ((tdrb >> 16) & DEQNA_ADDR_HI_MASK));
         udb[2] = static_cast<uint16_t>(trlen);
         udb[3] = rdrb & 0177776;
-        udb[4] = static_cast<uint16_t>((relen << 8) + ((rdrb >> 16) & 3));
+        udb[4] = static_cast<uint16_t>((relen << 8) + ((rdrb >> 16) & DEQNA_ADDR_HI_MASK));
         udb[5] = static_cast<uint16_t>(rrlen);
         if (!get_udb_addr(udbb))
             return false;
@@ -1622,7 +1651,7 @@ bool deuna_c::execute_command(void)
             return false;
         break;
     case FC_WRF:
-        if ((pcb[1] & 1) || (pcb[2] & 0374))
+        if ((pcb[1] & 1) || (pcb[2] & ~DEQNA_ADDR_HI_MASK))
             return false;
         if ((pcsr1 & PCSR1_STATE) == STATE_RUNNING)
             return false;
@@ -1630,19 +1659,20 @@ bool deuna_c::execute_command(void)
             return false;
         if (!dma_read_words(udbb, udb, 6))
             return false;
-        if ((udb[0] & 1) || (udb[1] & 0374) || (udb[3] & 1) || (udb[4] & 0374) || (udb[5] < 2))
+        if ((udb[0] & 1) || (udb[3] & 1) || (udb[5] < 2) ||
+            (udb[1] & 0x00c0) || (udb[4] & 0x00c0))
             return false;
-        tdrb = ((udb[1] & 3) << 16) + (udb[0] & 0177776);
+        tdrb = ((udb[1] & DEQNA_ADDR_HI_MASK) << 16) + (udb[0] & 0177776);
         telen = (udb[1] >> 8) & 0377;
         trlen = udb[2];
-        rdrb = ((udb[4] & 3) << 16) + (udb[3] & 0177776);
+        rdrb = ((udb[4] & DEQNA_ADDR_HI_MASK) << 16) + (udb[3] & 0177776);
         relen = (udb[4] >> 8) & 0377;
         rrlen = udb[5];
         rxnext = 0;
         txnext = 0;
         if (trace.value) {
-            WARNING("DEUNA: FC_WRF tx tdrb=%08o telen=%u trlen=%u", tdrb, telen, trlen);
-            WARNING("DEUNA: FC_WRF rx rdrb=%08o relen=%u rrlen=%u", rdrb, relen, rrlen);
+            WARNING("DEQNA: FC_WRF tx tdrb=%08o telen=%u trlen=%u", tdrb, telen, trlen);
+            WARNING("DEQNA: FC_WRF rx rdrb=%08o relen=%u rrlen=%u", rdrb, relen, rrlen);
         }
         break;
     case FC_RDCTR:
@@ -1748,7 +1778,7 @@ bool deuna_c::execute_command(void)
         uint16_t pltlen = pcb[3];
         if (!get_udb_addr(udbb))
             return false;
-        if (pltlen > DEUNA_UDB_WORDS)
+        if (pltlen > DEQNA_UDB_WORDS)
             return false;
         if (!dma_read_words(udbb, udb, pltlen))
             return false;
@@ -1794,12 +1824,12 @@ bool deuna_c::execute_command(void)
 }
 
 /*
- * deuna_c::enqueue_readq
+ * deqna_c::enqueue_readq
  * Purpose: stage a received Ethernet frame for later RX processing.
  * Behavior: copies data into the read queue with length and flags.
  * Notes: queue overflow increments loss counters.
  */
-void deuna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
+void deqna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
 {
     bool dropped = false;
     {
@@ -1837,12 +1867,12 @@ void deuna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
 }
 
 /*
- * deuna_c::accept_packet
+ * deqna_c::accept_packet
  * Purpose: decide whether a host frame should be delivered to the emulated NIC.
  * Behavior: checks length, broadcast/multicast rules, and filter setup.
  * Notes: assumes data points to a full Ethernet frame.
  */
-bool deuna_c::accept_packet(const uint8_t *data, size_t len) const
+bool deqna_c::accept_packet(const uint8_t *data, size_t len) const
 {
     if (!data || len < 6)
         return false;
@@ -1869,12 +1899,12 @@ bool deuna_c::accept_packet(const uint8_t *data, size_t len) const
 }
 
 /*
- * deuna_c::update_pcap_filter
+ * deqna_c::update_pcap_filter
  * Purpose: configure libpcap filter based on current setup and mode.
  * Behavior: builds and applies a filter string or falls back to promisc.
  * Notes: failures are logged but do not abort the device.
  */
-void deuna_c::update_pcap_filter(void)
+void deqna_c::update_pcap_filter(void)
 {
 #ifdef HAVE_PCAP
     if (!pcap.is_open())
@@ -1882,7 +1912,7 @@ void deuna_c::update_pcap_filter(void)
 
     if (setup.promiscuous) {
         if (!pcap.set_filter("ip or not ip"))
-            WARNING("DEUNA: pcap filter set failed: %s", pcap.last_error().c_str());
+            WARNING("DEQNA: pcap filter set failed: %s", pcap.last_error().c_str());
         return;
     }
 
@@ -1915,17 +1945,17 @@ void deuna_c::update_pcap_filter(void)
         filter = "ip or not ip";
 
     if (!pcap.set_filter(filter))
-        WARNING("DEUNA: pcap filter set failed: %s", pcap.last_error().c_str());
+        WARNING("DEQNA: pcap filter set failed: %s", pcap.last_error().c_str());
 #endif
 }
 
 /*
- * deuna_c::process_receive
+ * deqna_c::process_receive
  * Purpose: move queued frames into the RX descriptor ring.
  * Behavior: pulls from read_queue, DMA-writes buffers, updates status.
  * Notes: only runs when state is RUNNING; returns false on ring errors.
  */
-bool deuna_c::process_receive(void)
+bool deqna_c::process_receive(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
@@ -1984,7 +2014,7 @@ bool deuna_c::process_receive(void)
         }
 
         uint16_t slen = rxhdr[0];
-        uint32_t segb = make_addr(rxhdr[2] & 0x0003, rxhdr[1]);
+        uint32_t segb = make_addr(rxhdr[2] & DEQNA_ADDR_HI_MASK, rxhdr[1]);
 
         rxhdr[2] &= static_cast<uint16_t>(~(RXR_FRAM | RXR_OFLO | RXR_CRC | RXR_STF | RXR_ENF | RXR_ERRS));
         rxhdr[3] &= static_cast<uint16_t>(~(RXR_BUFL | RXR_UBTO | RXR_NCHN | RXR_OVRN | RXR_MLEN));
@@ -2032,6 +2062,7 @@ bool deuna_c::process_receive(void)
             pcsr0 |= PCSR0_RXI;
             stat_rx_frames.value = stats.frecv;
             stat_rx_errors.value = stats.frecve + stats.rlossl;
+            kick_sanity_timer();
 
             current_item.reset();
         }
@@ -2076,12 +2107,12 @@ bool deuna_c::process_receive(void)
 }
 
 /*
- * deuna_c::process_transmit
+ * deqna_c::process_transmit
  * Purpose: send frames from the TX descriptor ring to the host.
  * Behavior: reads descriptors, DMA-reads buffers, and injects via pcap.
  * Notes: updates TX stats and sets PCSR0 flags on errors.
  */
-bool deuna_c::process_transmit(unsigned max_descriptors)
+bool deqna_c::process_transmit(unsigned max_descriptors)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
@@ -2121,7 +2152,7 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         return false;
     };
     if (trace.value && tx_not_owned_squelch < 4) {
-        WARNING("DEUNA: TX start tdrb=%08o telen=%u trlen=%u txnext=%u limit=%u",
+        WARNING("DEQNA: TX start tdrb=%08o telen=%u trlen=%u txnext=%u limit=%u",
                 tdrb, telen, trlen, txnext, limit);
     }
 
@@ -2142,7 +2173,7 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
             unsigned owned_index = 0;
             if (find_owned_desc(owned_index)) {
                 if (trace.value && tx_not_owned_squelch < 4) {
-                    WARNING("DEUNA: TX desc not owned at txnext=%u, jumping to owned=%u",
+                    WARNING("DEQNA: TX desc not owned at txnext=%u, jumping to owned=%u",
                             txnext, owned_index);
                 }
                 txnext = owned_index;
@@ -2150,25 +2181,25 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
                 continue;
             }
             if (trace.value && tx_ring_dump_squelch < 2) {
-                WARNING("DEUNA: TX ring has no owned descriptors, dumping ring");
+                WARNING("DEQNA: TX ring has no owned descriptors, dumping ring");
                 dump_tx_ring(8);
                 tx_ring_dump_squelch++;
             }
             if (trace.value && tx_not_owned_squelch < 4) {
-                WARNING("DEUNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
+                WARNING("DEQNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
                         desc_addr, txhdr[0], txhdr[1], txhdr[2], txhdr[3]);
-                WARNING("DEUNA: TX desc not owned, stopping at txnext=%u", txnext);
+                WARNING("DEQNA: TX desc not owned, stopping at txnext=%u", txnext);
                 tx_not_owned_squelch++;
             }
             break;
         }
         if (trace.value) {
-            WARNING("DEUNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
+            WARNING("DEQNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
                     desc_addr, txhdr[0], txhdr[1], txhdr[2], txhdr[3]);
         }
 
         uint16_t slen = txhdr[0];
-        uint32_t segb = make_addr(txhdr[2] & 0x0003, txhdr[1]);
+        uint32_t segb = make_addr(txhdr[2] & DEQNA_ADDR_HI_MASK, txhdr[1]);
         size_t wlen = slen;
 
         txhdr[2] &= static_cast<uint16_t>(~(TXR_ERRS | TXR_MTCH | TXR_MORE | TXR_ONE | TXR_DEF));
@@ -2216,9 +2247,9 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
             } else {
                 if (!pcap.is_open() || !pcap.send(write_buffer.msg.data(), write_buffer.len)) {
                     if (!pcap.is_open()) {
-                        WARNING("DEUNA: TX pcap not open");
+                        WARNING("DEQNA: TX pcap not open");
                     } else {
-                        WARNING("DEUNA: TX pcap send failed: %s", pcap.last_error().c_str());
+                        WARNING("DEQNA: TX pcap send failed: %s", pcap.last_error().c_str());
                     }
                     txhdr[3] |= TXR_RTRY;
                     txhdr[2] |= TXR_ERRS;
@@ -2263,6 +2294,7 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
 
             stat_tx_frames.value = stats.ftrans;
             stat_tx_errors.value = stats.ftransa;
+            kick_sanity_timer();
         }
 
         txhdr[2] &= ~TXR_OWN;
@@ -2277,7 +2309,7 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         }
 
         if (trace.value) {
-            WARNING("DEUNA: TX desc writeback addr=%08o w2=%06o w3=%06o",
+            WARNING("DEQNA: TX desc writeback addr=%08o w2=%06o w3=%06o",
                     desc_addr, txhdr[2], txhdr[3]);
         }
 
@@ -2297,15 +2329,15 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
 }
 
 /*
- * deuna_c::dump_tx_ring
+ * deqna_c::dump_tx_ring
  * Purpose: trace TX ring descriptor ownership and headers for debugging.
  * Behavior: reads up to max_entries descriptors and logs their header words.
  * Notes: trace-only diagnostic to correlate driver-owned vs device-owned slots.
  */
-void deuna_c::dump_tx_ring(unsigned max_entries)
+void deqna_c::dump_tx_ring(unsigned max_entries)
 {
     if (trlen == 0 || telen < 4) {
-        WARNING("DEUNA: TX ring dump skipped (trlen=%u telen=%u)", trlen, telen);
+        WARNING("DEQNA: TX ring dump skipped (trlen=%u telen=%u)", trlen, telen);
         return;
     }
 
@@ -2314,21 +2346,35 @@ void deuna_c::dump_tx_ring(unsigned max_entries)
         uint32_t desc_addr = tdrb + (telen * 2) * i;
         uint16_t words[4] = {0};
         if (!desc_read_words(desc_addr, words, 4)) {
-            WARNING("DEUNA: TX ring[%u] addr=%08o read failed", i, desc_addr);
+            WARNING("DEQNA: TX ring[%u] addr=%08o read failed", i, desc_addr);
             continue;
         }
-        WARNING("DEUNA: TX ring[%u] addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
+        WARNING("DEQNA: TX ring[%u] addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
                 i, desc_addr, words[0], words[1], words[2], words[3]);
     }
 }
 
 /*
- * deuna_c::service_timers
- * Purpose: maintain DEUNA stats timebase.
- * Behavior: updates seconds counter based on monotonic time.
+ * deqna_c::kick_sanity_timer
+ * Purpose: reset the host inactivity watchdog deadline.
+ * Behavior: updates the last-kick timestamp when sanity is enabled.
+ * Notes: called on host-visible activity (commands, TX/RX completion).
+ */
+void deqna_c::kick_sanity_timer(void)
+{
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    if (!sanity.enabled || sanity.timeout_ns == 0)
+        return;
+    sanity.last_kick_ns = timeout_c::abstime_ns();
+}
+
+/*
+ * deqna_c::service_timers
+ * Purpose: maintain DEQNA stats timebase.
+ * Behavior: updates seconds counter and checks sanity timer.
  * Notes: invoked in RX thread to amortize timer work.
  */
-void deuna_c::service_timers(void)
+void deqna_c::service_timers(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
     uint64_t now = timeout_c::abstime_ns();
@@ -2340,18 +2386,29 @@ void deuna_c::service_timers(void)
         stats.secs += static_cast<uint32_t>(elapsed_ns / 1000000000ULL);
         stats.last_update_ns = now;
     }
+
+    if (sanity.enabled && sanity.timeout_ns > 0) {
+        if (sanity.last_kick_ns == 0)
+            sanity.last_kick_ns = now;
+        if (now - sanity.last_kick_ns >= sanity.timeout_ns) {
+            WARNING("DEQNA: sanity timer expired");
+            sanity.tripped = true;
+            reset_controller();
+            return;
+        }
+    }
 }
 
 /*
- * deuna_c::worker
+ * deqna_c::worker
  * Purpose: worker thread entrypoint dispatcher.
  * Behavior: routes instance 0 to RX and instance 1 to TX.
  * Notes: trace is emitted here to tag worker startup.
  */
-void deuna_c::worker(unsigned instance)
+void deqna_c::worker(unsigned instance)
 {
     if (trace.value)
-        WARNING("DEUNA: %s worker(%u) start", DEUNA_VERSION, instance);
+        WARNING("DEQNA: %s worker(%u) start", DEQNA_VERSION, instance);
     if (instance == 0)
         worker_rx();
     else
@@ -2359,12 +2416,12 @@ void deuna_c::worker(unsigned instance)
 }
 
 /*
- * deuna_c::worker_rx
+ * deqna_c::worker_rx
  * Purpose: RX thread loop for pcap polling and receive ring processing.
  * Behavior: polls pcap, enqueues frames, runs process_receive, and services timers.
  * Notes: runs at RT priority; keep per-iteration work short.
  */
-void deuna_c::worker_rx(void)
+void deqna_c::worker_rx(void)
 {
     worker_init_realtime_priority(rt_device);
 
@@ -2384,7 +2441,7 @@ void deuna_c::worker_rx(void)
         size_t len = 0;
         if (pcap.is_open()) {
             if (!pcap.poll(pkt_buf, sizeof(pkt_buf), &len)) {
-                WARNING("DEUNA: pcap poll error: %s", pcap.last_error().c_str());
+                WARNING("DEQNA: pcap poll error: %s", pcap.last_error().c_str());
                 timeout_c::wait_ms(10);
                 continue;
             }
@@ -2405,12 +2462,12 @@ void deuna_c::worker_rx(void)
 }
 
 /*
- * deuna_c::worker_tx
+ * deqna_c::worker_tx
  * Purpose: TX thread loop for descriptor-driven transmit and command processing.
  * Behavior: processes queued register writes and port commands, then handles TX.
  * Notes: uses condition variable for low-latency wakeup on new commands.
  */
-void deuna_c::worker_tx(void)
+void deqna_c::worker_tx(void)
 {
     worker_init_realtime_priority(rt_device);
 

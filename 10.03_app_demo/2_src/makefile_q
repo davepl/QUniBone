@@ -135,6 +135,7 @@ OBJECTS = $(OBJDIR)/application.o	\
 	$(OBJDIR)/rs232.o \
 	$(OBJDIR)/rs232adapter.o \
 	$(OBJDIR)/dl11w.o \
+	$(OBJDIR)/deqna.o \
 	$(OBJDIR)/delqa.o \
 	$(OBJDIR)/pcap_bridge.o \
 	$(OBJDIR)/storageimage.o	\
@@ -323,6 +324,9 @@ $(OBJDIR)/rs232adapter.o :  $(DEVICE_SRC_DIR)/rs232adapter.cpp $(DEVICE_SRC_DIR)
 	$(CC) $(CCFLAGS) $< -o $@
 
 $(OBJDIR)/dl11w.o :  $(DEVICE_SRC_DIR)/dl11w.cpp $(DEVICE_SRC_DIR)/dl11w.hpp
+	$(CC) $(CCFLAGS) $< -o $@
+
+$(OBJDIR)/deqna.o :  $(DEVICE_SRC_DIR)/deqna.cpp $(DEVICE_SRC_DIR)/deqna.hpp $(DEVICE_SRC_DIR)/deqna_bootrom.h
 	$(CC) $(CCFLAGS) $< -o $@
 
 $(OBJDIR)/delqa.o :  $(DEVICE_SRC_DIR)/delqa.cpp $(DEVICE_SRC_DIR)/delqa.hpp $(DEVICE_SRC_DIR)/delqa_regs.h
