@@ -298,10 +298,12 @@ private:
      *       0 = setup (ESETUP + length)
      *       1 = loopback (status 0x2000 + length)
      *       2 = normal receive (length only in status)
+     * enqueue_time: Timestamp when packet was enqueued (for loopback delay)
      */
     struct queue_item {
         int type = 0; // 0=setup, 1=loopback, 2=normal
         packet_buffer packet;
+        std::chrono::steady_clock::time_point enqueue_time;
     };
 
     /*

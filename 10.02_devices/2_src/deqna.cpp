@@ -3,13 +3,27 @@
  * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
  * Contributed under the GPL2 License
  *
- * This is a clean-room implementation based on:
+ * This is a scratch implementation based on:
  *   - DEC DEQNA hardware documentation
  *   - DEQNA User's Guide (EK-DEQNA-UG)
  *   - Q-bus specification
+ *   - Reading the OpenSIMH code when mine didn't work to see what it did
  *
  * This file is part of the QUniBone project, licensed under GPLv2.
  *
+ *   May be based in part on the DEQNA implementation in the OpenSIMH project:
+ * 
+ *   Copyright (c) 1993-2008, Robert M Supnik
+ *   Permission is hereby granted, free of charge, to any person obtaining a
+ *   copy of this software and associated documentation files (the "Software"),
+ *   to deal in the Software without restriction, including without limitation
+ *   the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ *   and/or sell copies of the Software, and to permit persons to whom the
+ *   Software is furnished to do so, subject to the following conditions:
+ *
+ *   The above copyright notice and this permission notice shall be included in
+ *   all copies or substantial portions of the Software.
+ * 
  * IMPLEMENTATION NOTES:
  * ---------------------
  * This file implements the DEQNA (M7504) Ethernet controller emulation.
@@ -124,7 +138,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v033";  // First RSX boot attempt
+static const char *DEQNA_VERSION = "v034";  // Setup echo matches wire data
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -1311,6 +1325,7 @@ void deqna_c::enqueue_readq(int type, const uint8_t *data, size_t len, int statu
     item.packet.len = len;
     item.packet.used = 0;
     item.packet.status = status;
+    item.enqueue_time = std::chrono::steady_clock::now();
     read_queue.push_back(std::move(item));
 }
 
@@ -1472,11 +1487,38 @@ bool deqna_c::process_rbdl(void)
             return true;
         }
 
+        // For loopback/setup packets (type 0 or 1), enforce a minimum delay
+        // before delivery. Real DEQNA hardware has ~400us delay. SIMH uses
+        // sim_activate_after_abs(..., 400) for 400us.
+        // Use 1ms as a reasonable compromise for real-time system.
+        if (queue_size > 0 && front_type < 2) {
+            std::chrono::steady_clock::time_point enqueue_time;
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex);
+                if (!read_queue.empty())
+                    enqueue_time = read_queue.front().enqueue_time;
+            }
+            auto elapsed = std::chrono::steady_clock::now() - enqueue_time;
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+            if (elapsed_us < 500) {
+                // Not enough time has passed, wait for next worker iteration
+                return true;
+            }
+        }
         if (queue_size == 0) {
             break;
         }
         uint16_t words[QE_RING_WORDS] = {0};
-        // DEQNA doesn't require a pre-write ownership flag for RX descriptors.
+        
+        // Write 0xFFFF to word 0 (flag word) to claim the descriptor.
+        // SIMH does this and RSX may depend on it.
+        words[0] = 0xFFFF;
+        if (!desc_write_words(cur_ba, &words[0], 1)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(QNA_CSR_RL, 0);
+            return false;
+        }
+        
         for (size_t i = 1; i < QE_RING_WORDS; ++i) {
             if (!desc_read_words(cur_ba + 2 + static_cast<uint32_t>((i - 1) * 2), &words[i], 1)) {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1581,11 +1623,9 @@ bool deqna_c::process_rbdl(void)
         if (overflow)
             item.packet.used = item.packet.len;
 
-        // UNCONDITIONAL log to verify code path
-        WARNING("DEQNA: RX deliver type=%d len=%zu to addr=%08o desc_ba=%06o",
-                item.type, rbl, address, cur_ba);
-
         bool dma_failed = false;
+        WARNING("DEQNA: RX deliver type=%d rbl=%zu to addr=%08o blen=%d", 
+                item.type, rbl, address, b_length);
         if (!dma_write_bytes(address, rbuf, rbl)) {
             // Treat RX buffer DMA failure as a dropped packet so we can still
             // write status back to the descriptor instead of raising NI.
@@ -1595,6 +1635,18 @@ bool deqna_c::process_rbdl(void)
             WARNING("DEQNA: RX DMA write failed at addr=%08o", address);
         }
 
+        // DEQNA hardware quirk: write 0xC000 word after setup packet data
+        // This is documented in SIMH as "Strange DEQNA behavior"
+        // Only write if buffer is small enough (b_length <= rbl + 2)
+        if (item.type == 0 && !dma_failed && b_length <= rbl + 2) {
+            uint16_t qdtc_chip_extra = 0xC000;
+            if (!dma_write_words(address + rbl, &qdtc_chip_extra, 1)) {
+                WARNING("DEQNA: Failed to write 0xC000 quirk at addr=%08o", address + rbl);
+            } else {
+                WARNING("DEQNA: Wrote 0xC000 quirk at addr=%08o", address + rbl);
+            }
+        }
+
         uint16_t status1 = 0;
         uint16_t rbl_status = static_cast<uint16_t>(rbl & 0xFFFF);
         switch (item.type) {
@@ -1602,14 +1654,6 @@ bool deqna_c::process_rbdl(void)
             stats.setup++;
             // Use a constant 0x2700 for setup status1 (ESETUP + RBL 10:8 = 7).
             status1 = static_cast<uint16_t>(QE_ESETUP | 0x0700);
-            // DEQNA hardware quirk: write 0xC000 word after setup packet data.
-            // This is documented as "Strange DEQNA behavior" in SIMH.
-            // RSX DECnet driver may depend on this behavior.   Kudos to whomever
-            // figured this out the first time, it burned me for days.
-            if (b_length >= rbl + 2) {
-                uint16_t qdtc_chip_extra = 0xC000;
-                dma_write_bytes(address + rbl, reinterpret_cast<uint8_t*>(&qdtc_chip_extra), 2);
-            }
             break;
         case 1:
             stats.loop++;
@@ -1654,10 +1698,9 @@ bool deqna_c::process_rbdl(void)
         if (loss)
             words[4] |= QE_OVF;
 
-        if (trace.value) {
-            DEBUG("DEQNA: RX write status words4=%06o words5=%06o to %06o",
-                    words[4], words[5], cur_ba + 8);
-        }
+        // UNCONDITIONAL log for debugging
+        WARNING("DEQNA: RX status type=%d words4=%06o words5=%06o to desc=%06o",
+                item.type, words[4], words[5], cur_ba + 8);
 
         if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1775,11 +1818,17 @@ void deqna_c::write_callback(int status)
         len_snapshot = write_buffer.len;
     }
     const uint16_t TDR = static_cast<uint16_t>(100 + len_snapshot * 8);
-    uint16_t write_success[2] = {0x2000, static_cast<uint16_t>(TDR & 0x03FF)};
+    // TX status word 1: 0x0000 = used, last segment, no errors
+    // TX status word 2: TDR (Time Domain Reflectometry) value
+    uint16_t write_success[2] = {0x0000, static_cast<uint16_t>(TDR & 0x03FF)};
     uint16_t write_failure[2] = {QNA_DSC_C, static_cast<uint16_t>(TDR & 0x03FF)};
 
     stats.xmit++;
     stat_tx_frames.value = stats.xmit;
+
+    WARNING("DEQNA: TX callback status=%d words4=%06o words5=%06o to desc=%06o",
+            status, (status == 0) ? write_success[0] : write_failure[0],
+            (status == 0) ? write_success[1] : write_failure[1], cur_ba + 8);
 
     // Write status words back to descriptor
     if (!desc_write_words(cur_ba + 8, (status == 0) ? write_success : write_failure, 2)) {
@@ -1937,25 +1986,25 @@ bool deqna_c::process_xbdl(void)
 
             if (loopback || setup_packet) {
                 bool enqueued = false;
-                uint16_t write_success[2] = {0x2000, 1};
+                // TX status: 0x0000 = used, last segment, no errors
+                // For loopback, SIMH sets QE_FAIL (0x0100) as "heartbeat check failure"
+                uint16_t write_success[2] = {0x0000, 0x0001};
                 if (setup_packet) {
                     process_setup(words[3]);
                     // Setup packets force loopback regardless of CSR loopback state.
-                    // Modify the response to have all even bytes to work around driver bugs
-                    // that might use packet data as addresses.
-                    std::vector<uint8_t> modified_response = write_buffer.msg;
-                    for (size_t i = 0; i < modified_response.size(); ++i) {
-                        modified_response[i] &= ~1;  // Clear low bit to make even
-                    }
-                    enqueue_readq(0, modified_response.data(), write_buffer.len, 0);
+                    enqueue_readq(0, write_buffer.msg.data(), write_buffer.len, 0);
                     enqueued = true;
-                    write_success[0] = 0x200C;
+                    // Setup TX status: word1=0x0000, word2=0x0860 (per SIMH)
+                    write_success[0] = 0x0000;
                     write_success[1] = 0x0860;
                 } else {
                     enqueue_readq(1, write_buffer.msg.data(), write_buffer.len, 0);
                     enqueued = true;
-                    write_success[0] |= QE_FAIL;
+                    // Loopback TX status: set FAIL bit (heartbeat check failure)
+                    write_success[0] = QE_FAIL;
                 }
+                WARNING("DEQNA: TX loopback/setup status words4=%06o words5=%06o to desc=%06o",
+                        write_success[0], write_success[1], cur_ba + 8);
                 if (!desc_write_words(cur_ba + 8, write_success, 2)) {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
                     nxm_error();
