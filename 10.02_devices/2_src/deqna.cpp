@@ -138,7 +138,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v034";  // Setup echo matches wire data
+static const char *DEQNA_VERSION = "v036";  // IL is active-low; setup RX status is 0x2700
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -390,6 +390,8 @@ bool deqna_c::on_before_install(void)
     ERROR("DEQNA: libpcap support not compiled in - install libpcap-dev and rebuild with HAVE_PCAP");
     return false;
 #else
+    INFO("DEQNA: emulation %s", DEQNA_VERSION);
+
     if (ifname.value.empty()) {
         ERROR("DEQNA: ifname must be set");
         return false;
@@ -1239,6 +1241,21 @@ bool deqna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
 {
     if (len == 0)
         return true;
+
+    /* Debug: Log DMA writes for setup packets and suspicious lengths */
+    if (trace.value && len <= 256) {
+        std::string h;
+        size_t dump = (len > 16) ? 16 : len;
+        char tmp[8];
+        for (size_t i = 0; i < dump; ++i) {
+            snprintf(tmp, sizeof(tmp), "%02x", buffer[i]);
+            h += tmp;
+        }
+        DEBUG("DEQNA: DMA WRITE addr=%08o len=%zu data_prefix=%s", addr, len, h.c_str());
+    }
+
+    if (trace.value && (addr & 1))
+        DEBUG("DEQNA: DMA WRITE odd addr=%08o len=%zu", addr, len);
     uint64_t addr64 = addr;
     uint64_t byte_count = static_cast<uint64_t>(len);
     uint64_t max = qunibus->addr_space_byte_count;
@@ -1326,6 +1343,29 @@ void deqna_c::enqueue_readq(int type, const uint8_t *data, size_t len, int statu
     item.packet.used = 0;
     item.packet.status = status;
     item.enqueue_time = std::chrono::steady_clock::now();
+
+    /* Debug: For loopback and normal packets, log a short hexdump for correlation */
+    if (trace.value && (type == 1 || type == 2) && len > 0) {
+        std::string hexdump;
+        size_t dump_len = (len > 64) ? 64 : len;
+        char tmp[8];
+        for (size_t i = 0; i < dump_len; ++i) {
+            snprintf(tmp, sizeof(tmp), "%02x", data[i]);
+            hexdump += tmp;
+            if (((i + 1) % 8) == 0) hexdump += ' ';
+        }
+        DEBUG("DEQNA: ENQ DBG type=%d len=%zu data=%s", type, len, hexdump.c_str());
+
+        /* If this looks like DECnet (EtherType 0x6003) then snapshot rings */
+        if (type == 2 && len >= 14) {
+            uint16_t ethertype = static_cast<uint16_t>((data[12] << 8) | data[13]);
+            if (ethertype == 0x6003) {
+                DEBUG("DEQNA: DECnet packet detected (ethertype=0x6003) - snapshotting rings");
+                dump_descriptor_rings("DECnet enqueued");
+            }
+        }
+    }
+
     read_queue.push_back(std::move(item));
 }
 
@@ -1349,14 +1389,8 @@ bool deqna_c::dispatch_rbdl(void)
 {
     uint32_t cur_ba = 0;
     uint16_t csr_snapshot = 0;
-    size_t queue_size = 0;
-    {
-        std::lock_guard<std::mutex> queue_lock(queue_mutex);
-        queue_size = read_queue.size();
-    }
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        // Clear RL and recalculate rbdl_ba from base registers
         csr_set_clr(0, QNA_CSR_RL);
         rbdl_ba = make_addr(rbdl[1], static_cast<uint16_t>(rbdl[0] & ~1u));
         cur_ba = rbdl_ba;
@@ -1366,39 +1400,26 @@ bool deqna_c::dispatch_rbdl(void)
         return false;
 
     if (trace.value) {
-        DEBUG("DEQNA: RX list dispatch at %06o (csr=%06o queue=%zu)",
-                cur_ba, csr_snapshot, queue_size);
-        DEBUG("DEQNA: RX list dispatch after RL clear at %06o (csr=%06o)",
-                cur_ba, csr_snapshot);
-    }
-
-    // Only read the descriptor in dispatch, don't write 0xFFFF yet
-    uint16_t words[4] = {0};
-    for (size_t i = 0; i < 4; ++i) {
-        if (!desc_read_words(cur_ba + static_cast<uint32_t>(i * 2), &words[i], 1)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_RL, 0);  // Mark list invalid on NXM
-            return false;
+        size_t queue_size = 0;
+        {
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
+            queue_size = read_queue.size();
         }
+        DEBUG("DEQNA: RX list dispatch at %06o (csr=%06o queue=%zu)",
+              cur_ba, csr_snapshot, queue_size);
     }
 
-    if (trace.value) {
-        DEBUG("DEQNA: RX dispatch read words0=%06o words1=%06o words2=%06o words3=%06o",
-                words[0], words[1], words[2], words[3]);
-    }
-
-    // Process any waiting packets in receive queue.
-    // Setup/loopback packets (types 0,1) can be processed without RE.
-    // Normal packets (type 2) require RE=1.
+    // If packets are queued (or setup/loopback is pending), process immediately.
+    // Otherwise the RX worker will return quickly on the next iteration.
     bool do_process = false;
-    bool has_loopback = false;
+    int front_type = 2;
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
         do_process = !read_queue.empty();
-        if (do_process && read_queue.front().type < 2)
-            has_loopback = true;
+        if (do_process)
+            front_type = read_queue.front().type;
     }
-    if (do_process && (has_loopback || rx_ready()))
+    if (do_process && (front_type < 2 || rx_ready()))
         return process_rbdl();
 
     return true;
@@ -1445,120 +1466,94 @@ bool deqna_c::process_rbdl(void)
     // Serialize concurrent calls from TX and RX threads
     std::lock_guard<std::mutex> process_lock(rx_process_mutex);
 
-    // Check if RX list is valid (like DEUNA checks STATE_RUNNING)
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         if (csr & QNA_CSR_RL)
-            return false;  // RX list invalid
-    }
-
-    // Check if queue has packets to deliver
-    {
-        std::lock_guard<std::mutex> queue_lock(queue_mutex);
-        if (read_queue.empty())
             return false;
     }
 
     bool ri_pending = false;
+    unsigned processed = 0;
+    const unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 0;
+
     while (true) {
-        uint32_t cur_ba = 0;
-        size_t queue_size = 0;
-        uint16_t csr_snapshot = 0;
-        int front_type = 2;  // Default to normal packet type
+        int front_type = 2;
         {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
-            queue_size = read_queue.size();
-            if (!read_queue.empty())
-                front_type = read_queue.front().type;
+            if (read_queue.empty())
+                break;
+            front_type = read_queue.front().type;
         }
+
+        uint32_t cur_ba = 0;
+        uint16_t csr_snapshot = 0;
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             cur_ba = rbdl_ba;
             csr_snapshot = csr;
         }
 
-        // Check if we can process the next packet
-        // Setup (type 0) and loopback (type 1) bypass RE check - they're internal
-        // Normal packets (type 2) require RE=1
-        if (queue_size > 0 && front_type == 2 && !rx_ready()) {
-            if (trace.value) {
-                DEBUG("DEQNA: RX process blocked (RE=0, normal packet) csr=%06o", csr_snapshot);
-            }
+        // Normal packets require the receiver to be enabled. Setup and loopback
+        // packets are internal and bypass RE.
+        if (front_type == 2 && !rx_ready()) {
+            if (trace.value)
+                DEBUG("DEQNA: RX blocked (RE=0) csr=%06o", csr_snapshot);
             return true;
         }
 
-        // For loopback/setup packets (type 0 or 1), enforce a minimum delay
-        // before delivery. Real DEQNA hardware has ~400us delay. SIMH uses
-        // sim_activate_after_abs(..., 400) for 400us.
-        // Use 1ms as a reasonable compromise for real-time system.
-        if (queue_size > 0 && front_type < 2) {
+        // Real QNA hardware delays setup/loopback delivery by ~400us.
+        if (front_type < 2) {
             std::chrono::steady_clock::time_point enqueue_time;
             {
                 std::lock_guard<std::mutex> queue_lock(queue_mutex);
                 if (!read_queue.empty())
                     enqueue_time = read_queue.front().enqueue_time;
             }
-            auto elapsed = std::chrono::steady_clock::now() - enqueue_time;
-            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
-            if (elapsed_us < 500) {
-                // Not enough time has passed, wait for next worker iteration
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - enqueue_time).count();
+            if (elapsed_us < 500)
                 return true;
-            }
         }
-        if (queue_size == 0) {
-            break;
-        }
+
         uint16_t words[QE_RING_WORDS] = {0};
-        
-        // Write 0xFFFF to word 0 (flag word) to claim the descriptor.
-        // SIMH does this and RSX may depend on it.
-        words[0] = 0xFFFF;
-        if (!desc_write_words(cur_ba, &words[0], 1)) {
+        if (!desc_read_words(cur_ba, words, 4)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             csr_set_clr(QNA_CSR_RL, 0);
             return false;
         }
-        
-        for (size_t i = 1; i < QE_RING_WORDS; ++i) {
-            if (!desc_read_words(cur_ba + 2 + static_cast<uint32_t>((i - 1) * 2), &words[i], 1)) {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                csr_set_clr(QNA_CSR_RL, 0);
-                return false;
-            }
+
+        // Mark descriptor as processed/claimed (hardware writes 0xFFFF here).
+        const uint16_t flag_word = 0xFFFF;
+        if (!desc_write_words(cur_ba, &flag_word, 1)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(QNA_CSR_RL, 0);
+            return false;
         }
 
         if (~words[1] & QNA_DSC_V) {
             if (trace.value) {
-                DEBUG("DEQNA: RX descriptor at %06o not valid (addr_hi=%06o)",
-                        cur_ba, words[1]);
+                DEBUG("DEQNA: RX descriptor at %06o not valid (word1=%06o)",
+                      cur_ba, words[1]);
             }
-            {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                csr_set_clr(QNA_CSR_RL, 0);
-            }
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(QNA_CSR_RL, 0);
             return false;
         }
 
         if (words[1] & QNA_DSC_C) {
             uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
-            {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                rbdl_ba = next_ba;
-            }
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            rbdl_ba = next_ba;
             continue;
         }
 
+        queue_item item;
         {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
-            if (read_queue.empty()) {
+            if (read_queue.empty())
                 break;
-            }
-        }
-
-        if (!desc_read_words(cur_ba + 8, &words[4], 2)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_RL, 0);
-            return false;
+            item = std::move(read_queue.front());
+            read_queue.pop_front();
         }
 
         uint32_t address = make_addr(words[1], words[2]);
@@ -1567,28 +1562,16 @@ bool deqna_c::process_rbdl(void)
         if (words[1] & QNA_DSC_H) {
             if ((address & 1) == 0)
                 address += 1;
-            b_length -= 1;
+            if (b_length)
+                b_length -= 1;
         }
-        if (words[1] & QNA_DSC_L)
-            b_length -= 1;
-
-        if (trace.value) {
-            DEBUG("DEQNA: RX desc words1=%06o words2=%06o words3=%06o addr=%08o blen=%d",
-                    words[1], words[2], words[3], address, b_length);
+        if (words[1] & QNA_DSC_L) {
+            if (b_length)
+                b_length -= 1;
         }
 
-        queue_item item;
-        {
-            std::lock_guard<std::mutex> queue_lock(queue_mutex);
-            if (read_queue.empty()) {
-                break;
-            }
-            item = std::move(read_queue.front());
-            read_queue.pop_front();
-        }
         size_t rbl = item.packet.len;
         uint8_t *rbuf = nullptr;
-
         if (item.packet.used) {
             size_t used = item.packet.used;
             rbl -= used;
@@ -1624,51 +1607,50 @@ bool deqna_c::process_rbdl(void)
             item.packet.used = item.packet.len;
 
         bool dma_failed = false;
-        WARNING("DEQNA: RX deliver type=%d rbl=%zu to addr=%08o blen=%d", 
-                item.type, rbl, address, b_length);
-        if (!dma_write_bytes(address, rbuf, rbl)) {
-            // Treat RX buffer DMA failure as a dropped packet so we can still
-            // write status back to the descriptor instead of raising NI.
+        if (trace.value) {
+            DEBUG("DEQNA: RX deliver type=%d rbl=%zu to addr=%08o blen=%u desc=%06o",
+                  item.type, rbl, address, static_cast<unsigned>(b_length), cur_ba);
+        }
+        if (rbl && !dma_write_bytes(address, rbuf, rbl)) {
             dma_failed = true;
             rbl = 0;
             item.packet.used = item.packet.len;
             WARNING("DEQNA: RX DMA write failed at addr=%08o", address);
         }
 
-        // DEQNA hardware quirk: write 0xC000 word after setup packet data
-        // This is documented in SIMH as "Strange DEQNA behavior"
-        // Only write if buffer is small enough (b_length <= rbl + 2)
-        if (item.type == 0 && !dma_failed && b_length <= rbl + 2) {
-            uint16_t qdtc_chip_extra = 0xC000;
-            if (!dma_write_words(address + rbl, &qdtc_chip_extra, 1)) {
-                WARNING("DEQNA: Failed to write 0xC000 quirk at addr=%08o", address + rbl);
-            } else {
-                WARNING("DEQNA: Wrote 0xC000 quirk at addr=%08o", address + rbl);
-            }
-        }
-
         uint16_t status1 = 0;
-        uint16_t rbl_status = static_cast<uint16_t>(rbl & 0xFFFF);
+        uint16_t report_rbl = static_cast<uint16_t>(rbl & 0xFFFF);
         switch (item.type) {
-        case 0:
+        case 0: {
             stats.setup++;
-            // Use a constant 0x2700 for setup status1 (ESETUP + RBL 10:8 = 7).
+            // Setup packets report ESETUP and set RBL<10:8> to 7.
             status1 = static_cast<uint16_t>(QE_ESETUP | 0x0700);
+
+            // Some DEQNA hardware writes an extra word after the setup packet
+            // when the buffer is tight. This is important for diagnostics.
+            if (!dma_failed && b_length <= static_cast<uint16_t>(rbl + 2)) {
+                uint8_t extra[2] = {0x00, 0xC0}; // 0xC000 in little-endian byte order
+                uint32_t extra_addr = address + static_cast<uint32_t>(rbl);
+                (void)dma_write_bytes(extra_addr, extra, sizeof(extra));
+                if (trace.value)
+                    DEBUG("DEQNA: RX setup wrote extra word at %08o", extra_addr);
+            }
             break;
+        }
         case 1:
             stats.loop++;
             status1 = QE_RST_LASTNOERR;
-            status1 |= static_cast<uint16_t>(rbl_status & 0x0700);
+            status1 |= static_cast<uint16_t>(report_rbl & 0x0700);
             if (csr_snapshot & QNA_CSR_EL)
                 status1 |= QE_ESETUP;
             break;
         case 2:
         default:
-            if (rbl_status >= 60)
-                rbl_status = static_cast<uint16_t>(rbl_status - 60);
+            if (report_rbl >= 60)
+                report_rbl = static_cast<uint16_t>(report_rbl - 60);
             else
-                rbl_status = 0;
-            status1 = static_cast<uint16_t>((rbl_status & 0x0700) | QE_RST_RSVD);
+                report_rbl = 0;
+            status1 = static_cast<uint16_t>((report_rbl & 0x0700) | QE_RST_RSVD);
             break;
         }
 
@@ -1679,12 +1661,7 @@ bool deqna_c::process_rbdl(void)
             status1 |= QE_RST_LASTERR;
             status1 |= QE_OVF | QE_DISCARD;
         } else if (item.packet.used < item.packet.len) {
-            status1 |= QE_RST_LASTNOT;  // 0xC000 = not last segment
-        }
-        words[4] = status1;
-        {
-            uint16_t rbl_low = static_cast<uint16_t>(rbl_status & 0x00FF);
-            words[5] = static_cast<uint16_t>((rbl_low << 8) | rbl_low);
+            status1 |= QE_RST_LASTNOT;
         }
 
         bool loss = false;
@@ -1696,11 +1673,16 @@ bool deqna_c::process_rbdl(void)
             }
         }
         if (loss)
-            words[4] |= QE_OVF;
+            status1 |= QE_OVF;
 
-        // UNCONDITIONAL log for debugging
-        WARNING("DEQNA: RX status type=%d words4=%06o words5=%06o to desc=%06o",
-                item.type, words[4], words[5], cur_ba + 8);
+        words[4] = status1;
+        const uint16_t rbl_low = static_cast<uint16_t>(report_rbl & 0x00FF);
+        words[5] = static_cast<uint16_t>((rbl_low << 8) | rbl_low);
+
+        if (trace.value) {
+            DEBUG("DEQNA: RX status type=%d st1=%06o st2=%06o desc=%06o",
+                  item.type, words[4], words[5], cur_ba + 8);
+        }
 
         if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1708,34 +1690,27 @@ bool deqna_c::process_rbdl(void)
             return false;
         }
 
-
-        if (item.packet.used < item.packet.len) {
+        const bool packet_complete = (item.packet.used >= item.packet.len);
+        if (!packet_complete) {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
             read_queue.push_front(std::move(item));
+        } else {
+            ri_pending = true;
         }
 
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             rbdl_ba = cur_ba + QE_RING_BYTES;
         }
-        ri_pending = true;
+
+        if (limit && (++processed >= limit))
+            break;
     }
 
     if (ri_pending) {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         csr_set_clr(QNA_CSR_RI, 0);
-    }
-    {
-        uint16_t next_word1 = 0;
-        uint32_t next_ba = 0;
-        {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            next_ba = rbdl_ba;
-        }
-        if (!desc_read_words(next_ba + 2, &next_word1, 1) || ((next_word1 & QNA_DSC_V) == 0)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_RL, 0);
-        }
+        update_csr_reg();
     }
 
     return true;
@@ -1826,9 +1801,13 @@ void deqna_c::write_callback(int status)
     stats.xmit++;
     stat_tx_frames.value = stats.xmit;
 
-    WARNING("DEQNA: TX callback status=%d words4=%06o words5=%06o to desc=%06o",
-            status, (status == 0) ? write_success[0] : write_failure[0],
-            (status == 0) ? write_success[1] : write_failure[1], cur_ba + 8);
+    if (trace.value) {
+        DEBUG("DEQNA: TX callback status=%d st1=%06o st2=%06o desc=%06o",
+              status,
+              (status == 0) ? write_success[0] : write_failure[0],
+              (status == 0) ? write_success[1] : write_failure[1],
+              cur_ba + 8);
+    }
 
     // Write status words back to descriptor
     if (!desc_write_words(cur_ba + 8, (status == 0) ? write_success : write_failure, 2)) {
@@ -1845,22 +1824,11 @@ void deqna_c::write_callback(int status)
         }
 
         csr_set_clr(QNA_CSR_XI, 0);  // Set transmit interrupt
+        update_csr_reg(); /* Ensure CSR shows XI for diagnostics */
+
         write_buffer.len = 0;
         write_buffer.used = 0;
         xbdl_ba = cur_ba + QE_RING_BYTES;  // Advance to next descriptor
-    }
-
-    {
-        uint16_t next_word1 = 0;
-        uint32_t next_ba = 0;
-        {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            next_ba = xbdl_ba;
-        }
-        if (!desc_read_words(next_ba + 2, &next_word1, 1) || ((next_word1 & QNA_DSC_V) == 0)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_XL, 0);
-        }
     }
 
     reset_sanity_timer();
@@ -1884,8 +1852,8 @@ void deqna_c::write_callback(int status)
  * 7. Write status words
  *
  * LOOPBACK LOGIC:
- * Loopback is enabled when EL=1 (external loopback) or when IL=1 with
- * RE=0 (internal loopback test mode).
+ * Loopback is enabled when EL=1 (external loopback) or when IL=0
+ * (internal loopback). Setup packets always loop back regardless of CSR.
  */
 bool deqna_c::process_xbdl(void)
 {
@@ -1905,7 +1873,14 @@ bool deqna_c::process_xbdl(void)
             return false;
         }
 
-        // DEQNA doesn't require a pre-write ownership flag for TX descriptors.
+        // Write 0xFFFF to word 0 to mark descriptor as claimed/used (like SIMH)
+        uint16_t flag_word = 0xFFFF;
+        if (!desc_write_words(cur_ba, &flag_word, 1)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            nxm_error();
+            return false;
+        }
+
         // Check V (valid) bit - if clear, end of list
         if (~words[1] & QNA_DSC_V) {
             if (trace.value) {
@@ -1957,16 +1932,15 @@ bool deqna_c::process_xbdl(void)
         }
 
         if (words[1] & QNA_DSC_E) {
-            bool il_set = false;
+            bool il_clear = false;
             bool el_set = false;
-            bool re_set = false;
             size_t len_snapshot = 0;
             uint16_t csr_snapshot = 0;
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                il_set = (csr & QNA_CSR_IL) != 0;
+                // Internal loopback is enabled when IL is clear.
+                il_clear = (csr & QNA_CSR_IL) == 0;
                 el_set = (csr & QNA_CSR_EL) != 0;
-                re_set = (csr & QNA_CSR_RE) != 0;
                 if (write_buffer.len < ETH_MIN_PACKET) {
                     size_t pad = ETH_MIN_PACKET - write_buffer.len;
                     memset(write_buffer.msg.data() + write_buffer.len, 0, pad);
@@ -1975,13 +1949,13 @@ bool deqna_c::process_xbdl(void)
                 len_snapshot = write_buffer.len;
                 csr_snapshot = csr;
             }
-            bool loopback = el_set || (il_set && !re_set);
+            bool loopback = el_set || il_clear;
             bool setup_packet = (words[1] & QNA_DSC_S) != 0;
 
             if (trace.value) {
-                DEBUG("DEQNA: TX EOMSG len=%u setup=%d loopback=%d (IL_set=%d EL_set=%d RE_set=%d) csr=%06o",
+                DEBUG("DEQNA: TX EOMSG len=%u setup=%d loopback=%d (IL_clear=%d EL_set=%d) csr=%06o",
                         static_cast<unsigned>(len_snapshot), setup_packet ? 1 : 0, loopback ? 1 : 0,
-                        il_set ? 1 : 0, el_set ? 1 : 0, re_set ? 1 : 0, csr_snapshot);
+                        il_clear ? 1 : 0, el_set ? 1 : 0, csr_snapshot);
             }
 
             if (loopback || setup_packet) {
@@ -2003,8 +1977,10 @@ bool deqna_c::process_xbdl(void)
                     // Loopback TX status: set FAIL bit (heartbeat check failure)
                     write_success[0] = QE_FAIL;
                 }
-                WARNING("DEQNA: TX loopback/setup status words4=%06o words5=%06o to desc=%06o",
-                        write_success[0], write_success[1], cur_ba + 8);
+                if (trace.value) {
+                    DEBUG("DEQNA: TX loopback/setup status st1=%06o st2=%06o desc=%06o",
+                          write_success[0], write_success[1], cur_ba + 8);
+                }
                 if (!desc_write_words(cur_ba + 8, write_success, 2)) {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
                     nxm_error();
@@ -2017,6 +1993,7 @@ bool deqna_c::process_xbdl(void)
                     write_buffer.used = 0;
                     reset_sanity_timer();
                     csr_set_clr(QNA_CSR_XI, 0);
+                    xbdl_ba = cur_ba + QE_RING_BYTES; // Advance to next descriptor
                 }
 
                 // Don't call process_rbdl() from TX thread - let RX worker handle it.
@@ -2026,6 +2003,24 @@ bool deqna_c::process_xbdl(void)
                 (void)enqueued;  // Suppress unused warning
 
             } else {
+                /* If this looks like a DECnet packet (ethertype 0x6003) snapshot rings for diagnosis */
+                if (trace.value && write_buffer.len >= 14) {
+                    uint16_t ethertype = static_cast<uint16_t>((write_buffer.msg[12] << 8) | write_buffer.msg[13]);
+                    if (ethertype == 0x6003) {
+                        DEBUG("DEQNA: TX DECnet packet detected (len=%zu) - snapshotting rings before send", write_buffer.len);
+                        dump_descriptor_rings("TX DECnet before send");
+                        std::string hexdump;
+                        size_t dump_len = (write_buffer.len > 64) ? 64 : write_buffer.len;
+                        char tmp[8];
+                        for (size_t i = 0; i < dump_len; ++i) {
+                            snprintf(tmp, sizeof(tmp), "%02x", write_buffer.msg[i]);
+                            hexdump += tmp;
+                            if (((i + 1) % 8) == 0) hexdump += ' ';
+                        }
+                        DEBUG("DEQNA: TX DECnet data prefix=%s", hexdump.c_str());
+                    }
+                }
+
                 if (!pcap.send(write_buffer.msg.data(), write_buffer.len))
                     write_callback(1);
                 else
@@ -2044,18 +2039,6 @@ bool deqna_c::process_xbdl(void)
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             xbdl_ba = cur_ba + QE_RING_BYTES;
-        }
-        {
-            uint16_t next_word1 = 0;
-            uint32_t next_ba = 0;
-            {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                next_ba = xbdl_ba;
-            }
-            if (!desc_read_words(next_ba + 2, &next_word1, 1) || ((next_word1 & QNA_DSC_V) == 0)) {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                csr_set_clr(QNA_CSR_XL, 0);
-            }
         }
     }
 }
@@ -2149,8 +2132,9 @@ void deqna_c::process_setup(uint16_t raw_len_word)
     setup.valid = true;
 
     if (trace.value) {
-        DEBUG("DEQNA: Setup packet processed: len=%zu, promisc=%d multicast=%d flags=%04o",
-                write_buffer.len, setup.promiscuous ? 1 : 0, setup.multicast ? 1 : 0, setup_flags);
+        DEBUG("DEQNA: Setup packet processed: len=%zu promisc=%d multicast=%d flags=%04o",
+              write_buffer.len, setup.promiscuous ? 1 : 0, setup.multicast ? 1 : 0, setup_flags);
+        dump_descriptor_rings("setup processed");
     }
 }
 
@@ -2161,6 +2145,52 @@ void deqna_c::process_setup(uint16_t raw_len_word)
  *
  * Returns: true if packet was handled, false otherwise
  */
+
+void deqna_c::dump_descriptor_rings(const char *reason)
+{
+    if (!trace.value)
+        return;
+
+    uint16_t csr_snapshot;
+    uint32_t rbase = 0, xbase = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        csr_snapshot = csr;
+        rbase = rbdl_ba;
+        xbase = xbdl_ba;
+    }
+
+    DEBUG("DEQNA: RING SNAPSHOT (%s) CSR=%06o rbdl=%06o xbdl=%06o", reason, csr_snapshot, rbase, xbase);
+
+    uint16_t w[QE_RING_WORDS];
+    uint32_t ba = rbase;
+    for (int i = 0; i < 8; ++i) {
+        if (ba == 0) break;
+        if (!desc_read_words(ba, w, QE_RING_WORDS)) {
+            DEBUG("DEQNA: RING SNAP: failed to read RX desc @%06o", ba);
+            break;
+        }
+        DEBUG("DEQNA: RBDL[%d] @%06o -> [%06o %06o %06o %06o %06o %06o]", i, ba, w[0], w[1], w[2], w[3], w[4], w[5]);
+        if (w[1] & QNA_DSC_C)
+            ba = ((w[1] & 0x3F) << 16) | w[2];
+        else
+            ba += QE_RING_BYTES;
+    }
+
+    ba = xbase;
+    for (int i = 0; i < 8; ++i) {
+        if (ba == 0) break;
+        if (!desc_read_words(ba, w, QE_RING_WORDS)) {
+            DEBUG("DEQNA: RING SNAP: failed to read TX desc @%06o", ba);
+            break;
+        }
+        DEBUG("DEQNA: XBDL[%d] @%06o -> [%06o %06o %06o %06o %06o %06o]", i, ba, w[0], w[1], w[2], w[3], w[4], w[5]);
+        if (w[1] & QNA_DSC_C)
+            ba = ((w[1] & 0x3F) << 16) | w[2];
+        else
+            ba += QE_RING_BYTES;
+    }
+}
 
 bool deqna_c::process_local(const uint8_t *data, size_t len)
 {

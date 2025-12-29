@@ -503,6 +503,9 @@ private:
      */
     void process_setup(uint16_t raw_len_word);
 
+    /* Debug helper: Dump RX/TX descriptor rings and CSR for diagnosis */
+    void dump_descriptor_rings(const char *reason);
+
     /*
      * Idle RX ring touch (debugging only, no DMA)
      */
