@@ -200,13 +200,16 @@ private:
      * state_mutex: Protects device state (csr, rbdl_ba, ring state, setup, etc.)
      * dma_mutex: Serializes DMA operations (only one DMA at a time)
      * queue_mutex: Serializes queue access from PCAP callbacks
-     * rx_process_mutex: Serializes process_rbdl() calls between TX and RX threads
+     * descriptor_process_mutex: Serializes process_rbdl() and process_xbdl() to
+     *                           prevent concurrent DMA from RX and TX threads.
+     *                           This ensures deferred interrupts only fire when
+     *                           ALL descriptor processing is complete.
      */
     std::recursive_mutex state_mutex;
     std::recursive_mutex dma_mutex;
-    std::mutex queue_mutex;  // New: Serialize queue access from PCAP callbacks
-    std::mutex rx_process_mutex;  // New: Serialize process_rbdl() calls
-    std::atomic<bool> reset_in_progress{false};  // New: Flag to abort worker operations during reset
+    std::mutex queue_mutex;  // Serialize queue access from PCAP callbacks
+    std::mutex descriptor_process_mutex;  // Serialize ALL descriptor processing (RX + TX)
+    std::atomic<bool> reset_in_progress{false};  // Flag to abort worker operations during reset
 
     /*
      * Pending register writes from PDP-11
@@ -365,6 +368,18 @@ private:
     bool rbdl_pending = false;
     bool xbdl_pending = false;
 
+    /*
+     * Deferred interrupt signaling
+     * -----------------------------
+     * Interrupts must not be raised while DMA operations are pending,
+     * as this can cause deadlock (interrupt blocks CPU, CPU can't
+     * respond to DMA). csr_set_clr() sets these flags instead of
+     * calling set_int/clr_int directly. process_deferred_interrupts()
+     * must be called after all DMA operations complete.
+     */
+    std::atomic<bool> deferred_set_int{false};
+    std::atomic<bool> deferred_clr_int{false};
+
     int idtmr = 0;
 
     /*
@@ -395,6 +410,7 @@ private:
     void update_csr_reg(void);
     void update_transceiver_bits(void);
     void update_intr(void);
+    void service_intr_complete(void);
 
     /*
      * Interrupt control
@@ -406,6 +422,7 @@ private:
      */
     void set_int(void);
     void clr_int(void);
+    void process_deferred_interrupts(void);
     void csr_set_clr(uint16_t set_bits, uint16_t clear_bits);
     void nxm_error(void);
 
@@ -435,7 +452,7 @@ private:
      * handle_register_write: Process a single register write
      * apply_pending_reg_writes: Process all pending writes from atomic queue
      */
-    void handle_register_write(uint8_t reg_index, uint16_t val);
+    void handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access);
     void apply_pending_reg_writes(void);
 
     /*
