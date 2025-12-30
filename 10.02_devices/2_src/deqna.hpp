@@ -376,9 +376,14 @@ private:
      * respond to DMA). csr_set_clr() sets these flags instead of
      * calling set_int/clr_int directly. process_deferred_interrupts()
      * must be called after all DMA operations complete.
+     *
+     * interrupt_pending: Set when interrupt is raised, cleared when
+     * acknowledged. New descriptor processing must not start while
+     * this is true, to avoid DMA conflicting with the IACK cycle.
      */
     std::atomic<bool> deferred_set_int{false};
     std::atomic<bool> deferred_clr_int{false};
+    std::atomic<bool> interrupt_pending{false};
 
     int idtmr = 0;
 

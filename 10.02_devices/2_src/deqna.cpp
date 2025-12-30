@@ -579,6 +579,10 @@ void deqna_c::update_transceiver_bits(void)
  */
 void deqna_c::set_int(void)
 {
+    // Set interrupt_pending BEFORE asserting the interrupt.
+    // This prevents other threads from starting DMA while the
+    // CPU is trying to acknowledge this interrupt.
+    interrupt_pending.store(true, std::memory_order_release);
     irq = true;
     if (trace.value)
         DEBUG("DEQNA: INTR assert, csr=%06o ie=%d", csr, (csr & QNA_CSR_IE) ? 1 : 0);
@@ -651,6 +655,10 @@ void deqna_c::service_intr_complete(void)
     // OpenSIMH-compatible: clear the controller interrupt latch on vector fetch.
     // Note RI/XI bits remain set in CSR until cleared by the guest via W1C.
     clr_int();
+
+    // Clear interrupt_pending to allow DMA operations to resume.
+    // The IACK cycle is complete, so new DMA won't conflict.
+    interrupt_pending.store(false, std::memory_order_release);
 }
 
 void deqna_c::nxm_error(void)
@@ -859,6 +867,11 @@ void deqna_c::reset_controller(void)
     rbdl_pending = false;
     xbdl_pending = false;
 
+    // Clear deferred interrupt state
+    deferred_set_int.store(false, std::memory_order_release);
+    deferred_clr_int.store(false, std::memory_order_release);
+    interrupt_pending.store(false, std::memory_order_release);
+
     sanity.enabled = 0;
     sanity.quarter_secs = QNA_HW_SANITY_SECS * 4;
     sanity.max = static_cast<int>(QNA_HW_SANITY_SECS * QNA_SERVICE_INTERVAL);
@@ -891,6 +904,11 @@ void deqna_c::sw_reset(void)
         csr_set_clr(QNA_CSR_OK, 0);
 
     clr_int();
+
+    // Clear deferred interrupt state
+    deferred_set_int.store(false, std::memory_order_release);
+    deferred_clr_int.store(false, std::memory_order_release);
+    interrupt_pending.store(false, std::memory_order_release);
 
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
@@ -1657,6 +1675,14 @@ bool deqna_c::process_rbdl(void)
     // Serialize ALL descriptor processing (RX and TX) to prevent interrupt deadlock
     std::lock_guard<std::mutex> process_lock(descriptor_process_mutex);
 
+    // If an interrupt is pending acknowledgment, don't start new DMA.
+    // The CPU is trying to IACK and any DMA would conflict with the bus cycle.
+    // Wait for service_intr_complete() to clear this flag.
+    if (interrupt_pending.load(std::memory_order_acquire)) {
+        process_deferred_interrupts();  // Clear any pending deferred flags
+        return false;
+    }
+
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         if (csr & QNA_CSR_RL)
@@ -1666,6 +1692,15 @@ bool deqna_c::process_rbdl(void)
     bool ri_pending = false;
     unsigned processed = 0;
     const unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 0;
+
+    // Track starting address to detect circular chains (stale/garbage descriptors)
+    uint32_t start_rbdl_ba = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        start_rbdl_ba = rbdl_ba;
+    }
+    unsigned desc_count = 0;
+    const unsigned max_desc_count = 256;  // Sanity limit to prevent infinite loops
 
     while (true) {
         int front_type = 2;
@@ -1682,6 +1717,26 @@ bool deqna_c::process_rbdl(void)
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             cur_ba = rbdl_ba;
             csr_snapshot = csr;
+        }
+
+        // Circular chain detection: if we've looped back to start, stop.
+        // This catches stale/garbage descriptors with C=1 pointing in circles.
+        if (desc_count > 0 && cur_ba == start_rbdl_ba) {
+            WARNING("DEQNA: RX circular chain detected at %06o after %u descriptors",
+                    cur_ba, desc_count);
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(QNA_CSR_RL, 0);
+            process_deferred_interrupts();
+            return false;
+        }
+
+        // Sanity limit: prevent infinite loops through garbage memory
+        if (++desc_count > max_desc_count) {
+            WARNING("DEQNA: RX descriptor limit reached (%u), stopping", max_desc_count);
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(QNA_CSR_RL, 0);
+            process_deferred_interrupts();
+            return false;
         }
 
         // Normal packets require the receiver to be enabled. Setup and loopback
@@ -1726,6 +1781,17 @@ bool deqna_c::process_rbdl(void)
             return false;
         }
 
+        // IMPORTANT: Check C (chain) bit BEFORE V (valid) bit!
+        // When C=1, this is a chain pointer - follow it regardless of V.
+        // SIMH does it this way (see xq_process_rbdl in pdp11_xq.c).
+        if (words[1] & QNA_DSC_C) {
+            uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            rbdl_ba = next_ba;
+            continue;
+        }
+
+        // Check V (valid) bit - if clear, end of list
         if (~words[1] & QNA_DSC_V) {
             if (trace.value) {
                 DEBUG("DEQNA: RX descriptor at %06o not valid (word1=%06o)",
@@ -1735,13 +1801,6 @@ bool deqna_c::process_rbdl(void)
             csr_set_clr(QNA_CSR_RL, 0);
             process_deferred_interrupts();
             return false;
-        }
-
-        if (words[1] & QNA_DSC_C) {
-            uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            rbdl_ba = next_ba;
-            continue;
         }
 
         queue_item item;
@@ -2069,8 +2128,25 @@ bool deqna_c::process_xbdl(void)
     // Serialize ALL descriptor processing (RX and TX) to prevent interrupt deadlock
     std::lock_guard<std::mutex> process_lock(descriptor_process_mutex);
 
+    // If an interrupt is pending acknowledgment, don't start new DMA.
+    // The CPU is trying to IACK and any DMA would conflict with the bus cycle.
+    // Wait for service_intr_complete() to clear this flag.
+    if (interrupt_pending.load(std::memory_order_acquire)) {
+        process_deferred_interrupts();  // Clear any pending deferred flags
+        return false;
+    }
+
     // Status for implicit chain (multi-segment packets)
     const uint16_t implicit_chain_status[2] = {static_cast<uint16_t>(QNA_DSC_V | QNA_DSC_C), 1};
+
+    // Track starting address to detect circular chains (stale/garbage descriptors)
+    uint32_t start_xbdl_ba = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        start_xbdl_ba = xbdl_ba;
+    }
+    unsigned desc_count = 0;
+    const unsigned max_desc_count = 256;  // Sanity limit to prevent infinite loops
 
     while (true) {
         uint32_t cur_ba = 0;
@@ -2078,6 +2154,27 @@ bool deqna_c::process_xbdl(void)
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             cur_ba = xbdl_ba;
         }
+
+        // Circular chain detection: if we've looped back to start, stop.
+        // This catches stale/garbage descriptors with C=1 pointing in circles.
+        if (desc_count > 0 && cur_ba == start_xbdl_ba) {
+            WARNING("DEQNA: TX circular chain detected at %06o after %u descriptors",
+                    cur_ba, desc_count);
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(QNA_CSR_XL, 0);
+            process_deferred_interrupts();
+            return false;
+        }
+
+        // Sanity limit: prevent infinite loops through garbage memory
+        if (++desc_count > max_desc_count) {
+            WARNING("DEQNA: TX descriptor limit reached (%u), stopping", max_desc_count);
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(QNA_CSR_XL, 0);
+            process_deferred_interrupts();
+            return false;
+        }
+
         uint16_t words[QE_RING_WORDS] = {0};
         if (trace.value)
             DEBUG("DEQNA: TX desc_read_words @ %08o words=%u", cur_ba, (unsigned)QE_RING_WORDS);
@@ -2097,6 +2194,18 @@ bool deqna_c::process_xbdl(void)
             return false;
         }
 
+        // IMPORTANT: Check C (chain) bit BEFORE V (valid) bit!
+        // When C=1, this is a chain pointer - follow it regardless of V.
+        // SIMH does it this way (see xq_process_xbdl in pdp11_xq.c).
+        if (words[1] & QNA_DSC_C) {
+            uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
+            {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                xbdl_ba = next_ba;
+            }
+            continue;
+        }
+
         // Check V (valid) bit - if clear, end of list
         if (~words[1] & QNA_DSC_V) {
             if (trace.value) {
@@ -2107,18 +2216,6 @@ bool deqna_c::process_xbdl(void)
             csr_set_clr(QNA_CSR_XL, 0);
             process_deferred_interrupts();
             return false;
-        }
-
-        // Handle C (chain) bit - follow chain pointer.
-        // Important: when C=1, words 1/2 are a *descriptor pointer*, not a data buffer address.
-        // Do not apply odd-byte adjustments to the chain pointer.
-        if (words[1] & QNA_DSC_C) {
-            uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
-            {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                xbdl_ba = next_ba;
-            }
-            continue;
         }
 
         // Calculate buffer address and length
