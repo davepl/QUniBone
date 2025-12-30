@@ -57,7 +57,41 @@
  *   - Descriptor base address is recalculated from registers on each dispatch
  *   - Loopback is IL=0 OR EL=1 (not AND, not dependent on RE)
  *   - Boot ROM handling is not applicable for DEQNA
+ * 
+ * Ring Buffer Architecture
+ * ------------------------
+ * 
+ *  ┌────────────────────────────────────────────────────────────────┐
+ *  │                      BeagleBone (Linux)                        │
+ *  │  ┌──────────────┐    ┌──────────────────────────────────────┐  │
+ *  │  │ Host Network │───▶│ read_queue (up to 500 packets)       │  │
+ *  │  │   (pcap)     │    │ std::deque in Linux memory           │  │
+ *  │  └──────────────┘    └───────────────┬──────────────────────┘  │
+ *  │                                      │ DMA                     │
+ *  └──────────────────────────────────────│─────────────────────────┘
+ *                                         ▼
+ *  ┌────────────────────────────────────────────────────────────────┐
+ *  │                    PDP-11 System Memory                        │
+ *  │  ┌─────────────────────────────────────────────────────────┐   │
+ *  │  │ RX Descriptor Ring (driver-allocated, 4-16 descriptors) │   │
+ *  │  │ rbdl_ba → [desc0] → [desc1] → [desc2] → ... (C=0 ends)  │   │
+ *  │  └─────────────────────────────────────────────────────────┘   │
+ *  │  ┌─────────────────────────────────────────────────────────┐   │
+ *  │  │ TX Descriptor Ring (driver-allocated, 4-16 descriptors) │   │
+ *  │  │ xbdl_ba → [desc0] → [desc1] → [desc2] → ... (C=0 ends)  │   │
+ *  │  └─────────────────────────────────────────────────────────┘   │
+ *  └────────────────────────────────────────────────────────────────┘
+ * 
+ *  The read_qyeye is a staging buffer that allows packets to come in
+ *  faster than the PDP-11 can process them. The RX worker thread
+ *  dequeues packets from read_queue and DMA's them into the RX descriptor
+ *  ring in PDP-11 memory.
+ * 
+ *  The TX worker thread processes the TX descriptor ring and sends
+ *  packets out via pcap.
+ * 
  */
+
 #ifndef _DEQNA_HPP_
 #define _DEQNA_HPP_
 
@@ -337,6 +371,7 @@ private:
     uint16_t var = 0;
     uint16_t csr = 0;
     bool irq = false;
+    std::atomic<unsigned> dma_in_progress{0};
 
     uint32_t rbdl_ba = 0;
     uint32_t xbdl_ba = 0;
@@ -371,19 +406,13 @@ private:
     /*
      * Deferred interrupt signaling
      * -----------------------------
-     * Interrupts must not be raised while DMA operations are pending,
-     * as this can cause deadlock (interrupt blocks CPU, CPU can't
-     * respond to DMA). csr_set_clr() sets these flags instead of
-     * calling set_int/clr_int directly. process_deferred_interrupts()
-     * must be called after all DMA operations complete.
-     *
-     * interrupt_pending: Set when interrupt is raised, cleared when
-     * acknowledged. New descriptor processing must not start while
-     * this is true, to avoid DMA conflicting with the IACK cycle.
+     * QuNiBone's PRU can deadlock if we assert a bus interrupt while DMA is
+     * underway. csr_set_clr() therefore sets deferred flags instead of
+     * calling set_int/clr_int directly; process_deferred_interrupts() is
+     * called after DMA-heavy operations complete.
      */
     std::atomic<bool> deferred_set_int{false};
     std::atomic<bool> deferred_clr_int{false};
-    std::atomic<bool> interrupt_pending{false};
 
     int idtmr = 0;
 
@@ -523,7 +552,7 @@ private:
      * Parses the 128-byte setup frame to configure receive filters,
      * promiscuous mode, sanity timer, etc.
      */
-    void process_setup(uint16_t raw_len_word);
+    void process_setup(void);
 
     /* Debug helper: Dump RX/TX descriptor rings and CSR for diagnosis */
     void dump_descriptor_rings(const char *reason);

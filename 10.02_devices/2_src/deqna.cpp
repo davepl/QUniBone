@@ -178,7 +178,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v038";  // Byte-write CSR semantics + DMA trace
+static const char *DEQNA_VERSION = "v041";  // RX status RBL uses full packet length (OpenSIMH)
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -579,10 +579,6 @@ void deqna_c::update_transceiver_bits(void)
  */
 void deqna_c::set_int(void)
 {
-    // Set interrupt_pending BEFORE asserting the interrupt.
-    // This prevents other threads from starting DMA while the
-    // CPU is trying to acknowledge this interrupt.
-    interrupt_pending.store(true, std::memory_order_release);
     irq = true;
     if (trace.value)
         DEBUG("DEQNA: INTR assert, csr=%06o ie=%d", csr, (csr & QNA_CSR_IE) ? 1 : 0);
@@ -655,10 +651,6 @@ void deqna_c::service_intr_complete(void)
     // OpenSIMH-compatible: clear the controller interrupt latch on vector fetch.
     // Note RI/XI bits remain set in CSR until cleared by the guest via W1C.
     clr_int();
-
-    // Clear interrupt_pending to allow DMA operations to resume.
-    // The IACK cycle is complete, so new DMA won't conflict.
-    interrupt_pending.store(false, std::memory_order_release);
 }
 
 void deqna_c::nxm_error(void)
@@ -709,7 +701,11 @@ void deqna_c::start_rx_delay(void)
  */
 void deqna_c::update_intr(void)
 {
-    bool level = irq;
+    // QuNiBone PRU currently treats an INTR request as a bus master arbitration
+    // operation which can starve DMA if the CPU is masking interrupts (splimp).
+    // Real QBUS allows NPR DMA while BR lines are asserted, so we approximate that
+    // by deferring bus-level interrupt assertion while DMA is in progress.
+    bool level = irq && (dma_in_progress.load(std::memory_order_relaxed) == 0);
 
     switch (intr_request.edge_detect(level)) {
     case intr_request_c::INTERRUPT_EDGE_RAISING:
@@ -846,6 +842,8 @@ void deqna_c::reset_controller(void)
     rbdl_ba = 0;
     xbdl_ba = 0;
     irq = false;
+    if (qunibusadapter)
+        qunibusadapter->cancel_INTR(intr_request);
     intr_request.edge_detect_reset();
     intr_request.set_vector(var & QNA_VEC_IV);
 
@@ -870,7 +868,6 @@ void deqna_c::reset_controller(void)
     // Clear deferred interrupt state
     deferred_set_int.store(false, std::memory_order_release);
     deferred_clr_int.store(false, std::memory_order_release);
-    interrupt_pending.store(false, std::memory_order_release);
 
     sanity.enabled = 0;
     sanity.quarter_secs = QNA_HW_SANITY_SECS * 4;
@@ -898,6 +895,15 @@ void deqna_c::sw_reset(void)
     reset_in_progress.store(true, std::memory_order_release);
     const uint16_t set_bits = QNA_CSR_XL | QNA_CSR_RL;
 
+    if (trace.value) {
+        uint16_t csr_snapshot = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_snapshot = csr;
+        }
+        DEBUG("DEQNA: sw_reset() begin csr=%06o", csr_snapshot);
+    }
+
     csr_set_clr(set_bits, static_cast<uint16_t>(~set_bits));
 
     if (pcap.is_open())
@@ -908,7 +914,6 @@ void deqna_c::sw_reset(void)
     // Clear deferred interrupt state
     deferred_set_int.store(false, std::memory_order_release);
     deferred_clr_int.store(false, std::memory_order_release);
-    interrupt_pending.store(false, std::memory_order_release);
 
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
@@ -1092,14 +1097,6 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         handle_register_write(static_cast<uint8_t>(device_reg->index), val, access);
         return;
     }
-    if (device_reg->index == DEQNA_REG_RCVLIST_LO ||
-        device_reg->index == DEQNA_REG_RCVLIST_HI ||
-        device_reg->index == DEQNA_REG_XMTLIST_LO ||
-        device_reg->index == DEQNA_REG_XMTLIST_HI) {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        handle_register_write(static_cast<uint8_t>(device_reg->index), val, access);
-        return;
-    }
     if (device_reg->index < 8) {
         pending_reg_value[device_reg->index].store(val, std::memory_order_relaxed);
         pending_reg_mask.fetch_or(static_cast<uint16_t>(1u << device_reg->index),
@@ -1134,22 +1131,18 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         break;
     case DEQNA_REG_RCVLIST_HI:
         rbdl[1] = val;
-        rbdl_ba = make_addr(rbdl[1], static_cast<uint16_t>(rbdl[0] & ~1u));
-        csr_set_clr(0, QNA_CSR_RL);
         rbdl_pending = true;
         if (trace.value)
-            DEBUG("DEQNA: RX list base set to %06o (csr=%06o)", rbdl_ba, csr);
+            DEBUG("DEQNA: RX list update pending (RCLH=%06o RCLL=%06o csr=%06o)", rbdl[1], rbdl[0], csr);
         break;
     case DEQNA_REG_XMTLIST_LO:
         xbdl[0] = val;
         break;
     case DEQNA_REG_XMTLIST_HI:
         xbdl[1] = val;
-        xbdl_ba = make_addr(xbdl[1], static_cast<uint16_t>(xbdl[0] & ~1u));
-        csr_set_clr(0, QNA_CSR_XL);
         xbdl_pending = true;
         if (trace.value)
-            DEBUG("DEQNA: TX list base set to %06o (csr=%06o)", xbdl_ba, csr);
+            DEBUG("DEQNA: TX list update pending (XMTH=%06o XMTL=%06o csr=%06o)", xbdl[1], xbdl[0], csr);
         break;
     case DEQNA_REG_VECTOR: {
         // Byte writes only update the targeted byte.
@@ -1185,6 +1178,10 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         // OpenSIMH-compatible: reset controller when SR transitions to cleared.
         // Only applies if the SR bit is actually being written (low byte or full word).
         if ((byte_mask & QNA_CSR_SR) && (prev & QNA_CSR_SR) && !(data_masked & QNA_CSR_SR)) {
+            if (trace.value) {
+                DEBUG("DEQNA: SW reset requested by guest (CSR SR 1->0): prev=%06o write=%06o byte_mask=%06o",
+                      prev, data_masked, byte_mask);
+            }
             sw_reset();
             return;
         }
@@ -1269,10 +1266,16 @@ bool deqna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
         return true;
     }
 
+    dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
+    // Deassert bus INTR while DMA is in progress (QuNiBone PRU quirk).
+    update_intr();
+
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
 //    WARNING("DEQNA: DMA read_words addr=%06o words=%zu", addr, wordcount);
     qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
 //    WARNING("DEQNA: DMA read_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
+    dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+    update_intr();
     return dma_request.success;
 }
 
@@ -1306,9 +1309,14 @@ bool deqna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
         return true;
     }
 
+    dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
+    update_intr();
+
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
     qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
             const_cast<uint16_t *>(buffer), wordcount);
+    dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+    update_intr();
     return dma_request.success;
 }
 
@@ -1348,8 +1356,13 @@ bool deqna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
              deqna_thread_ctx, addr, wordcount, csr, rbdl_ba, xbdl_ba);
     }
 
+    dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
+    update_intr();
+
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
     qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
+    dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+    update_intr();
     return dma_desc_request.success;
 }
 
@@ -1383,9 +1396,14 @@ bool deqna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
         return true;
     }
 
+    dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
+    update_intr();
+
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
     qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,
             const_cast<uint16_t *>(buffer), wordcount);
+    dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+    update_intr();
     return dma_desc_request.success;
 }
 
@@ -1675,14 +1693,6 @@ bool deqna_c::process_rbdl(void)
     // Serialize ALL descriptor processing (RX and TX) to prevent interrupt deadlock
     std::lock_guard<std::mutex> process_lock(descriptor_process_mutex);
 
-    // If an interrupt is pending acknowledgment, don't start new DMA.
-    // The CPU is trying to IACK and any DMA would conflict with the bus cycle.
-    // Wait for service_intr_complete() to clear this flag.
-    if (interrupt_pending.load(std::memory_order_acquire)) {
-        process_deferred_interrupts();  // Clear any pending deferred flags
-        return false;
-    }
-
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         if (csr & QNA_CSR_RL)
@@ -1719,15 +1729,16 @@ bool deqna_c::process_rbdl(void)
             csr_snapshot = csr;
         }
 
-        // Circular chain detection: if we've looped back to start, stop.
-        // This catches stale/garbage descriptors with C=1 pointing in circles.
+        // Circular ring overrun avoidance (OpenSIMH-style): if the ring chains
+        // back to the start and we've already processed at least one descriptor,
+        // stop now to avoid overwriting descriptors the guest may not have
+        // reclaimed yet.
         if (desc_count > 0 && cur_ba == start_rbdl_ba) {
-            WARNING("DEQNA: RX circular chain detected at %06o after %u descriptors",
-                    cur_ba, desc_count);
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_RL, 0);
-            process_deferred_interrupts();
-            return false;
+            if (trace.value) {
+                DEBUG("DEQNA: RX processed %u descriptors; stopping to avoid overrun (ring chained to %06o)",
+                      desc_count, start_rbdl_ba);
+            }
+            break;
         }
 
         // Sanity limit: prevent infinite loops through garbage memory
@@ -1781,26 +1792,30 @@ bool deqna_c::process_rbdl(void)
             return false;
         }
 
-        // IMPORTANT: Check C (chain) bit BEFORE V (valid) bit!
-        // When C=1, this is a chain pointer - follow it regardless of V.
-        // SIMH does it this way (see xq_process_rbdl in pdp11_xq.c).
-        if (words[1] & QNA_DSC_C) {
-            uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            rbdl_ba = next_ba;
-            continue;
-        }
-
-        // Check V (valid) bit - if clear, end of list
+        // OpenSIMH-compatible ordering (see xq_process_rbdl in pdp11_xq.c):
+        // 1) Check V (valid) first - invalid ends the list and sets RL.
+        // 2) Then check explicit chain (C) descriptors.
         if (~words[1] & QNA_DSC_V) {
             if (trace.value) {
-                DEBUG("DEQNA: RX descriptor at %06o not valid (word1=%06o)",
-                      cur_ba, words[1]);
+                uint32_t address = make_addr(words[1], words[2]) & ~1u;
+                INFO("DEQNA: RX list end: descriptor not valid @%06o (word1=%06o word2=%06o addr=%06o)",
+                     cur_ba, words[1], words[2], address);
             }
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             csr_set_clr(QNA_CSR_RL, 0);
             process_deferred_interrupts();
-            return false;
+            return true;
+        }
+
+        if (words[1] & QNA_DSC_C) {
+            uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
+            if (trace.value) {
+                INFO("DEQNA: RX chain desc @%06o -> next=%06o (word1=%06o word2=%06o)",
+                     cur_ba, next_ba, words[1], words[2]);
+            }
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            rbdl_ba = next_ba;
+            continue;
         }
 
         queue_item item;
@@ -1816,8 +1831,7 @@ bool deqna_c::process_rbdl(void)
         uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
         uint16_t b_length = static_cast<uint16_t>(w_length * 2);
         if (words[1] & QNA_DSC_H) {
-            if ((address & 1) == 0)
-                address += 1;
+            address += 1;
             if (b_length)
                 b_length -= 1;
         }
@@ -1875,7 +1889,10 @@ bool deqna_c::process_rbdl(void)
         }
 
         uint16_t status1 = 0;
-        uint16_t report_rbl = static_cast<uint16_t>(rbl & 0xFFFF);
+        // OpenSIMH reports RBL based on the full packet length (even when the packet is
+        // split across multiple buffers). For normal packets, the reported length is
+        // (packet_len - 60) to keep the value within 11 bits.
+        uint16_t report_rbl = static_cast<uint16_t>(item.packet.len & 0xFFFF);
         switch (item.type) {
         case 0: {
             stats.setup++;
@@ -2128,14 +2145,6 @@ bool deqna_c::process_xbdl(void)
     // Serialize ALL descriptor processing (RX and TX) to prevent interrupt deadlock
     std::lock_guard<std::mutex> process_lock(descriptor_process_mutex);
 
-    // If an interrupt is pending acknowledgment, don't start new DMA.
-    // The CPU is trying to IACK and any DMA would conflict with the bus cycle.
-    // Wait for service_intr_complete() to clear this flag.
-    if (interrupt_pending.load(std::memory_order_acquire)) {
-        process_deferred_interrupts();  // Clear any pending deferred flags
-        return false;
-    }
-
     // Status for implicit chain (multi-segment packets)
     const uint16_t implicit_chain_status[2] = {static_cast<uint16_t>(QNA_DSC_V | QNA_DSC_C), 1};
 
@@ -2155,15 +2164,15 @@ bool deqna_c::process_xbdl(void)
             cur_ba = xbdl_ba;
         }
 
-        // Circular chain detection: if we've looped back to start, stop.
-        // This catches stale/garbage descriptors with C=1 pointing in circles.
+        // Circular ring overrun avoidance:
+        // If the TX ring chains back to the start and we've already processed at
+        // least one descriptor, stop now to avoid looping indefinitely.
         if (desc_count > 0 && cur_ba == start_xbdl_ba) {
-            WARNING("DEQNA: TX circular chain detected at %06o after %u descriptors",
-                    cur_ba, desc_count);
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_XL, 0);
-            process_deferred_interrupts();
-            return false;
+            if (trace.value) {
+                DEBUG("DEQNA: TX processed %u descriptors; stopping to avoid overrun (ring chained to %06o)",
+                      desc_count, start_xbdl_ba);
+            }
+            break;
         }
 
         // Sanity limit: prevent infinite loops through garbage memory
@@ -2199,6 +2208,10 @@ bool deqna_c::process_xbdl(void)
         // SIMH does it this way (see xq_process_xbdl in pdp11_xq.c).
         if (words[1] & QNA_DSC_C) {
             uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
+            if (trace.value) {
+                INFO("DEQNA: TX chain desc @%06o -> next=%06o (word1=%06o word2=%06o)",
+                     cur_ba, next_ba, words[1], words[2]);
+            }
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 xbdl_ba = next_ba;
@@ -2209,28 +2222,24 @@ bool deqna_c::process_xbdl(void)
         // Check V (valid) bit - if clear, end of list
         if (~words[1] & QNA_DSC_V) {
             if (trace.value) {
-                DEBUG("DEQNA: TX descriptor at %06o not valid (addr_hi=%06o)",
-                        cur_ba, words[1]);
+                uint32_t address = make_addr(words[1], words[2]) & ~1u;
+                INFO("DEQNA: TX list end: descriptor not valid @%06o (word1=%06o word2=%06o addr=%06o)",
+                     cur_ba, words[1], words[2], address);
             }
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             csr_set_clr(QNA_CSR_XL, 0);
             process_deferred_interrupts();
-            return false;
+            return true;
         }
 
         // Calculate buffer address and length
         const bool setup_packet = (words[1] & QNA_DSC_S) != 0;
         uint32_t address = make_addr(words[1], words[2]);
-        // Setup packets encode options in the low bits of the length word; mask them out
-        // before computing the actual byte count (OpenSIMH-style).
-        uint16_t length_word = words[3];
-        if (setup_packet)
-            length_word = static_cast<uint16_t>(length_word & ~0x007f);
-        uint16_t w_length = static_cast<uint16_t>(~length_word + 1);  // One's complement
+        // Decode buffer length - two's complement (in words), OpenSIMH-style.
+        uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
         uint16_t b_length = static_cast<uint16_t>(w_length * 2);
         if (words[1] & QNA_DSC_H) {  // Odd byte at start
-            if ((address & 1) == 0)
-                address += 1;
+            address += 1;
             if (b_length)
                 b_length -= 1;
         }
@@ -2290,7 +2299,7 @@ bool deqna_c::process_xbdl(void)
                 // For loopback, SIMH sets QE_FAIL (0x0100) as "heartbeat check failure"
                 uint16_t write_success[2] = {0x0000, 0x0001};
                 if (setup_packet) {
-                    process_setup(words[3]);
+                    process_setup();
                     // Setup packets force loopback regardless of CSR loopback state.
                     enqueue_readq(0, write_buffer.msg.data(), write_buffer.len, 0);
                     enqueued = true;
@@ -2377,6 +2386,11 @@ bool deqna_c::process_xbdl(void)
             xbdl_ba = cur_ba + QE_RING_BYTES;
         }
     }
+
+    // Process deferred interrupts AFTER all DMA operations complete.
+    process_deferred_interrupts();
+
+    return true;
 }
 
 /*
@@ -2392,14 +2406,14 @@ bool deqna_c::process_xbdl(void)
  *                  Bits 2-3: LED control
  *                  Bits 4-6: Sanity timer setting
  *
- * The setup flags are encoded in the low bits of the descriptor length word,
- * NOT in extra bytes. The raw_len_word is the one's complement length from
- * the TX descriptor.
+ * OpenSIMH-compatible: setup options are encoded in the low bits of the
+ * setup packet length (write_buffer.len) when the guest provides an extended
+ * (>128 byte) setup packet.
  *
  * After processing, update_pcap_filter() is called to apply the new
  * receive filter to the host network interface.
  */
-void deqna_c::process_setup(uint16_t raw_len_word)
+void deqna_c::process_setup(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
     const uint8_t *msg = write_buffer.msg.data();
@@ -2418,12 +2432,22 @@ void deqna_c::process_setup(uint16_t raw_len_word)
         }
     }
 
-    // Setup options are encoded in the low bits of the descriptor length word.
-    const uint16_t setup_flags = static_cast<uint16_t>(raw_len_word & 0x007f);
-    setup.multicast = (0 != (setup_flags & QNA_SETUP_MC));
-    setup.promiscuous = (0 != (setup_flags & QNA_SETUP_PM));
-    const uint16_t led = static_cast<uint16_t>((setup_flags & QNA_SETUP_LD) >> 2);
-    const uint16_t san = static_cast<uint16_t>((setup_flags & QNA_SETUP_ST) >> 4);
+    // Setup options are encoded in the low bits of the setup packet length.
+    // PROMISCUOUS is always cleared on setup processing; short setup packets
+    // are used by some OSes to disable promiscuous mode.
+    setup.promiscuous = false;
+
+    uint16_t setup_flags = 0;
+    uint16_t led = 0;
+    uint16_t san = 0;
+    if (len > 128) {
+        const uint16_t len16 = static_cast<uint16_t>(len & 0xffff);
+        setup_flags = len16;
+        setup.multicast = (0 != (setup_flags & QNA_SETUP_MC));
+        setup.promiscuous = (0 != (setup_flags & QNA_SETUP_PM));
+        led = static_cast<uint16_t>((setup_flags & QNA_SETUP_LD) >> 2);
+        san = static_cast<uint16_t>((setup_flags & QNA_SETUP_ST) >> 4);
+    }
 
     // LED control (active low)
     if (led) {
