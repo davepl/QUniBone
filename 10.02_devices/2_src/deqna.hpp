@@ -149,6 +149,8 @@ public:
             "%d", "TX ring scan limit (0 = no limit)", 0, 10);
     parameter_unsigned_c rx_start_delay_ms = parameter_unsigned_c(this, "rx_start_delay_ms", "rxd", false, "",
             "%d", "Receiver start delay in ms", 16, 10);
+    parameter_unsigned_c intr_dma_holdoff_us = parameter_unsigned_c(this, "intr_dma_holdoff_us", "idh", false, "",
+            "%d", "DMA holdoff after INTR assert in us (0 = disable)", 16, 10);
     parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
             "Trace CSR/ring events to log");
 
@@ -402,6 +404,7 @@ private:
     uint64_t rx_enable_deadline_ns = 0;
     bool rbdl_pending = false;
     bool xbdl_pending = false;
+    uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
 
     /*
      * Deferred interrupt signaling
@@ -413,6 +416,9 @@ private:
      */
     std::atomic<bool> deferred_set_int{false};
     std::atomic<bool> deferred_clr_int{false};
+    // Short DMA holdoff window after raising INTR to reduce PRU deadlocks during IACK.
+    // If the CPU doesn't acknowledge quickly (e.g., interrupts masked), DMA resumes.
+    std::atomic<uint64_t> intr_dma_holdoff_until_ns{0};
 
     int idtmr = 0;
 
@@ -445,6 +451,7 @@ private:
     void update_transceiver_bits(void);
     void update_intr(void);
     void service_intr_complete(void);
+    void holdoff_dma_if_intr_pending(void);
 
     /*
      * Interrupt control

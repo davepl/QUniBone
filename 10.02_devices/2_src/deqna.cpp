@@ -88,6 +88,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <climits>
 #include <algorithm>
 #include <vector>
 #include <utility>
@@ -350,6 +351,7 @@ deqna_c::deqna_c() : qunibusdevice_c()
     rx_slots.value = 0;
     tx_slots.value = 0;
     rx_start_delay_ms.value = 0;
+    intr_dma_holdoff_us.value = 2000;
     trace.value = false;
 
     // Default MAC address for the emulated adapter (DEC OUI + fixed suffix)
@@ -580,6 +582,13 @@ void deqna_c::update_transceiver_bits(void)
 void deqna_c::set_int(void)
 {
     irq = true;
+    const uint64_t holdoff_us = intr_dma_holdoff_us.value;
+    if (holdoff_us) {
+        intr_dma_holdoff_until_ns.store(timeout_c::abstime_ns() + holdoff_us * 1000ull,
+                std::memory_order_release);
+    } else {
+        intr_dma_holdoff_until_ns.store(0, std::memory_order_release);
+    }
     if (trace.value)
         DEBUG("DEQNA: INTR assert, csr=%06o ie=%d", csr, (csr & QNA_CSR_IE) ? 1 : 0);
     update_intr();
@@ -588,6 +597,7 @@ void deqna_c::set_int(void)
 void deqna_c::clr_int(void)
 {
     irq = false;
+    intr_dma_holdoff_until_ns.store(0, std::memory_order_release);
     if (trace.value)
         DEBUG("DEQNA: INTR deassert, csr=%06o ie=%d", csr, (csr & QNA_CSR_IE) ? 1 : 0);
     update_intr();
@@ -651,6 +661,28 @@ void deqna_c::service_intr_complete(void)
     // OpenSIMH-compatible: clear the controller interrupt latch on vector fetch.
     // Note RI/XI bits remain set in CSR until cleared by the guest via W1C.
     clr_int();
+}
+
+void deqna_c::holdoff_dma_if_intr_pending(void)
+{
+    // Hold off DMA briefly after asserting INTR to give the CPU time to complete IACK.
+    // This reduces IACK timeouts caused by the PRU being mid-DMA and unable to respond.
+    for (;;) {
+        uint64_t until = intr_dma_holdoff_until_ns.load(std::memory_order_acquire);
+        if (until == 0)
+            return;
+        const uint64_t now = timeout_c::abstime_ns();
+        if (now >= until) {
+            (void)intr_dma_holdoff_until_ns.compare_exchange_strong(until, 0,
+                    std::memory_order_acq_rel, std::memory_order_acquire);
+            return;
+        }
+        // If the CPU already fetched the vector, clear the latch so DMA can continue.
+        service_intr_complete();
+        if (intr_dma_holdoff_until_ns.load(std::memory_order_acquire) == 0)
+            return;
+        timeout_c::wait_us(10);
+    }
 }
 
 void deqna_c::nxm_error(void)
@@ -795,8 +827,23 @@ void deqna_c::reset_sanity_timer(void)
 void deqna_c::service_timers(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    const uint64_t now_ns = timeout_c::abstime_ns();
+    if (timers_last_service_ns == 0)
+        timers_last_service_ns = now_ns;
+
+    const uint64_t tick_ns = 1000000000ull / QNA_SERVICE_INTERVAL; // 10ms @ 100Hz
+    uint64_t elapsed_ns = now_ns - timers_last_service_ns;
+    uint64_t ticks64 = elapsed_ns / tick_ns;
+    if (ticks64 == 0)
+        return;
+    if (ticks64 > static_cast<uint64_t>(INT_MAX))
+        ticks64 = static_cast<uint64_t>(INT_MAX);
+    const int ticks = static_cast<int>(ticks64);
+    timers_last_service_ns += static_cast<uint64_t>(ticks) * tick_ns;
+
     if (sanity.enabled) {
-        if (--sanity.timer <= 0) {
+        sanity.timer -= ticks;
+        if (sanity.timer <= 0) {
             WARNING("DEQNA: sanity timer expired");
             reset_controller();
             return;
@@ -873,6 +920,7 @@ void deqna_c::reset_controller(void)
     sanity.quarter_secs = QNA_HW_SANITY_SECS * 4;
     sanity.max = static_cast<int>(QNA_HW_SANITY_SECS * QNA_SERVICE_INTERVAL);
     sanity.timer = sanity.max;
+    timers_last_service_ns = timeout_c::abstime_ns();
 
     idtmr = 0;
 
@@ -926,6 +974,7 @@ void deqna_c::sw_reset(void)
 
     setup.multicast = false;
     setup.promiscuous = false;
+    timers_last_service_ns = timeout_c::abstime_ns();
 
     update_pcap_filter();
     reset_in_progress.store(false, std::memory_order_release);
@@ -1266,6 +1315,7 @@ bool deqna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
         return true;
     }
 
+    holdoff_dma_if_intr_pending();
     dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
     // Deassert bus INTR while DMA is in progress (QuNiBone PRU quirk).
     update_intr();
@@ -1309,6 +1359,7 @@ bool deqna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
         return true;
     }
 
+    holdoff_dma_if_intr_pending();
     dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
     update_intr();
 
@@ -1356,6 +1407,7 @@ bool deqna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
              deqna_thread_ctx, addr, wordcount, csr, rbdl_ba, xbdl_ba);
     }
 
+    holdoff_dma_if_intr_pending();
     dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
     update_intr();
 
@@ -1396,6 +1448,7 @@ bool deqna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
         return true;
     }
 
+    holdoff_dma_if_intr_pending();
     dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
     update_intr();
 
@@ -1703,7 +1756,7 @@ bool deqna_c::process_rbdl(void)
     unsigned processed = 0;
     const unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 0;
 
-    // Track starting address to detect circular chains (stale/garbage descriptors)
+    // Track starting address to detect circular chains (OpenSIMH-style)
     uint32_t start_rbdl_ba = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1745,7 +1798,7 @@ bool deqna_c::process_rbdl(void)
         if (++desc_count > max_desc_count) {
             WARNING("DEQNA: RX descriptor limit reached (%u), stopping", max_desc_count);
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_RL, 0);
+            csr_set_clr(static_cast<uint16_t>(QNA_CSR_RL | QNA_CSR_RI), 0);
             process_deferred_interrupts();
             return false;
         }
@@ -1778,23 +1831,12 @@ bool deqna_c::process_rbdl(void)
             DEBUG("DEQNA: RX desc_read_words @ %08o words=%u", cur_ba, 4u);
         if (!desc_read_words(cur_ba, words, 4)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_RL, 0);
+            // OpenSIMH-compatible: NXM triggers NI|XI|XL|RL (and interrupts via XI).
+            nxm_error();
             process_deferred_interrupts();
             return false;
         }
 
-        // Mark descriptor as processed/claimed (hardware writes 0xFFFF here).
-        const uint16_t flag_word = 0xFFFF;
-        if (!desc_write_words(cur_ba, &flag_word, 1)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_RL, 0);
-            process_deferred_interrupts();
-            return false;
-        }
-
-        // OpenSIMH-compatible ordering (see xq_process_rbdl in pdp11_xq.c):
-        // 1) Check V (valid) first - invalid ends the list and sets RL.
-        // 2) Then check explicit chain (C) descriptors.
         if (~words[1] & QNA_DSC_V) {
             if (trace.value) {
                 uint32_t address = make_addr(words[1], words[2]) & ~1u;
@@ -1802,7 +1844,9 @@ bool deqna_c::process_rbdl(void)
                      cur_ba, words[1], words[2], address);
             }
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_RL, 0);
+            // RL indicates RX list exhausted. Also set RI so the guest can wake up
+            // and refill descriptors (BSD qe driver otherwise may stall/restart).
+            csr_set_clr(static_cast<uint16_t>(QNA_CSR_RL | QNA_CSR_RI), 0);
             process_deferred_interrupts();
             return true;
         }
@@ -1816,6 +1860,18 @@ bool deqna_c::process_rbdl(void)
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             rbdl_ba = next_ba;
             continue;
+        }
+
+        // Claim descriptor by writing 0xFFFF to word[0] (in-use marker).
+        // Do this only for real data descriptors (V=1 and not a chain pointer).
+        // The BSD driver does not clear word[0], so we must not use word[0] to
+        // infer ownership; it is purely a device-written marker.
+        const uint16_t flag_word = 0xFFFF;
+        if (!desc_write_words(cur_ba, &flag_word, 1)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            nxm_error();
+            process_deferred_interrupts();
+            return false;
         }
 
         queue_item item;
@@ -1959,7 +2015,7 @@ bool deqna_c::process_rbdl(void)
 
         if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_RL, 0);
+            nxm_error();
             process_deferred_interrupts();
             return false;
         }
@@ -2148,7 +2204,7 @@ bool deqna_c::process_xbdl(void)
     // Status for implicit chain (multi-segment packets)
     const uint16_t implicit_chain_status[2] = {static_cast<uint16_t>(QNA_DSC_V | QNA_DSC_C), 1};
 
-    // Track starting address to detect circular chains (stale/garbage descriptors)
+    // Track starting address to detect circular chains (OpenSIMH-style)
     uint32_t start_xbdl_ba = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -2179,7 +2235,11 @@ bool deqna_c::process_xbdl(void)
         if (++desc_count > max_desc_count) {
             WARNING("DEQNA: TX descriptor limit reached (%u), stopping", max_desc_count);
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_XL, 0);
+            // XL indicates TX list exhausted/invalid; set XI so the guest driver
+            // wakes up to reclaim/restart rather than stalling and leaking mbufs.
+            csr_set_clr(static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_XI), 0);
+            write_buffer.len = 0;
+            write_buffer.used = 0;
             process_deferred_interrupts();
             return false;
         }
@@ -2188,15 +2248,6 @@ bool deqna_c::process_xbdl(void)
         if (trace.value)
             DEBUG("DEQNA: TX desc_read_words @ %08o words=%u", cur_ba, (unsigned)QE_RING_WORDS);
         if (!desc_read_words(cur_ba, words, QE_RING_WORDS)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            process_deferred_interrupts();
-            return false;
-        }
-
-        // Write 0xFFFF to word 0 to mark descriptor as claimed/used (like SIMH)
-        uint16_t flag_word = 0xFFFF;
-        if (!desc_write_words(cur_ba, &flag_word, 1)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
             process_deferred_interrupts();
@@ -2227,9 +2278,21 @@ bool deqna_c::process_xbdl(void)
                      cur_ba, words[1], words[2], address);
             }
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            csr_set_clr(QNA_CSR_XL, 0);
+            csr_set_clr(static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_XI), 0);
+            write_buffer.len = 0;
+            write_buffer.used = 0;
             process_deferred_interrupts();
             return true;
+        }
+
+        // Claim descriptor by writing 0xFFFF to word[0] (in-use marker).
+        // Do this only for real data descriptors (not chains, not V=0 list-end).
+        const uint16_t flag_word = 0xFFFF;
+        if (!desc_write_words(cur_ba, &flag_word, 1)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            nxm_error();
+            process_deferred_interrupts();
+            return false;
         }
 
         // Calculate buffer address and length
@@ -2752,10 +2815,22 @@ void deqna_c::worker_rx(void)
             dispatch_rbdl();
 
         // Poll for one incoming packet from network
-        // Only poll if receiver is enabled (RE=1) - don't queue packets before driver is ready
+        // Only poll if receiver is enabled (RE=1) - don't queue packets before driver is ready.
+        // NOTE: We check RE but NOT RL here. RL=1 means no descriptors available,
+        // but we should still accept packets into our internal queue. The real DEQNA
+        // has internal buffers that hold packets even when descriptor list is exhausted.
+        // When driver provides new descriptors (clears RL), we deliver queued packets.
         size_t len = 0;
+        bool capture_enabled = false;
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            if (csr & QNA_CSR_RE) {
+                if (!rx_delay_active || timeout_c::abstime_ns() >= rx_enable_deadline_ns)
+                    capture_enabled = true;
+            }
+        }
 #ifdef HAVE_PCAP
-        if (pcap.is_open() && rx_ready()) {
+        if (pcap.is_open() && capture_enabled) {
             if (!pcap.poll(pkt_buf, sizeof(pkt_buf), &len)) {
                 WARNING("DEQNA: pcap poll error: %s", pcap.last_error().c_str());
                 timeout_c::wait_ms(10);
