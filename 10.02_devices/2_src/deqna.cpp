@@ -30,8 +30,8 @@
  * Key design decisions follow documented behavior where the hardware
  * documentation is ambiguous:
  *
- * 1. LOOPBACK DETECTION: Loopback mode is active when IL=1 (internal) OR EL=1
- *    (external), independent of the RE (receive enable) bit.
+ * 1. LOOPBACK DETECTION: Loopback mode is active when IL=0 (internal) OR EL=1
+ *    (external), independent of the RE (receive enable) bit. IL is active LOW.
  *
  * 2. DESCRIPTOR BASE RECALCULATION: When dispatch_rbdl() or dispatch_xbdl()
  *    is called, the descriptor base address is recalculated from the RCLL/RCLH
@@ -523,8 +523,13 @@ void deqna_c::update_transceiver_bits(void)
 /*
  * Interrupt management
  * ---------------------
- * Interrupts are level-sensitive: asserted when IE=1 and (RI|XI) != 0.
- * set_int/clr_int update the internal irq flag and signal the bus.
+ * Interrupts use a one-shot model: when RI/XI becomes set with IE=1, an
+ * interrupt is raised. After the vector is fetched (interrupt acknowledged),
+ * the internal irq flag is cleared so that new interrupts can be raised.
+ * The RI/XI bits in CSR remain set until explicitly cleared via W1C.
+ *
+ * SIMH behavior: xq_int() auto-clears the interrupt when vector is fetched.
+ * We emulate this by checking intr_request.complete in update_intr().
  */
 void deqna_c::set_int(void)
 {
@@ -623,10 +628,26 @@ void deqna_c::start_rx_delay(void)
  *
  * Uses edge detection to only signal on transitions, avoiding
  * redundant bus operations.
+ *
+ * Key fix for interrupt handling: When a previous interrupt has been
+ * acknowledged (vector fetched, intr_request.complete=true), we must
+ * reset the edge detector so that new interrupts can be raised even
+ * if irq is still true. This matches SIMH behavior where xq_int()
+ * auto-clears the interrupt when the vector is fetched.
  */
 void deqna_c::update_intr(void)
 {
     bool level = irq;
+
+    // If we're trying to raise an interrupt and a previous one has completed,
+    // reset the edge detector. This allows new interrupts to be raised even
+    // when the CSR bits (RI/XI) are still set from a previous interrupt.
+    if (level && intr_request.complete) {
+        intr_request.edge_detect_reset();
+        if (trace.value) {
+            DEBUG("DEQNA: INTR edge reset after completion, csr=%06o", csr);
+        }
+    }
 
     switch (intr_request.edge_detect(level)) {
     case intr_request_c::INTERRUPT_EDGE_RAISING:
@@ -801,8 +822,24 @@ void deqna_c::update_pcap_filter(void)
     if (!pcap.is_open())
         return;
 
-    if (promisc.value || setup.promiscuous) {
-        if (!pcap.set_filter("ip or not ip")) {
+    // Build a filter to exclude packets from our own source MAC.
+    // libpcap can deliver outgoing packets back to us; we want to reject them.
+    char srcbuf[64] = {0};
+    if (!mac_is_zero(mac_addr)) {
+        snprintf(srcbuf, sizeof(srcbuf), "not ether src %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+    }
+    const bool have_src_excl = srcbuf[0] != '\0';
+
+    // setup.promiscuous is set by the guest OS via setup frame - if set, deliver all packets.
+    // promisc.value controls whether the HOST interface is in promiscuous mode (pcap.open),
+    // but does NOT bypass emulated MAC filtering - only setup.promiscuous does that.
+    if (setup.promiscuous) {
+        std::string filter = "ip or not ip";
+        if (have_src_excl) {
+            filter = std::string(srcbuf) + " and (" + filter + ")";
+        }
+        if (!pcap.set_filter(filter)) {
             WARNING("DEQNA: pcap filter set failed: %s", pcap.last_error().c_str());
         }
         return;
@@ -836,6 +873,11 @@ void deqna_c::update_pcap_filter(void)
     if (filter.empty())
         filter = "ip or not ip";
 
+    // Exclude packets from our own source MAC
+    if (have_src_excl) {
+        filter = "(" + filter + ") and " + srcbuf;
+    }
+
     if (!pcap.set_filter(filter)) {
         WARNING("DEQNA: pcap filter set failed: %s", pcap.last_error().c_str());
     }
@@ -852,6 +894,14 @@ bool deqna_c::accept_packet(const uint8_t *data, size_t len) const
 {
     if (!data || len < 6)
         return false;
+
+    // libpcap can deliver "outgoing" packets for the capture interface. Real DEQNA
+    // hardware doesn't receive its own transmitted frames unless loopback is active.
+    if (len >= 12) {
+        const uint8_t *src = data + 6;
+        if (!mac_is_zero(mac_addr) && mac_equal(src, mac_addr))
+            return false;
+    }
 
     if (setup.promiscuous)
         return true;
@@ -1105,10 +1155,8 @@ bool deqna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
     }
 
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-//    WARNING("DEQNA: DMA write_words addr=%06o words=%zu", addr, wordcount);
     qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
             const_cast<uint16_t *>(buffer), wordcount);
-//    WARNING("DEQNA: DMA write_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
     return dma_request.success;
 }
 
@@ -1846,7 +1894,7 @@ void deqna_c::write_callback(int status)
  * 4. Handle C (chain) bit - follow chain to next descriptor
  * 5. DMA packet data from buffer address, accumulating in write_buffer
  * 6. On E (end of message):
- *    - Check for loopback mode (EL=1 or IL=1 with RE=0)
+ *    - Check for loopback mode (EL=1 or IL=0)
  *    - Check for setup packet (S bit)
  *    - Either loopback/setup locally, or send via pcap
  * 7. Write status words
@@ -1968,14 +2016,16 @@ bool deqna_c::process_xbdl(void)
                     // Setup packets force loopback regardless of CSR loopback state.
                     enqueue_readq(0, write_buffer.msg.data(), write_buffer.len, 0);
                     enqueued = true;
-                    // Setup TX status: word1=0x0000, word2=0x0860 (per SIMH)
-                    write_success[0] = 0x0000;
+                    // Setup TX status: word1=0x200C, word2=0x0860 (per SIMH)
+                    // Bit 13 (0x2000) is "always set", bits 3:2 (0x000C) are setup-specific
+                    write_success[0] = 0x200C;
                     write_success[1] = 0x0860;
                 } else {
                     enqueue_readq(1, write_buffer.msg.data(), write_buffer.len, 0);
                     enqueued = true;
-                    // Loopback TX status: set FAIL bit (heartbeat check failure)
-                    write_success[0] = QE_FAIL;
+                    // Loopback TX status: bit 13 always set (0x2000) + FAIL bit (0x0100) = 0x2100
+                    // FAIL bit indicates heartbeat check failure, which is normal for loopback
+                    write_success[0] = 0x2100;
                 }
                 if (trace.value) {
                     DEBUG("DEQNA: TX loopback/setup status st1=%06o st2=%06o desc=%06o",

@@ -1846,6 +1846,15 @@ bool deuna_c::accept_packet(const uint8_t *data, size_t len) const
     if (!data || len < 6)
         return false;
 
+    // Filter out packets from our own source MAC. libpcap can deliver our own
+    // transmitted frames back to us (outgoing packets), but real Ethernet
+    // hardware doesn't receive its own transmitted frames unless loopback is active.
+    if (len >= 12) {
+        const uint8_t *src = data + 6;
+        if (!mac_is_zero(mac_addr) && mac_equal(src, mac_addr))
+            return false;
+    }
+
     if (setup.promiscuous)
         return true;
 
@@ -1879,8 +1888,21 @@ void deuna_c::update_pcap_filter(void)
     if (!pcap.is_open())
         return;
 
+    // Build a filter to exclude packets from our own source MAC.
+    // libpcap can deliver outgoing packets back to us; we want to reject them.
+    char srcbuf[64] = {0};
+    if (!mac_is_zero(mac_addr)) {
+        snprintf(srcbuf, sizeof(srcbuf), "not ether src %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+    }
+    const bool have_src_excl = srcbuf[0] != '\0';
+
     if (setup.promiscuous) {
-        if (!pcap.set_filter("ip or not ip"))
+        std::string filter = "ip or not ip";
+        if (have_src_excl) {
+            filter = std::string(srcbuf) + " and (" + filter + ")";
+        }
+        if (!pcap.set_filter(filter))
             WARNING("DEUNA: pcap filter set failed: %s", pcap.last_error().c_str());
         return;
     }
@@ -1912,6 +1934,11 @@ void deuna_c::update_pcap_filter(void)
 
     if (filter.empty())
         filter = "ip or not ip";
+
+    // Exclude packets from our own source MAC
+    if (have_src_excl) {
+        filter = "(" + filter + ") and " + srcbuf;
+    }
 
     if (!pcap.set_filter(filter))
         WARNING("DEUNA: pcap filter set failed: %s", pcap.last_error().c_str());
