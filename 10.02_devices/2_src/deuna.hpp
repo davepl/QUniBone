@@ -23,10 +23,8 @@
 #include <condition_variable>
 #include <atomic>
 
-#include "qunibusdevice.hpp"
-#include "priorityrequest.hpp"
+#include "dec_ether_base.hpp"
 #include "parameter.hpp"
-#include "pcap_bridge.hpp"
 
 /*
  * Default DEUNA I/O page parameters
@@ -45,7 +43,7 @@
 #define DEUNA_REG_PCSR2 2
 #define DEUNA_REG_PCSR3 3
 
-class deuna_c : public qunibusdevice_c {
+class deuna_c : public dec_ether_base_c {
 public:
     deuna_c();
     ~deuna_c() override;
@@ -63,6 +61,8 @@ public:
             "%d", "RX ring scan limit (0 = no limit)", 0, 10);
     parameter_unsigned_c tx_slots = parameter_unsigned_c(this, "tx_slots", "tx", false, "",
             "%d", "TX ring scan limit (0 = no limit)", 0, 10);
+    parameter_unsigned_c intr_dma_holdoff_us = parameter_unsigned_c(this, "intr_dma_holdoff_us", "idh", false, "",
+            "%d", "DMA holdoff after INTR assert in us (0 = disable)", 16, 10);
     parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
             "Trace CSR/ring events to log");
 
@@ -104,22 +104,9 @@ private:
     qunibusdevice_register_t *reg_pcsr3 = nullptr;
 
     /*
-     * Bus requests for interrupts and DMA
-     */
-    intr_request_c intr_request = intr_request_c(this);
-    dma_request_c dma_request = dma_request_c(this);
-    dma_request_c dma_desc_request = dma_request_c(this);
-
-    /*
-     * Network bridge to host interface via libpcap
-     */
-    PcapBridge pcap;
-
-    /*
      * Thread synchronization
      */
     std::recursive_mutex state_mutex;
-    std::recursive_mutex dma_mutex;
     std::mutex queue_mutex;  // New: Serialize queue access from PCAP callbacks
     std::atomic<bool> reset_in_progress{false};  // New: Flag to abort worker operations during reset
 
@@ -251,7 +238,11 @@ private:
      */
     void update_pcsr_regs(void);
     void update_transceiver_bits(void);
-    void update_intr(void);
+    void update_intr(void) override;
+    uint64_t intr_dma_holdoff_us_value(void) const override
+    {
+        return static_cast<uint64_t>(intr_dma_holdoff_us.value);
+    }
 
     /*
      * Register write handling
@@ -261,15 +252,7 @@ private:
     void apply_pending_reg_writes(void);
     void process_pending_command(void);
 
-    /*
-     * DMA operations
-     */
-    bool dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
-    bool dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
-    bool desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
-    bool desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
-    bool dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len);
-    bool dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len);
+    // DMA operations are inherited from dec_ether_base_c.
     bool cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
     bool cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len);
     bool process_bootrom(uint32_t dst_addr);

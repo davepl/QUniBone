@@ -103,10 +103,8 @@
 #include <mutex>
 #include <atomic>
 
-#include "qunibusdevice.hpp"
-#include "priorityrequest.hpp"
+#include "dec_ether_base.hpp"
 #include "parameter.hpp"
-#include "pcap_bridge.hpp"
 #include "deqna_regs.h"
 
 /*
@@ -128,7 +126,7 @@
  * Provides all register handling, DMA operations, and network bridging for
  * DEQNA Ethernet controller emulation.
  */
-class deqna_c : public qunibusdevice_c {
+class deqna_c : public dec_ether_base_c {
 public:
     deqna_c();
     ~deqna_c() override;
@@ -214,23 +212,6 @@ private:
     qunibusdevice_register_t *reg_csr = nullptr;
 
     /*
-     * Bus requests for interrupts and DMA
-     * -----------------------------------
-     * intr_request: Interrupt request (BR5 typically)
-     * dma_request: DMA request for packet data transfer
-     * dma_desc_request: Separate DMA request for descriptor access
-     *                   (allows different priority/timing if needed)
-     */
-    intr_request_c intr_request = intr_request_c(this);
-    dma_request_c dma_request = dma_request_c(this);
-    dma_request_c dma_desc_request = dma_request_c(this);
-
-    /*
-     * Network bridge to host interface via libpcap
-     */
-    PcapBridge pcap;
-
-    /*
      * Thread synchronization
      * ----------------------
      * state_mutex: Protects device state (csr, rbdl_ba, ring state, setup, etc.)
@@ -242,7 +223,6 @@ private:
      *                           ALL descriptor processing is complete.
      */
     std::recursive_mutex state_mutex;
-    std::recursive_mutex dma_mutex;
     std::mutex queue_mutex;  // Serialize queue access from PCAP callbacks
     std::mutex descriptor_process_mutex;  // Serialize ALL descriptor processing (RX + TX)
     std::atomic<bool> reset_in_progress{false};  // Flag to abort worker operations during reset
@@ -373,7 +353,6 @@ private:
     uint16_t var = 0;
     uint16_t csr = 0;
     bool irq = false;
-    std::atomic<unsigned> dma_in_progress{0};
 
     uint32_t rbdl_ba = 0;
     uint32_t xbdl_ba = 0;
@@ -416,9 +395,6 @@ private:
      */
     std::atomic<bool> deferred_set_int{false};
     std::atomic<bool> deferred_clr_int{false};
-    // Short DMA holdoff window after raising INTR to reduce PRU deadlocks during IACK.
-    // If the CPU doesn't acknowledge quickly (e.g., interrupts masked), DMA resumes.
-    std::atomic<uint64_t> intr_dma_holdoff_until_ns{0};
 
     int idtmr = 0;
 
@@ -449,9 +425,16 @@ private:
     void update_vector_reg(void);
     void update_csr_reg(void);
     void update_transceiver_bits(void);
-    void update_intr(void);
+    void update_intr(void) override;
     void service_intr_complete(void);
-    void holdoff_dma_if_intr_pending(void);
+    uint64_t intr_dma_holdoff_us_value(void) const override
+    {
+        return static_cast<uint64_t>(intr_dma_holdoff_us.value);
+    }
+    void service_intr_complete_for_dma_holdoff(void) override
+    {
+        service_intr_complete();
+    }
 
     /*
      * Interrupt control
@@ -496,25 +479,7 @@ private:
     void handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access);
     void apply_pending_reg_writes(void);
 
-    /*
-     * DMA operations
-     * ---------------
-     * dma_read_words: Read 16-bit words from host memory
-     * dma_write_words: Write 16-bit words to host memory
-     * desc_read_words: Read descriptor words (separate DMA request)
-     * desc_write_words: Write descriptor words
-     * dma_read_bytes: Read bytes (handles odd addresses/lengths)
-     * dma_write_bytes: Write bytes (handles odd addresses/lengths)
-     *
-     * All functions return true on success, false on NXM error.
-     * DDR memory is accessed directly if available, otherwise bus DMA.
-     */
-    bool dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
-    bool dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
-    bool desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
-    bool desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
-    bool dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len);
-    bool dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len);
+    // DMA operations are inherited from dec_ether_base_c.
 
     /*
      * Address calculation

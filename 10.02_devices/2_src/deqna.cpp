@@ -257,7 +257,7 @@ static bool mac_equal(const uint8_t *a, const uint8_t *b)
  *   - Default MAC address (DEC OUI with a fixed suffix)
  *   - Packet buffers sized for maximum Ethernet frames
  */
-deqna_c::deqna_c() : qunibusdevice_c()
+deqna_c::deqna_c() : dec_ether_base_c()
 {
     set_workers_count(2);  // Instance 0 = RX, Instance 1 = TX
 
@@ -351,7 +351,7 @@ deqna_c::deqna_c() : qunibusdevice_c()
     rx_slots.value = 0;
     tx_slots.value = 0;
     rx_start_delay_ms.value = 0;
-    intr_dma_holdoff_us.value = 2000;
+    intr_dma_holdoff_us.value = 200;
     trace.value = false;
 
     // Default MAC address for the emulated adapter (DEC OUI + fixed suffix)
@@ -582,13 +582,6 @@ void deqna_c::update_transceiver_bits(void)
 void deqna_c::set_int(void)
 {
     irq = true;
-    const uint64_t holdoff_us = intr_dma_holdoff_us.value;
-    if (holdoff_us) {
-        intr_dma_holdoff_until_ns.store(timeout_c::abstime_ns() + holdoff_us * 1000ull,
-                std::memory_order_release);
-    } else {
-        intr_dma_holdoff_until_ns.store(0, std::memory_order_release);
-    }
     if (trace.value)
         DEBUG("DEQNA: INTR assert, csr=%06o ie=%d", csr, (csr & QNA_CSR_IE) ? 1 : 0);
     update_intr();
@@ -597,7 +590,7 @@ void deqna_c::set_int(void)
 void deqna_c::clr_int(void)
 {
     irq = false;
-    intr_dma_holdoff_until_ns.store(0, std::memory_order_release);
+    note_intr_deasserted();
     if (trace.value)
         DEBUG("DEQNA: INTR deassert, csr=%06o ie=%d", csr, (csr & QNA_CSR_IE) ? 1 : 0);
     update_intr();
@@ -663,28 +656,6 @@ void deqna_c::service_intr_complete(void)
     clr_int();
 }
 
-void deqna_c::holdoff_dma_if_intr_pending(void)
-{
-    // Hold off DMA briefly after asserting INTR to give the CPU time to complete IACK.
-    // This reduces IACK timeouts caused by the PRU being mid-DMA and unable to respond.
-    for (;;) {
-        uint64_t until = intr_dma_holdoff_until_ns.load(std::memory_order_acquire);
-        if (until == 0)
-            return;
-        const uint64_t now = timeout_c::abstime_ns();
-        if (now >= until) {
-            (void)intr_dma_holdoff_until_ns.compare_exchange_strong(until, 0,
-                    std::memory_order_acq_rel, std::memory_order_acquire);
-            return;
-        }
-        // If the CPU already fetched the vector, clear the latch so DMA can continue.
-        service_intr_complete();
-        if (intr_dma_holdoff_until_ns.load(std::memory_order_acquire) == 0)
-            return;
-        timeout_c::wait_us(10);
-    }
-}
-
 void deqna_c::nxm_error(void)
 {
     WARNING("DEQNA: NXM error triggered!");
@@ -741,6 +712,7 @@ void deqna_c::update_intr(void)
 
     switch (intr_request.edge_detect(level)) {
     case intr_request_c::INTERRUPT_EDGE_RAISING:
+        note_intr_asserted();
         if (trace.value) {
             INFO("DEQNA: INTR assert, csr=%06o vec=%03o level=%d",
                  csr, intr_request.get_vector(), intr_request.get_level());
@@ -1285,308 +1257,6 @@ void deqna_c::apply_pending_reg_writes(void)
     }
 }
 
-/* dma_read_words - Perform a DMA read operation
- *
- * Reads 'wordcount' words from 'addr' into 'buffer' using DMA.
- * Returns true on success, false on failure (e.g., NXM).
- * Handles DDR memory accesses directly if applicable.
- */
-
-bool deqna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
-{
-    if (wordcount == 0)
-        return true;
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64) {
-        WARNING("DEQNA: dma_read_words bounds check failed: addr=%06o words=%zu max=%llu",
-                addr, wordcount, static_cast<unsigned long long>(max));
-        return false;
-    }
-
-    if (ddrmem && ddrmem->enabled &&
-        addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
-                return false;
-        }
-        return true;
-    }
-
-    holdoff_dma_if_intr_pending();
-    dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
-    // Deassert bus INTR while DMA is in progress (QuNiBone PRU quirk).
-    update_intr();
-
-    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-//    WARNING("DEQNA: DMA read_words addr=%06o words=%zu", addr, wordcount);
-    qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
-//    WARNING("DEQNA: DMA read_words done addr=%06o ok=%d", addr, dma_request.success ? 1 : 0);
-    dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
-    update_intr();
-    return dma_request.success;
-}
-
-/* dma_write_words - Perform a DMA write operation
- *
- * Writes 'wordcount' words from 'buffer' to 'addr' using DMA.
- * Returns true on success, false on failure (e.g., NXM).
- * Handles DDR memory accesses directly if applicable.
- */
-
-bool deqna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
-{
-    if (wordcount == 0)
-        return true;
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64) {
-        WARNING("DEQNA: dma_write_words bounds check failed: addr=%06o words=%zu max=%llu",
-                addr, wordcount, static_cast<unsigned long long>(max));
-        return false;
-    }
-
-    if (ddrmem && ddrmem->enabled &&
-        addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
-                return false;
-        }
-        return true;
-    }
-
-    holdoff_dma_if_intr_pending();
-    dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
-    update_intr();
-
-    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
-            const_cast<uint16_t *>(buffer), wordcount);
-    dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
-    update_intr();
-    return dma_request.success;
-}
-
-/* desc_read_words - Perform a descriptor read operation
- *
- * Reads 'wordcount' words from 'addr' into 'buffer' using DMA.
- * Returns true on success, false on failure (e.g., NXM).
- * Handles DDR memory accesses directly if applicable.
- */
-
-bool deqna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
-{
-    if (wordcount == 0)
-        return true;
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64) {
-        WARNING("DEQNA: desc_read_words bounds check failed: addr=%06o words=%zu max=%llu",
-                addr, wordcount, static_cast<unsigned long long>(max));
-        return false;
-    }
-
-    if (ddrmem && ddrmem->enabled &&
-        addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
-                return false;
-        }
-        return true;
-    }
-
-    if (trace.value) {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        INFO("DEQNA: %s desc_read_words addr=%08o words=%zu csr=%06o rbdl_ba=%08o xbdl_ba=%08o",
-             deqna_thread_ctx, addr, wordcount, csr, rbdl_ba, xbdl_ba);
-    }
-
-    holdoff_dma_if_intr_pending();
-    dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
-    update_intr();
-
-    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
-    dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
-    update_intr();
-    return dma_desc_request.success;
-}
-
-/* desc_write_words - Perform a descriptor write operation
- *
- * Writes 'wordcount' words from 'buffer' to 'addr' using DMA.
- * Returns true on success, false on failure (e.g., NXM).
- * Handles DDR memory accesses directly if applicable.
- */
-
-bool deqna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
-{
-    if (wordcount == 0)
-        return true;
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64) {
-        WARNING("DEQNA: desc_write_words bounds check failed: addr=%06o words=%zu max=%llu",
-                addr, wordcount, static_cast<unsigned long long>(max));
-        return false;
-    }
-
-    if (ddrmem && ddrmem->enabled &&
-        addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
-                return false;
-        }
-        return true;
-    }
-
-    holdoff_dma_if_intr_pending();
-    dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
-    update_intr();
-
-    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,
-            const_cast<uint16_t *>(buffer), wordcount);
-    dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
-    update_intr();
-    return dma_desc_request.success;
-}
-
-/* dma_read_bytes - Perform a DMA read operation for bytes  
- *
- * Reads 'len' bytes from 'addr' into 'buffer' using DMA.
- * Returns true on success, false on failure (e.g., NXM).
- * Handles odd-length reads by reading an extra word if needed.
- */
-
-bool deqna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
-{
-    if (len == 0)
-        return true;
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(len);
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64)
-        return false;
-
-    if (addr & 1) {
-        uint16_t word = 0;
-        if (addr == 0 || !dma_read_words(addr - 1, &word, 1))
-            return false;
-        buffer[0] = word_high(word);
-        addr += 1;
-        buffer += 1;
-        len -= 1;
-    }
-
-    size_t full_words = len / 2;
-    if (full_words) {
-        std::vector<uint16_t> words(full_words);
-        if (!dma_read_words(addr, words.data(), full_words))
-            return false;
-        for (size_t i = 0; i < full_words; ++i) {
-            buffer[2 * i] = word_low(words[i]);
-            buffer[2 * i + 1] = word_high(words[i]);
-        }
-    }
-
-    if (len & 1) {
-        uint16_t word = 0;
-        if (!dma_read_words(addr + full_words * 2, &word, 1))
-            return false;
-        buffer[len - 1] = word_low(word);
-    }
-    return true;
-}
-
-/* dma_write_bytes - Perform a DMA write operation for bytes  
- *
- * Writes 'len' bytes from 'buffer' to 'addr' using DMA.
- * Returns true on success, false on failure (e.g., NXM).
- * Handles odd-length writes by reading-modifying-writing an extra word if needed.
- */
-
-bool deqna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
-{
-    if (len == 0)
-        return true;
-
-    /* Debug: Log DMA writes for setup packets and suspicious lengths */
-    if (trace.value && len <= 256) {
-        std::string h;
-        size_t dump = (len > 16) ? 16 : len;
-        char tmp[8];
-        for (size_t i = 0; i < dump; ++i) {
-            snprintf(tmp, sizeof(tmp), "%02x", buffer[i]);
-            h += tmp;
-        }
-        DEBUG("DEQNA: DMA WRITE addr=%08o len=%zu data_prefix=%s", addr, len, h.c_str());
-    }
-
-    if (trace.value && (addr & 1))
-        DEBUG("DEQNA: DMA WRITE odd addr=%08o len=%zu", addr, len);
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(len);
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64)
-        return false;
-
-    if (addr & 1) {
-        uint16_t word = 0;
-        if (addr == 0 || !dma_read_words(addr - 1, &word, 1))
-            return false;
-        word = static_cast<uint16_t>((word & 0x00ff) | (buffer[0] << 8));
-        if (!dma_write_words(addr - 1, &word, 1))
-            return false;
-        addr += 1;
-        buffer += 1;
-        len -= 1;
-    }
-
-    const size_t max_words_per_dma = 64;
-    size_t full_words = len / 2;
-    if (full_words) {
-        size_t word_index = 0;
-        while (word_index < full_words) {
-            size_t chunk_words = full_words - word_index;
-            if (chunk_words > max_words_per_dma)
-                chunk_words = max_words_per_dma;
-
-            std::vector<uint16_t> words(chunk_words);
-            for (size_t i = 0; i < chunk_words; ++i) {
-                size_t byte_index = (word_index + i) * 2;
-                words[i] = static_cast<uint16_t>(buffer[byte_index])
-                        | static_cast<uint16_t>(buffer[byte_index + 1] << 8);
-            }
-
-            uint32_t addr_offset = static_cast<uint32_t>(word_index * 2);
-            if (!dma_write_words(addr + addr_offset, words.data(), chunk_words))
-                return false;
-
-            word_index += chunk_words;
-        }
-    }
-
-    if (len & 1) {
-        uint16_t word = 0;
-        if (!dma_read_words(addr + full_words * 2, &word, 1))
-            return false;
-        word = static_cast<uint16_t>((word & 0xff00) | buffer[len - 1]);
-        if (!dma_write_words(addr + full_words * 2, &word, 1))
-            return false;
-    }
-
-    return true;
-}
-
 /*
  * enqueue_readq - Add a received packet to the RX queue
  *
@@ -1837,6 +1507,19 @@ bool deqna_c::process_rbdl(void)
             return false;
         }
 
+        // Mark descriptor processed/in-use by writing 0xFFFF to word[0].
+        // OpenSIMH does this unconditionally for each descriptor it touches,
+        // including explicit chain and list-end (V=0) descriptors.
+        const uint16_t flag_word = 0xFFFF;
+        if (!desc_write_words(cur_ba, &flag_word, 1)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            nxm_error();
+            process_deferred_interrupts();
+            return false;
+        }
+
+        // RX: OpenSIMH checks V (valid) BEFORE C (chain). A chain pointer is only
+        // followed when the descriptor is valid.
         if (~words[1] & QNA_DSC_V) {
             if (trace.value) {
                 uint32_t address = make_addr(words[1], words[2]) & ~1u;
@@ -1860,18 +1543,6 @@ bool deqna_c::process_rbdl(void)
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             rbdl_ba = next_ba;
             continue;
-        }
-
-        // Claim descriptor by writing 0xFFFF to word[0] (in-use marker).
-        // Do this only for real data descriptors (V=1 and not a chain pointer).
-        // The BSD driver does not clear word[0], so we must not use word[0] to
-        // infer ownership; it is purely a device-written marker.
-        const uint16_t flag_word = 0xFFFF;
-        if (!desc_write_words(cur_ba, &flag_word, 1)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            process_deferred_interrupts();
-            return false;
         }
 
         queue_item item;
@@ -2177,9 +1848,9 @@ void deqna_c::write_callback(int status)
  *
  * This is the main TX processing loop. For each descriptor:
  * 1. Read all descriptor words
- * 2. Write 0xFFFF flag to claim descriptor
- * 3. Check V (valid) bit - if clear, set XL and stop
- * 4. Handle C (chain) bit - follow chain to next descriptor
+ * 2. Write 0xFFFF flag to mark descriptor processed
+ * 3. Handle C (chain) bit - follow chain to next descriptor
+ * 4. Check V (valid) bit - if clear, set XL and stop
  * 5. DMA packet data from buffer address, accumulating in write_buffer
  * 6. On E (end of message):
  *    - Check for loopback mode (EL=1 or IL=0)
@@ -2254,6 +1925,16 @@ bool deqna_c::process_xbdl(void)
             return false;
         }
 
+        // Mark descriptor processed/in-use by writing 0xFFFF to word[0] (OpenSIMH-style).
+        // Do this before evaluating C/V so chain and list-end descriptors are also marked.
+        const uint16_t flag_word = 0xFFFF;
+        if (!desc_write_words(cur_ba, &flag_word, 1)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            nxm_error();
+            process_deferred_interrupts();
+            return false;
+        }
+
         // IMPORTANT: Check C (chain) bit BEFORE V (valid) bit!
         // When C=1, this is a chain pointer - follow it regardless of V.
         // SIMH does it this way (see xq_process_xbdl in pdp11_xq.c).
@@ -2283,16 +1964,6 @@ bool deqna_c::process_xbdl(void)
             write_buffer.used = 0;
             process_deferred_interrupts();
             return true;
-        }
-
-        // Claim descriptor by writing 0xFFFF to word[0] (in-use marker).
-        // Do this only for real data descriptors (not chains, not V=0 list-end).
-        const uint16_t flag_word = 0xFFFF;
-        if (!desc_write_words(cur_ba, &flag_word, 1)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            process_deferred_interrupts();
-            return false;
         }
 
         // Calculate buffer address and length

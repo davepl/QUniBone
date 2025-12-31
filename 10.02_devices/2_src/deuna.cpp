@@ -3,10 +3,23 @@
  * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
  * Contributed under the GPL2 License
  *
- * This is a clean-room implementation based on:
+ * This is an implementation based on:
  *   - DEC DEUNA User's Guide (EK-DEUNA-UG)
  *   - UNIBUS specification
  *
+ *   May be based in part on the OpenSIMH project:
+ * 
+ *   Copyright (c) 1993-2008, Robert M Supnik
+ *   Permission is hereby granted, free of charge, to any person obtaining a
+ *   copy of this software and associated documentation files (the "Software"),
+ *   to deal in the Software without restriction, including without limitation
+ *   the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ *   and/or sell copies of the Software, and to permit persons to whom the
+ *   Software is furnished to do so, subject to the following conditions:
+ *
+ *   The above copyright notice and this permission notice shall be included in
+ *   all copies or substantial portions of the Software.
+ * 
  * Theory of Operation
  * -------------------
  * The DEUNA exposes four UNIBUS registers (PCSR0-3). PCSR0 is the command/status
@@ -285,7 +298,7 @@ static bool mac_equal(const uint8_t *a, const uint8_t *b)
  * Behavior: initializes registers, defaults, MAC, and buffers for emulation.
  * Notes: sets host-interface defaults (e.g., ifname) and DEC-range MAC.
  */
-deuna_c::deuna_c() : qunibusdevice_c()
+deuna_c::deuna_c() : dec_ether_base_c()
 {
     set_workers_count(2);  // Instance 0 = RX, Instance 1 = TX
 
@@ -342,6 +355,7 @@ deuna_c::deuna_c() : qunibusdevice_c()
     promisc.value = true;
     rx_slots.value = 0;
     tx_slots.value = 0;
+    intr_dma_holdoff_us.value = 200;
     trace.value = false;
 
     /* Default MAC in DEC range */
@@ -611,6 +625,7 @@ void deuna_c::update_intr(void)
         return;
 
     const bool inte = (pcsr0 & PCSR0_INTE) != 0;
+    const bool dma_ok = (dma_in_progress.load(std::memory_order_relaxed) == 0);
     if (!inte) {
         if (trace.value && any)
             WARNING("DEUNA: INTR suppressed (INTE=0) pcsr0=%06o", pcsr0);
@@ -619,6 +634,21 @@ void deuna_c::update_intr(void)
             irq = false;
             if (trace.value)
                 WARNING("DEUNA: INTR deassert pcsr0=%06o", pcsr0);
+        }
+        // If interrupts are disabled, don't stall DMA for a prior INTR event.
+        note_intr_deasserted();
+        return;
+    }
+
+    // QuNiBone PRU quirk: avoid holding INTR asserted while DMA is in progress.
+    // Real UNIBUS/QBUS can perform NPR DMA while BR lines are asserted, but the
+    // current PRU arbitration model can deadlock if IACK happens mid-DMA.
+    if (!dma_ok) {
+        if (irq) {
+            qunibusadapter->cancel_INTR(intr_request);
+            irq = false;
+            if (trace.value)
+                WARNING("DEUNA: INTR deassert (DMA in progress) pcsr0=%06o", pcsr0);
         }
         return;
     }
@@ -630,10 +660,14 @@ void deuna_c::update_intr(void)
     }
 
     if (any) {
+        note_intr_asserted();
         qunibusadapter->INTR(intr_request, reg_pcsr0, pcsr0);
         irq = true;
         if (trace.value)
             WARNING("DEUNA: INTR assert pcsr0=%06o vec=%03o level=%d", pcsr0, intr_vector.value, intr_level.value);
+    } else {
+        // No pending interrupt conditions; clear any holdoff arm.
+        note_intr_deasserted();
     }
 }
 
@@ -915,238 +949,6 @@ void deuna_c::process_pending_command(void)
         if (trace.value)
             WARNING("DEUNA: Worker command done, pcsr0=%06o", pcsr0);
     }
-}
-
-/*
- * deuna_c::dma_read_words
- * Purpose: DMA read helper for device descriptors and buffers.
- * Behavior: reads from UNIBUS or DDR-backed memory into a word buffer.
- * Notes: returns false on NXM; callers must handle failures.
- */
-bool deuna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
-{
-    if (wordcount == 0)
-        return true;
-
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64)
-        return false;
-
-    if (ddrmem && ddrmem->enabled &&
-        addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i])) {
-                WARNING("DEUNA: DDR exam failed");
-                return false;
-            }
-        }
-        return true;
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
-    return dma_request.success;
-}
-
-/*
- * deuna_c::dma_write_words
- * Purpose: DMA write helper for descriptors and status back to PDP-11 memory.
- * Behavior: writes word buffers into UNIBUS or DDR-backed memory.
- * Notes: returns false on NXM; callers should set PCEI/ERR as needed.
- */
-bool deuna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
-{
-    if (wordcount == 0)
-        return true;
-
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64)
-        return false;
-
-    if (ddrmem && ddrmem->enabled &&
-        addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i])) {
-                WARNING("DEUNA: DDR deposit failed");
-                return false;
-            }
-        }
-        return true;
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
-                        const_cast<uint16_t*>(buffer), wordcount);
-    return dma_request.success;
-}
-
-/*
- * deuna_c::desc_read_words
- * Purpose: descriptor read wrapper with NXM handling.
- * Behavior: performs DMA reads and updates error status on failure.
- * Notes: used by RX/TX descriptor processing; keep error semantics consistent.
- */
-bool deuna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
-{
-    if (wordcount == 0)
-        return true;
-
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64)
-        return false;
-
-    if (ddrmem && ddrmem->enabled &&
-        addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
-                return false;
-        }
-        return true;
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
-    return dma_desc_request.success;
-}
-
-/*
- * deuna_c::desc_write_words
- * Purpose: descriptor write wrapper with NXM handling.
- * Behavior: performs DMA writes and updates error status on failure.
- * Notes: used when returning ownership or status to the PDP-11.
- */
-bool deuna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
-{
-    if (wordcount == 0)
-        return true;
-
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64)
-        return false;
-
-    if (ddrmem && ddrmem->enabled &&
-        addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
-                return false;
-        }
-        return true;
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,
-                        const_cast<uint16_t*>(buffer), wordcount);
-    return dma_desc_request.success;
-}
-
-/*
- * deuna_c::dma_read_bytes
- * Purpose: byte-granular DMA reader for Ethernet frames.
- * Behavior: reads bytes from PDP-11 memory using aligned word reads.
- * Notes: handles odd-byte alignment; expects len <= frame size.
- */
-bool deuna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
-{
-    if (len == 0)
-        return true;
-
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(len);
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64)
-        return false;
-
-    if ((addr & 1) == 0 && (len & 1) == 0) {
-        std::vector<uint16_t> tmp(len / 2, 0);
-        if (!dma_read_words(addr, tmp.data(), tmp.size()))
-            return false;
-        for (size_t i = 0; i < len; ++i) {
-            size_t word_index = i / 2;
-            bool high = (i & 1) != 0;
-            uint16_t w = tmp[word_index];
-            buffer[i] = high ? static_cast<uint8_t>((w >> 8) & 0xff)
-                             : static_cast<uint8_t>(w & 0xff);
-        }
-        return true;
-    }
-
-    std::vector<uint16_t> tmp((len + 1) / 2, 0);
-    if (!dma_read_words(addr & ~1u, tmp.data(), tmp.size()))
-        return false;
-
-    size_t offset = addr & 1u;
-    for (size_t i = 0; i < len; ++i) {
-        size_t word_index = (i + offset) / 2;
-        bool high = ((i + offset) & 1) != 0;
-        uint16_t w = tmp[word_index];
-        buffer[i] = high ? static_cast<uint8_t>((w >> 8) & 0xff) : static_cast<uint8_t>(w & 0xff);
-    }
-    return true;
-}
-
-/*
- * deuna_c::dma_write_bytes
- * Purpose: byte-granular DMA writer for Ethernet frames.
- * Behavior: writes bytes into PDP-11 memory using aligned word writes.
- * Notes: handles odd alignment; callers should verify buffer lengths.
- */
-bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
-{
-    if (len == 0)
-        return true;
-
-    uint64_t addr64 = addr;
-    uint64_t byte_count = static_cast<uint64_t>(len);
-    uint64_t max = qunibus->addr_space_byte_count;
-    if (max == 0 || addr64 >= max || byte_count > max - addr64)
-        return false;
-
-    if ((addr & 1) == 0 && (len & 1) == 0) {
-        std::vector<uint16_t> tmp(len / 2, 0);
-        for (size_t i = 0; i < len; ++i) {
-            size_t word_index = i / 2;
-            bool high = (i & 1) != 0;
-            uint16_t w = tmp[word_index];
-            if (high)
-                w = static_cast<uint16_t>((w & 0x00ff) | (static_cast<uint16_t>(buffer[i]) << 8));
-            else
-                w = static_cast<uint16_t>((w & 0xff00) | buffer[i]);
-            tmp[word_index] = w;
-        }
-        return dma_write_words(addr, tmp.data(), tmp.size());
-    }
-
-    uint32_t aligned = addr & ~1u;
-    size_t wordcount = (len + (addr & 1u) + 1) / 2;
-    std::vector<uint16_t> tmp(wordcount, 0);
-
-    if (!dma_read_words(aligned, tmp.data(), wordcount))
-        return false;
-
-    for (size_t i = 0; i < len; ++i) {
-        size_t word_index = (i + (addr & 1u)) / 2;
-        bool high = ((i + (addr & 1u)) & 1) != 0;
-        uint16_t w = tmp[word_index];
-        if (high)
-            w = static_cast<uint16_t>((w & 0x00ff) | (static_cast<uint16_t>(buffer[i]) << 8));
-        else
-            w = static_cast<uint16_t>((w & 0xff00) | buffer[i]);
-        tmp[word_index] = w;
-    }
-
-    return dma_write_words(aligned, tmp.data(), wordcount);
 }
 
 /*
