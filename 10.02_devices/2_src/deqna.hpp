@@ -356,6 +356,10 @@ private:
 
     uint32_t rbdl_ba = 0;
     uint32_t xbdl_ba = 0;
+    // Remember the last RX ring start we saw when packets remained queued.
+    // Used to avoid lapping a circular ring across process_rbdl() calls.
+    uint32_t last_rbdl_start = 0;
+    bool rbdl_wrap_guard = false;
 
     /*
      * MAC address state

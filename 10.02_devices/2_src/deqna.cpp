@@ -351,7 +351,7 @@ deqna_c::deqna_c() : dec_ether_base_c()
     rx_slots.value = 0;
     tx_slots.value = 0;
     rx_start_delay_ms.value = 0;
-    intr_dma_holdoff_us.value = 200;
+    intr_dma_holdoff_us.value = 0;  // Disabled - was causing TX starvation during RX floods
     trace.value = false;
 
     // Default MAC address for the emulated adapter (DEC OUI + fixed suffix)
@@ -704,24 +704,25 @@ void deqna_c::start_rx_delay(void)
  */
 void deqna_c::update_intr(void)
 {
-    // QuNiBone PRU currently treats an INTR request as a bus master arbitration
-    // operation which can starve DMA if the CPU is masking interrupts (splimp).
-    // Real QBUS allows NPR DMA while BR lines are asserted, so we approximate that
-    // by deferring bus-level interrupt assertion while DMA is in progress.
-    bool level = irq && (dma_in_progress.load(std::memory_order_relaxed) == 0);
+    // Assert interrupt based purely on irq state. Previous versions gated this
+    // on dma_in_progress==0 to work around PRU arbitration issues, but that
+    // caused TX completion interrupts to be blocked during RX floods, leading
+    // to watchdog timeout and qerestart. The PRU should handle concurrent
+    // NPR (DMA) and BR (interrupt) requests properly per QBUS spec.
+    bool level = irq;
 
     switch (intr_request.edge_detect(level)) {
     case intr_request_c::INTERRUPT_EDGE_RAISING:
         note_intr_asserted();
         if (trace.value) {
-            INFO("DEQNA: INTR assert, csr=%06o vec=%03o level=%d",
+            DEBUG("DEQNA: INTR assert, csr=%06o vec=%03o level=%d",
                  csr, intr_request.get_vector(), intr_request.get_level());
         }
         qunibusadapter->INTR(intr_request, nullptr, 0);
         break;
     case intr_request_c::INTERRUPT_EDGE_FALLING:
         if (trace.value) {
-            INFO("DEQNA: INTR deassert, csr=%06o", csr);
+            DEBUG("DEQNA: INTR deassert, csr=%06o", csr);
         }
         qunibusadapter->cancel_INTR(intr_request);
         break;
@@ -860,6 +861,8 @@ void deqna_c::reset_controller(void)
 
     rbdl_ba = 0;
     xbdl_ba = 0;
+    last_rbdl_start = 0;
+    rbdl_wrap_guard = false;
     irq = false;
     if (qunibusadapter)
         qunibusadapter->cancel_INTR(intr_request);
@@ -912,7 +915,26 @@ void deqna_c::reset_controller(void)
 
 void deqna_c::sw_reset(void)
 {
+    // Signal reset early so worker loops can abort
     reset_in_progress.store(true, std::memory_order_release);
+
+    // Wait for any in-flight descriptor processing to complete.
+    // This ensures no DMA operations are active when we clear state.
+    // Use try_lock with timeout to avoid deadlock if processing is stuck.
+    // Wait up to 100ms - longer than one RX batch (8 packets) but shorter
+    // than the driver's 5-second watchdog.
+    bool mutex_acquired = false;
+    for (int i = 0; i < 100 && !mutex_acquired; ++i) {
+        mutex_acquired = descriptor_process_mutex.try_lock();
+        if (!mutex_acquired)
+            timeout_c::wait_ms(1);
+    }
+    if (!mutex_acquired) {
+        WARNING("DEQNA: sw_reset timeout waiting for descriptor processing");
+        // Force the mutex even if we timed out - this is a reset after all
+        descriptor_process_mutex.lock();
+    }
+
     const uint16_t set_bits = QNA_CSR_XL | QNA_CSR_RL;
 
     if (trace.value) {
@@ -924,31 +946,59 @@ void deqna_c::sw_reset(void)
         DEBUG("DEQNA: sw_reset() begin csr=%06o", csr_snapshot);
     }
 
+    // Clear pending dispatch flags BEFORE modifying CSR
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        rbdl_pending = false;
+        xbdl_pending = false;
+        rbdl_ba = 0;
+        xbdl_ba = 0;
+        write_buffer.len = 0;
+        write_buffer.used = 0;
+        irq = false;
+    }
+
     csr_set_clr(set_bits, static_cast<uint16_t>(~set_bits));
 
     if (pcap.is_open())
         csr_set_clr(QNA_CSR_OK, 0);
 
-    clr_int();
+    // Cancel any pending interrupt request at the bus level
+    if (qunibusadapter)
+        qunibusadapter->cancel_INTR(intr_request);
+    intr_request.edge_detect_reset();
+
+    // Reset dma_in_progress counter to known state (used by DMA helper functions)
+    dma_in_progress.store(0, std::memory_order_release);
 
     // Clear deferred interrupt state
     deferred_set_int.store(false, std::memory_order_release);
     deferred_clr_int.store(false, std::memory_order_release);
 
+    // Clear DMA holdoff state that could block future DMA operations
+    intr_dma_holdoff_until_ns.store(0, std::memory_order_release);
+    intr_dma_holdoff_armed.store(false, std::memory_order_release);
+
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
         if (!read_queue.empty()) {
-            WARNING("DEQNA: sw_reset clearing RX queue (size=%zu)", read_queue.size());
+            DEBUG("DEQNA: sw_reset clearing RX queue (size=%zu loss=%u)",
+                    read_queue.size(), read_queue_loss);
         }
         read_queue.clear();
         read_queue_loss = 0;
     }
+    last_rbdl_start = 0;
+    rbdl_wrap_guard = false;
 
     setup.multicast = false;
     setup.promiscuous = false;
     timers_last_service_ns = timeout_c::abstime_ns();
 
     update_pcap_filter();
+
+    // Release the descriptor processing mutex
+    descriptor_process_mutex.unlock();
     reset_in_progress.store(false, std::memory_order_release);
 }
 
@@ -1138,7 +1188,7 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
             "STA0", "STA1", "RCLL", "RCLH", "XMTL", "XMTH", "VAR", "CSR"
         };
         const char *rname = (reg_index < 8) ? reg_names[reg_index] : "???";
-        INFO("DEQNA: Write %s (reg %d) = %06o access=%d", rname, reg_index, val, access);
+        DEBUG("DEQNA: Write %s (reg %d) = %06o access=%d", rname, reg_index, val, access);
     }
 
     const uint16_t byte_mask =
@@ -1199,10 +1249,13 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         // OpenSIMH-compatible: reset controller when SR transitions to cleared.
         // Only applies if the SR bit is actually being written (low byte or full word).
         if ((byte_mask & QNA_CSR_SR) && (prev & QNA_CSR_SR) && !(data_masked & QNA_CSR_SR)) {
-            if (trace.value) {
-                DEBUG("DEQNA: SW reset requested by guest (CSR SR 1->0): prev=%06o write=%06o byte_mask=%06o",
-                      prev, data_masked, byte_mask);
-            }
+            // Log SW reset - this is "qerestart" from the BSD driver
+            WARNING("DEQNA: SW reset by driver (qerestart): prev_csr=%06o RI=%d XI=%d RL=%d XL=%d",
+                    prev,
+                    (prev & QNA_CSR_RI) ? 1 : 0,
+                    (prev & QNA_CSR_XI) ? 1 : 0,
+                    (prev & QNA_CSR_RL) ? 1 : 0,
+                    (prev & QNA_CSR_XL) ? 1 : 0);
             sw_reset();
             return;
         }
@@ -1424,18 +1477,29 @@ bool deqna_c::process_rbdl(void)
 
     bool ri_pending = false;
     unsigned processed = 0;
-    const unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 0;
+    // Limit RX processing per call to prevent TX starvation during floods.
+    // Even if rx_slots.value is 0 (unlimited), impose a reasonable maximum
+    // to allow TX to run and prevent watchdog timeout.
+    const unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 8;
 
     // Track starting address to detect circular chains (OpenSIMH-style)
     uint32_t start_rbdl_ba = 0;
+    uint32_t prev_start = 0;
+    bool wrap_guard_enabled = false;
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         start_rbdl_ba = rbdl_ba;
+        prev_start = last_rbdl_start;
+        wrap_guard_enabled = rbdl_wrap_guard;
     }
     unsigned desc_count = 0;
     const unsigned max_desc_count = 256;  // Sanity limit to prevent infinite loops
 
     while (true) {
+        // Abort immediately if reset is in progress
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
+
         int front_type = 2;
         {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
@@ -1450,6 +1514,17 @@ bool deqna_c::process_rbdl(void)
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             cur_ba = rbdl_ba;
             csr_snapshot = csr;
+        }
+
+        // Guard against lapping a circular ring across successive calls when
+        // the guest hasn't reclaimed descriptors yet. If we return to the same
+        // start address as the previous call while packets remain queued, stop
+        // delivering and let packets be dropped at the queue/pcap level.
+        if (wrap_guard_enabled && cur_ba == prev_start) {
+            if (trace.value) {
+                DEBUG("DEQNA: RX wrap guard hit at %06o (prev_start=%06o)", cur_ba, prev_start);
+            }
+            break;
         }
 
         // Circular ring overrun avoidance (OpenSIMH-style): if the ring chains
@@ -1523,23 +1598,21 @@ bool deqna_c::process_rbdl(void)
         if (~words[1] & QNA_DSC_V) {
             if (trace.value) {
                 uint32_t address = make_addr(words[1], words[2]) & ~1u;
-                INFO("DEQNA: RX list end: descriptor not valid @%06o (word1=%06o word2=%06o addr=%06o)",
-                     cur_ba, words[1], words[2], address);
+                DEBUG("DEQNA: RX list end: descriptor not valid @%06o (word1=%06o word2=%06o addr=%06o)",
+                      cur_ba, words[1], words[2], address);
             }
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            // RL indicates RX list exhausted. Also set RI so the guest can wake up
-            // and refill descriptors (BSD qe driver otherwise may stall/restart).
-            csr_set_clr(static_cast<uint16_t>(QNA_CSR_RL | QNA_CSR_RI), 0);
+            // RL indicates RX list exhausted/invalid. Avoid raising RI here to
+            // prevent early interrupt/DMA contention during ifconfig.
+            csr_set_clr(QNA_CSR_RL, 0);
             process_deferred_interrupts();
             return true;
         }
 
         if (words[1] & QNA_DSC_C) {
             uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
-            if (trace.value) {
-                INFO("DEQNA: RX chain desc @%06o -> next=%06o (word1=%06o word2=%06o)",
-                     cur_ba, next_ba, words[1], words[2]);
-            }
+            // NOTE: Chain descriptors just point to the next descriptor; they do NOT
+            // have packets in the queue for them. We follow the chain immediately.
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             rbdl_ba = next_ba;
             continue;
@@ -1706,6 +1779,22 @@ bool deqna_c::process_rbdl(void)
 
         if (limit && (++processed >= limit))
             break;
+    }
+
+    // Update wrap guard state based on whether packets remain queued.
+    {
+        bool queue_empty = false;
+        {
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
+            queue_empty = read_queue.empty();
+        }
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        if (queue_empty) {
+            rbdl_wrap_guard = false;
+        } else {
+            rbdl_wrap_guard = true;
+            last_rbdl_start = start_rbdl_ba;
+        }
     }
 
     if (ri_pending) {
@@ -1885,6 +1974,10 @@ bool deqna_c::process_xbdl(void)
     const unsigned max_desc_count = 256;  // Sanity limit to prevent infinite loops
 
     while (true) {
+        // Abort immediately if reset is in progress
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
+
         uint32_t cur_ba = 0;
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1940,10 +2033,6 @@ bool deqna_c::process_xbdl(void)
         // SIMH does it this way (see xq_process_xbdl in pdp11_xq.c).
         if (words[1] & QNA_DSC_C) {
             uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
-            if (trace.value) {
-                INFO("DEQNA: TX chain desc @%06o -> next=%06o (word1=%06o word2=%06o)",
-                     cur_ba, next_ba, words[1], words[2]);
-            }
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 xbdl_ba = next_ba;
@@ -1953,12 +2042,8 @@ bool deqna_c::process_xbdl(void)
 
         // Check V (valid) bit - if clear, end of list
         if (~words[1] & QNA_DSC_V) {
-            if (trace.value) {
-                uint32_t address = make_addr(words[1], words[2]) & ~1u;
-                INFO("DEQNA: TX list end: descriptor not valid @%06o (word1=%06o word2=%06o addr=%06o)",
-                     cur_ba, words[1], words[2], address);
-            }
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            // XL indicates TX list exhausted. Also set XI to wake up the driver.
             csr_set_clr(static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_XI), 0);
             write_buffer.len = 0;
             write_buffer.used = 0;
@@ -2567,8 +2652,11 @@ void deqna_c::worker_tx(void)
                 do_xbdl = true;
             }
         }
-        if (do_xbdl)
+        if (do_xbdl) {
             dispatch_xbdl();
+            // Process interrupts immediately after TX to ensure driver sees completion
+            process_deferred_interrupts();
+        }
 
         timeout_c::wait_ms(1);  // Fast poll for low TX latency
     }
