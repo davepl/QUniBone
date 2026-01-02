@@ -2327,6 +2327,15 @@ void deqna_c::dump_descriptor_rings(const char *reason)
     if (!trace.value)
         return;
 
+    // Avoid debug DMA while interrupts are pending or DMA is active.
+    if (irq || dma_in_progress.load(std::memory_order_acquire) != 0) {
+        DEBUG("DEQNA: RING SNAPSHOT skipped (irq=%d dma=%u) reason=%s",
+              irq ? 1 : 0,
+              dma_in_progress.load(std::memory_order_relaxed),
+              reason ? reason : "");
+        return;
+    }
+
     uint16_t csr_snapshot;
     uint32_t rbase = 0, xbase = 0;
     {
@@ -2398,17 +2407,22 @@ bool deqna_c::process_local(const uint8_t *data, size_t len)
 bool deqna_c::process_loopback(const uint8_t *data, size_t len)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    
+    // Minimum length: Ethernet header (14) + MOP header (8) + function code (2)
     if (len < 32)
         return false;
 
+    // Offset to function code is at bytes 14-15 (little-endian)
     size_t offset = static_cast<size_t>(data[14] | (data[15] << 8));
     if (offset + 8 > len)
         return false;
 
+    // Check function code (2 = loopback request)
     uint16_t function = static_cast<uint16_t>(data[offset] | (data[offset + 1] << 8));
     if (function != 2)
         return false;
 
+    // Construct reply packet by swapping source/destination MACs
     std::vector<uint8_t> reply(data, data + len);
     uint8_t phys[6];
     memcpy(phys, setup.valid ? setup.macs[0] : mac_addr, 6);
@@ -2421,6 +2435,7 @@ bool deqna_c::process_loopback(const uint8_t *data, size_t len)
     reply[14] = static_cast<uint8_t>(offset & 0xFF);
     reply[15] = static_cast<uint8_t>((offset >> 8) & 0xFF);
 
+    // Send the reply packet
     return pcap.send(reply.data(), reply.size());
 }
 
@@ -2436,9 +2451,12 @@ bool deqna_c::process_loopback(const uint8_t *data, size_t len)
 bool deqna_c::process_remote_console(const uint8_t *data, size_t len)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    
+    // Minimum length: Ethernet header (14) + MOP header (6)
     if (len < 20)
         return false;
 
+    // Command code is at byte 16
     uint8_t code = data[16];
     switch (code) {
     case 0x05: {
