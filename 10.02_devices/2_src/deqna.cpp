@@ -179,7 +179,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v041";  // RX status RBL uses full packet length (OpenSIMH)
+static const char *DEQNA_VERSION = "v042";  // TX ring scan remains active between XMTH writes
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -435,7 +435,7 @@ bool deqna_c::on_before_install(void)
     ERROR("DEQNA: libpcap support not compiled in - install libpcap-dev and rebuild with HAVE_PCAP");
     return false;
 #else
-    INFO("DEQNA: emulation %s", DEQNA_VERSION);
+    WARNING("DEQNA: emulation %s", DEQNA_VERSION);
 
     if (ifname.value.empty()) {
         ERROR("DEQNA: ifname must be set");
@@ -654,6 +654,11 @@ void deqna_c::service_intr_complete(void)
     // OpenSIMH-compatible: clear the controller interrupt latch on vector fetch.
     // Note RI/XI bits remain set in CSR until cleared by the guest via W1C.
     clr_int();
+    if ((csr & QNA_CSR_IE) && (csr & QNA_CSR_XIRI)) {
+        // Keep interrupts level-like: if RI/XI are still pending after vector
+        // fetch, re-assert so the guest doesn't miss XI when RI was serviced first.
+        deferred_set_int.store(true, std::memory_order_release);
+    }
 }
 
 void deqna_c::nxm_error(void)
@@ -886,6 +891,7 @@ void deqna_c::reset_controller(void)
 
     rbdl_pending = false;
     xbdl_pending = false;
+    xbdl_active = false;
 
     // Clear deferred interrupt state
     deferred_set_int.store(false, std::memory_order_release);
@@ -951,6 +957,7 @@ void deqna_c::sw_reset(void)
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         rbdl_pending = false;
         xbdl_pending = false;
+        xbdl_active = false;
         rbdl_ba = 0;
         xbdl_ba = 0;
         write_buffer.len = 0;
@@ -1212,6 +1219,7 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
     case DEQNA_REG_XMTLIST_HI:
         xbdl[1] = val;
         xbdl_pending = true;
+        xbdl_active = true;
         if (trace.value)
             DEBUG("DEQNA: TX list update pending (XMTH=%06o XMTL=%06o csr=%06o)", xbdl[1], xbdl[0], csr);
         break;
@@ -1250,12 +1258,33 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         // Only applies if the SR bit is actually being written (low byte or full word).
         if ((byte_mask & QNA_CSR_SR) && (prev & QNA_CSR_SR) && !(data_masked & QNA_CSR_SR)) {
             // Log SW reset - this is "qerestart" from the BSD driver
-            WARNING("DEQNA: SW reset by driver (qerestart): prev_csr=%06o RI=%d XI=%d RL=%d XL=%d",
+            size_t queue_size = 0;
+            unsigned loss = 0;
+            uint32_t rbdl_snapshot = 0;
+            uint32_t xbdl_snapshot = 0;
+            size_t wb_len = 0;
+            size_t wb_used = 0;
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex);
+                queue_size = read_queue.size();
+                loss = read_queue_loss;
+            }
+            {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                rbdl_snapshot = rbdl_ba;
+                xbdl_snapshot = xbdl_ba;
+                wb_len = write_buffer.len;
+                wb_used = write_buffer.used;
+            }
+            WARNING("DEQNA: SW reset by driver (qerestart): prev_csr=%06o RI=%d XI=%d RL=%d XL=%d qlen=%zu loss=%u rbdl=%06o xbdl=%06o tx_used=%zu/%zu dma=%u",
                     prev,
                     (prev & QNA_CSR_RI) ? 1 : 0,
                     (prev & QNA_CSR_XI) ? 1 : 0,
                     (prev & QNA_CSR_RL) ? 1 : 0,
-                    (prev & QNA_CSR_XL) ? 1 : 0);
+                    (prev & QNA_CSR_XL) ? 1 : 0,
+                    queue_size, loss, rbdl_snapshot, xbdl_snapshot,
+                    wb_used, wb_len,
+                    dma_in_progress.load(std::memory_order_relaxed));
             sw_reset();
             return;
         }
@@ -1396,8 +1425,11 @@ bool deqna_c::dispatch_rbdl(void)
         cur_ba = rbdl_ba;
         csr_snapshot = csr;
     }
-    if (cur_ba == 0)
+    if (cur_ba == 0) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        xbdl_active = false;
         return false;
+    }
 
     if (trace.value) {
         size_t queue_size = 0;
@@ -1494,7 +1526,6 @@ bool deqna_c::process_rbdl(void)
     }
     unsigned desc_count = 0;
     const unsigned max_desc_count = 256;  // Sanity limit to prevent infinite loops
-
     while (true) {
         // Abort immediately if reset is in progress
         if (reset_in_progress.load(std::memory_order_acquire))
@@ -1581,17 +1612,8 @@ bool deqna_c::process_rbdl(void)
             process_deferred_interrupts();
             return false;
         }
-
-        // Mark descriptor processed/in-use by writing 0xFFFF to word[0].
-        // OpenSIMH does this unconditionally for each descriptor it touches,
-        // including explicit chain and list-end (V=0) descriptors.
-        const uint16_t flag_word = 0xFFFF;
-        if (!desc_write_words(cur_ba, &flag_word, 1)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            process_deferred_interrupts();
+        if (reset_in_progress.load(std::memory_order_acquire))
             return false;
-        }
 
         // RX: OpenSIMH checks V (valid) BEFORE C (chain). A chain pointer is only
         // followed when the descriptor is valid.
@@ -1616,6 +1638,17 @@ bool deqna_c::process_rbdl(void)
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             rbdl_ba = next_ba;
             continue;
+        }
+
+        // Descriptor is valid and not a chain pointer. Mark it in-use now.
+        const uint16_t flag_word = 0xFFFF;
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
+        if (!desc_write_words(cur_ba, &flag_word, 1)) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            nxm_error();
+            process_deferred_interrupts();
+            return false;
         }
 
         queue_item item;
@@ -1681,6 +1714,8 @@ bool deqna_c::process_rbdl(void)
             DEBUG("DEQNA: RX deliver type=%d rbl=%zu to addr=%08o blen=%u desc=%06o",
                   item.type, rbl, address, static_cast<unsigned>(b_length), cur_ba);
         }
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         if (rbl && !dma_write_bytes(address, rbuf, rbl)) {
             dma_failed = true;
             rbl = 0;
@@ -1755,8 +1790,19 @@ bool deqna_c::process_rbdl(void)
         if (trace.value) {
             DEBUG("DEQNA: RX status type=%d st1=%06o st2=%06o desc=%06o",
                   item.type, words[4], words[5], cur_ba + 8);
+            if (status1 & (QE_RST_LASTERR | QE_OVF | QE_DISCARD | QE_RST_LASTNOT | QE_ESETUP)) {
+                DEBUG("DEQNA: RX status flags err=%d ovf=%d discard=%d lastnot=%d esetup=%d rbl=%u",
+                      (status1 & QE_RST_LASTERR) ? 1 : 0,
+                      (status1 & QE_OVF) ? 1 : 0,
+                      (status1 & QE_DISCARD) ? 1 : 0,
+                      (status1 & QE_RST_LASTNOT) ? 1 : 0,
+                      (status1 & QE_ESETUP) ? 1 : 0,
+                      static_cast<unsigned>(report_rbl));
+            }
         }
 
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
@@ -1798,6 +1844,20 @@ bool deqna_c::process_rbdl(void)
     }
 
     if (ri_pending) {
+        if (trace.value) {
+            size_t queue_size = 0;
+            uint32_t rbdl_snapshot = 0;
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex);
+                queue_size = read_queue.size();
+            }
+            {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                rbdl_snapshot = rbdl_ba;
+            }
+            DEBUG("DEQNA: RI set (rx_processed=%u queue=%zu rbdl=%06o)",
+                  processed, queue_size, rbdl_snapshot);
+        }
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         csr_set_clr(QNA_CSR_RI, 0);
         update_csr_reg();
@@ -1849,6 +1909,7 @@ bool deqna_c::dispatch_xbdl(void)
 
         // Always recalculate xbdl_ba from base registers when dispatching
         xbdl_ba = make_addr(xbdl[1], static_cast<uint16_t>(xbdl[0] & ~1u));
+        xbdl_active = true;
         cur_ba = xbdl_ba;
         csr_snapshot = csr;
 
@@ -1901,6 +1962,9 @@ void deqna_c::write_callback(int status)
               (status == 0) ? write_success[0] : write_failure[0],
               (status == 0) ? write_success[1] : write_failure[1],
               cur_ba + 8);
+        if (status != 0) {
+            DEBUG("DEQNA: TX failure status=%d len=%zu desc=%06o", status, len_snapshot, cur_ba);
+        }
     }
 
     // Write status words back to descriptor
@@ -1918,6 +1982,8 @@ void deqna_c::write_callback(int status)
             stat_tx_errors.value = stats.fail;
         }
 
+        if (trace.value)
+            DEBUG("DEQNA: XI set (tx_done status=%d len=%zu desc=%06o)", status, len_snapshot, cur_ba);
         csr_set_clr(QNA_CSR_XI, 0);  // Set transmit interrupt
         update_csr_reg(); /* Ensure CSR shows XI for diagnostics */
 
@@ -1972,6 +2038,8 @@ bool deqna_c::process_xbdl(void)
     }
     unsigned desc_count = 0;
     const unsigned max_desc_count = 256;  // Sanity limit to prevent infinite loops
+    const unsigned packet_budget = tx_slots.value ? static_cast<unsigned>(tx_slots.value) : 8;
+    unsigned packets_processed = 0;
 
     while (true) {
         // Abort immediately if reset is in progress
@@ -2004,6 +2072,7 @@ bool deqna_c::process_xbdl(void)
             csr_set_clr(static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_XI), 0);
             write_buffer.len = 0;
             write_buffer.used = 0;
+            xbdl_active = false;
             process_deferred_interrupts();
             return false;
         }
@@ -2014,6 +2083,7 @@ bool deqna_c::process_xbdl(void)
         if (!desc_read_words(cur_ba, words, QE_RING_WORDS)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
+            xbdl_active = false;
             process_deferred_interrupts();
             return false;
         }
@@ -2024,6 +2094,7 @@ bool deqna_c::process_xbdl(void)
         if (!desc_write_words(cur_ba, &flag_word, 1)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
+            xbdl_active = false;
             process_deferred_interrupts();
             return false;
         }
@@ -2042,6 +2113,9 @@ bool deqna_c::process_xbdl(void)
 
         // Check V (valid) bit - if clear, end of list
         if (~words[1] & QNA_DSC_V) {
+            if (trace.value) {
+                DEBUG("DEQNA: TX list end (V=0) - XI/XL set desc=%06o", cur_ba);
+            }
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             // XL indicates TX list exhausted. Also set XI to wake up the driver.
             csr_set_clr(static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_XI), 0);
@@ -2140,6 +2214,7 @@ bool deqna_c::process_xbdl(void)
                 if (!desc_write_words(cur_ba + 8, write_success, 2)) {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
                     nxm_error();
+                    xbdl_active = false;
                     process_deferred_interrupts();
                     return false;
                 }
@@ -2159,6 +2234,14 @@ bool deqna_c::process_xbdl(void)
                 // on its next iteration (within ~10ms).
                 (void)enqueued;  // Suppress unused warning
                 
+                ++packets_processed;
+                if (packets_processed >= packet_budget) {
+                    if (trace.value) {
+                        DEBUG("DEQNA: TX packet budget reached (%u), yielding", packet_budget);
+                    }
+                    break;
+                }
+
                 // Continue processing TX descriptors - deferred interrupts will be
                 // processed when we finally exit the while(true) loop
                 continue;
@@ -2186,6 +2269,13 @@ bool deqna_c::process_xbdl(void)
                     write_callback(1);
                 else
                     write_callback(0);
+                ++packets_processed;
+                if (packets_processed >= packet_budget) {
+                    if (trace.value) {
+                        DEBUG("DEQNA: TX packet budget reached (%u), yielding", packet_budget);
+                    }
+                    break;
+                }
                 // Continue processing remaining TX descriptors in this loop
                 // (write_callback updates xbdl_ba to point to next descriptor)
                 continue;
@@ -2194,6 +2284,7 @@ bool deqna_c::process_xbdl(void)
             if (!desc_write_words(cur_ba + 8, implicit_chain_status, 2)) {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 nxm_error();
+                xbdl_active = false;
                 process_deferred_interrupts();
                 return false;
             }
@@ -2319,7 +2410,6 @@ void deqna_c::process_setup(void)
  * This function processes packets sent to the DEQNA's local
  * protocols: Loopback (0x0090) and Remote Console (0x0260).
  *
- * Returns: true if packet was handled, false otherwise
  */
 
 void deqna_c::dump_descriptor_rings(const char *reason)
@@ -2663,15 +2753,22 @@ void deqna_c::worker_tx(void)
 
         // Check for pending TX dispatch
         bool do_xbdl = false;
+        bool do_xbdl_active = false;
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             if (xbdl_pending) {
                 xbdl_pending = false;
                 do_xbdl = true;
+            } else if (xbdl_active) {
+                do_xbdl_active = true;
             }
         }
         if (do_xbdl) {
             dispatch_xbdl();
+            // Process interrupts immediately after TX to ensure driver sees completion
+            process_deferred_interrupts();
+        } else if (do_xbdl_active) {
+            process_xbdl();
             // Process interrupts immediately after TX to ensure driver sees completion
             process_deferred_interrupts();
         }
