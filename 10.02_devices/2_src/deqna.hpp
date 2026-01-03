@@ -389,6 +389,8 @@ private:
     bool rbdl_pending = false;
     bool xbdl_pending = false;
     bool xbdl_active = false;
+    bool xbdl_idle = false;
+    uint64_t xbdl_idle_until_ns = 0;
     uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
 
     /*

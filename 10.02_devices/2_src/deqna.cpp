@@ -892,6 +892,8 @@ void deqna_c::reset_controller(void)
     rbdl_pending = false;
     xbdl_pending = false;
     xbdl_active = false;
+    xbdl_idle = false;
+    xbdl_idle_until_ns = 0;
 
     // Clear deferred interrupt state
     deferred_set_int.store(false, std::memory_order_release);
@@ -958,6 +960,8 @@ void deqna_c::sw_reset(void)
         rbdl_pending = false;
         xbdl_pending = false;
         xbdl_active = false;
+        xbdl_idle = false;
+        xbdl_idle_until_ns = 0;
         rbdl_ba = 0;
         xbdl_ba = 0;
         write_buffer.len = 0;
@@ -1210,8 +1214,7 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
     case DEQNA_REG_RCVLIST_HI:
         rbdl[1] = val;
         rbdl_pending = true;
-        if (trace.value)
-            DEBUG("DEQNA: RX list update pending (RCLH=%06o RCLL=%06o csr=%06o)", rbdl[1], rbdl[0], csr);
+        INFO("DEQNA: RX list update pending (RCLH=%06o RCLL=%06o csr=%06o)", rbdl[1], rbdl[0], csr);
         break;
     case DEQNA_REG_XMTLIST_LO:
         xbdl[0] = val;
@@ -1220,8 +1223,9 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         xbdl[1] = val;
         xbdl_pending = true;
         xbdl_active = true;
-        if (trace.value)
-            DEBUG("DEQNA: TX list update pending (XMTH=%06o XMTL=%06o csr=%06o)", xbdl[1], xbdl[0], csr);
+        xbdl_idle = false;
+        xbdl_idle_until_ns = 0;
+        INFO("DEQNA: TX list update pending (XMTH=%06o XMTL=%06o csr=%06o)", xbdl[1], xbdl[0], csr);
         break;
     case DEQNA_REG_VECTOR: {
         // Byte writes only update the targeted byte.
@@ -1431,15 +1435,13 @@ bool deqna_c::dispatch_rbdl(void)
         return false;
     }
 
-    if (trace.value) {
-        size_t queue_size = 0;
-        {
-            std::lock_guard<std::mutex> queue_lock(queue_mutex);
-            queue_size = read_queue.size();
-        }
-        DEBUG("DEQNA: RX list dispatch at %06o (csr=%06o queue=%zu)",
-              cur_ba, csr_snapshot, queue_size);
+    size_t queue_size = 0;
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
+        queue_size = read_queue.size();
     }
+    INFO("DEQNA: RX list dispatch at %06o (csr=%06o queue=%zu)",
+         cur_ba, csr_snapshot, queue_size);
 
     // If packets are queued (or setup/loopback is pending), process immediately.
     // Otherwise the RX worker will return quickly on the next iteration.
@@ -1510,9 +1512,15 @@ bool deqna_c::process_rbdl(void)
     bool ri_pending = false;
     unsigned processed = 0;
     // Limit RX processing per call to prevent TX starvation during floods.
-    // Even if rx_slots.value is 0 (unlimited), impose a reasonable maximum
-    // to allow TX to run and prevent watchdog timeout.
-    const unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 8;
+    // When the RX queue backs up, raise the cap to keep up with line-rate bursts.
+    size_t queue_depth = 0;
+    {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex);
+        queue_depth = read_queue.size();
+    }
+    unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 8;
+    if (!rx_slots.value && queue_depth > (QNA_QUE_MAX / 2))
+        limit = 32;
 
     // Track starting address to detect circular chains (OpenSIMH-style)
     uint32_t start_rbdl_ba = 0;
@@ -1618,11 +1626,9 @@ bool deqna_c::process_rbdl(void)
         // RX: OpenSIMH checks V (valid) BEFORE C (chain). A chain pointer is only
         // followed when the descriptor is valid.
         if (~words[1] & QNA_DSC_V) {
-            if (trace.value) {
-                uint32_t address = make_addr(words[1], words[2]) & ~1u;
-                DEBUG("DEQNA: RX list end: descriptor not valid @%06o (word1=%06o word2=%06o addr=%06o)",
-                      cur_ba, words[1], words[2], address);
-            }
+            uint32_t address = make_addr(words[1], words[2]) & ~1u;
+            INFO("DEQNA: RX list end: descriptor not valid @%06o (word1=%06o word2=%06o addr=%06o)",
+                 cur_ba, words[1], words[2], address);
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             // RL indicates RX list exhausted/invalid. Avoid raising RI here to
             // prevent early interrupt/DMA contention during ifconfig.
@@ -1910,17 +1916,23 @@ bool deqna_c::dispatch_xbdl(void)
         // Always recalculate xbdl_ba from base registers when dispatching
         xbdl_ba = make_addr(xbdl[1], static_cast<uint16_t>(xbdl[0] & ~1u));
         xbdl_active = true;
+        xbdl_idle = false;
+        xbdl_idle_until_ns = 0;
         cur_ba = xbdl_ba;
         csr_snapshot = csr;
 
         write_buffer.len = 0;
         write_buffer.used = 0;
     }
-    if (cur_ba == 0)
+    if (cur_ba == 0) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        xbdl_active = false;
+        xbdl_idle = false;
+        xbdl_idle_until_ns = 0;
         return false;
+    }
 
-    if (trace.value)
-        DEBUG("DEQNA: TX list dispatch at %06o (csr=%06o)", cur_ba, csr_snapshot);
+    INFO("DEQNA: TX list dispatch at %06o (csr=%06o)", cur_ba, csr_snapshot);
 
     return process_xbdl();
 }
@@ -2088,41 +2100,49 @@ bool deqna_c::process_xbdl(void)
             return false;
         }
 
-        // Mark descriptor processed/in-use by writing 0xFFFF to word[0] (OpenSIMH-style).
-        // Do this before evaluating C/V so chain and list-end descriptors are also marked.
-        const uint16_t flag_word = 0xFFFF;
-        if (!desc_write_words(cur_ba, &flag_word, 1)) {
+        // TX: Check V (valid) BEFORE C (chain) to avoid following stale chain
+        // pointers when the descriptor is not yet owned by the device.
+        if (~words[1] & QNA_DSC_V) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            xbdl_active = false;
+            // XL indicates TX list exhausted. Also set XI once to wake up the driver.
+            if (!xbdl_idle) {
+                INFO("DEQNA: TX list end (V=0) - XI/XL set desc=%06o", cur_ba);
+                csr_set_clr(static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_XI), 0);
+                xbdl_idle = true;
+            }
+            xbdl_idle_until_ns = timeout_c::abstime_ns() + 5000000ull; // 5ms backoff
+            write_buffer.len = 0;
+            write_buffer.used = 0;
             process_deferred_interrupts();
-            return false;
+            return true;
         }
 
-        // IMPORTANT: Check C (chain) bit BEFORE V (valid) bit!
-        // When C=1, this is a chain pointer - follow it regardless of V.
-        // SIMH does it this way (see xq_process_xbdl in pdp11_xq.c).
         if (words[1] & QNA_DSC_C) {
             uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                xbdl_idle = false;
+                xbdl_idle_until_ns = 0;
                 xbdl_ba = next_ba;
             }
             continue;
         }
 
-        // Check V (valid) bit - if clear, end of list
-        if (~words[1] & QNA_DSC_V) {
-            if (trace.value) {
-                DEBUG("DEQNA: TX list end (V=0) - XI/XL set desc=%06o", cur_ba);
-            }
+        // Mark descriptor processed/in-use by writing 0xFFFF to word[0] (OpenSIMH-style).
+        const uint16_t flag_word = 0xFFFF;
+        if (!desc_write_words(cur_ba, &flag_word, 1)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            // XL indicates TX list exhausted. Also set XI to wake up the driver.
-            csr_set_clr(static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_XI), 0);
-            write_buffer.len = 0;
-            write_buffer.used = 0;
+            nxm_error();
+            xbdl_active = false;
+            xbdl_idle = false;
+            xbdl_idle_until_ns = 0;
             process_deferred_interrupts();
-            return true;
+            return false;
+        }
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            xbdl_idle = false;
+            xbdl_idle_until_ns = 0;
         }
 
         // Calculate buffer address and length
@@ -2760,7 +2780,8 @@ void deqna_c::worker_tx(void)
                 xbdl_pending = false;
                 do_xbdl = true;
             } else if (xbdl_active) {
-                do_xbdl_active = true;
+                if (xbdl_idle_until_ns == 0 || timeout_c::abstime_ns() >= xbdl_idle_until_ns)
+                    do_xbdl_active = true;
             }
         }
         if (do_xbdl) {
