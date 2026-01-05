@@ -1,0 +1,333 @@
+QUniBone Background (CSR I/O -> DELQA/DEQNA “QNA” Ethernet Emulation)
+===================================================================
+
+This repo (“QUniBone”) is the userspace half of UniBone (UNIBUS) / QBone (QBUS):
+a BeagleBone Black sits on a real DEC backplane and behaves like one or more
+classic bus devices. The BeagleBone’s PRUs handle the hard real-time bus pins;
+the ARM-side C++ code models device registers, DMA, interrupts, and any
+“outside world” I/O (disk images, TCP sockets, libpcap, GPIO, etc.).
+
+If you’ve written a UNIX device driver, think “memory‑mapped registers +
+interrupts + DMA”, except the “hardware” is your own C++ running on Linux, and
+it must obey the bus timing/protocol of a real PDP‑11.
+
+This document is a “zero to hero” for CSR‑style programming and then the
+DEQNA/DELQA family (often called “QNA” style) descriptor rings, using the
+existing DEQNA emulation as the concrete reference implementation.
+
+
+1) CSR I/O programming on a PDP‑11 (what the CPU really does)
+-------------------------------------------------------------
+
+On UNIBUS/QBUS, device registers live in the I/O page: the top chunk of the
+physical address space. The CPU accesses them with normal loads/stores; the bus
+cycle type encodes the direction and width:
+
+  - DATI   : master reads a 16‑bit word from a slave
+  - DATO   : master writes a 16‑bit word to a slave
+  - DATOB  : master writes an 8‑bit byte to a slave (QBUS has an explicit byte
+             cycle; UNIBUS uses byte strobes)
+
+The classic “CSR” pattern is:
+
+  - One register is a Control/Status Register (CSR)
+  - Driver sets control bits (GO, IE, RESET, etc.) via DATO
+  - Device sets status bits (DONE, ERR, “interrupt pending”) via internal logic
+  - Driver either polls CSR in a loop or enables interrupts and sleeps
+
+Simple PDP‑11 C driver style (polling):
+
+    #define DEV_BASE   ((volatile unsigned short *)017760100) /* example */
+    #define DEV_CSR    (DEV_BASE[0])
+    #define DEV_DATA   (DEV_BASE[1])
+    #define CSR_GO     0000001
+    #define CSR_DONE   0000200
+    #define CSR_IE     0000100
+
+    void dev_xfer_word(unsigned short w)
+    {
+        while ((DEV_CSR & CSR_DONE) == 0) ;   /* wait idle */
+        DEV_DATA = w;
+        DEV_CSR  = CSR_GO;                    /* start */
+        while ((DEV_CSR & CSR_DONE) == 0) ;   /* wait complete */
+    }
+
+Interrupt-driven is the same idea, but the device asserts an interrupt request
+line when “done” becomes true and IE=1; the CPU performs an interrupt
+acknowledge cycle (IACK) and fetches a vector, then your ISR clears the device
+condition and wakes the sleeping process.
+
+Two details that matter for emulation:
+
+  A) Byte writes
+     Old drivers sometimes do byte writes into 16‑bit CSRs. Your emulation must
+     merge the written byte with the existing word, and apply the device’s
+     “writable bits”/W1C rules correctly. In QUniBone this is surfaced as
+     DATO_ACCESS = word/byte-high/byte-low.
+
+  B) “Read has side effects”
+     Some CSRs clear bits on read (e.g., reading a status register clears an
+     interrupt latch). If you mark a register “active_on_dati”, QUniBone will
+     call you after every DATI so you can implement those semantics.
+
+
+2) From CSR to DMA (why “GO” isn’t enough anymore)
+--------------------------------------------------
+
+Once transfers are large (disk blocks, packets, tapes), you don’t want to push
+every word through a data register. Instead the driver gives the device a
+memory address and a count, starts the operation, and the device becomes a bus
+master and DMA’s data directly to/from RAM.
+
+Conceptually (classic pattern):
+
+  - BAR (bus address register) points at RAM
+  - WC  (word count) is usually stored as a negative number (two’s complement)
+  - GO  starts DMA
+  - Device arbitrates for the bus (NPR/NPG on QBUS; BR/BG on UNIBUS variants)
+  - On completion it sets DONE and optionally interrupts
+
+In QUniBone, the PRU implements the bus‑master handshake. On ARM, a device uses
+qunibusadapter->DMA(...) (or wrappers like dec_ether_base_c::dma_read_words /
+dma_write_words) to perform DMA safely through the adapter’s arbitration layer.
+
+
+3) The QUniBone device model (how “hardware registers” are represented)
+------------------------------------------------------------------------
+
+Key files:
+  - 10.01_base/2_src/arm/qunibusdevice.hpp
+  - 10.01_base/2_src/arm/qunibusadapter.hpp
+  - 10.01_base/2_src/shared/qunibus.h
+
+Each emulated device subclasses qunibusdevice_c and defines a sequential block
+of 16‑bit registers at base_addr + 2*index. Each register can be either:
+
+  - “Passive”: PRU treats it like a memory cell (fast; ideal for polled status)
+  - “Active”: PRU raises an event after DATI and/or DATO so ARM code can run
+              side effects (slow; use only where needed)
+
+This is controlled per register with:
+  - active_on_dato : call on_after_register_access() on writes (commands)
+  - active_on_dati : call on_after_register_access() on reads (read-to-clear etc.)
+
+Important constraint: on_after_register_access() runs in the context of
+servicing a PRU “device register access” event. It must be quick and must not
+try to do bus-master DMA inline, or you can deadlock the bus (CPU is in a CSR
+cycle while your device wants NPR/BR). The normal pattern is:
+
+  - Capture the written value
+  - Wake a worker thread
+  - Let the worker do DMA, update internal state, and schedule interrupts
+
+The DEQNA code explicitly does this: CSR/VAR are handled immediately (no DMA),
+but ring-pointer writes are queued for worker threads (“deferred register
+writes”) to keep the CSR path responsive.
+
+
+4) Enter the DELQA/DEQNA (“QNA”) programming model
+--------------------------------------------------
+
+The DEQNA/DELQA family is a QBUS Ethernet controller. From the driver’s
+perspective it provides:
+
+  - A small CSR block in the I/O page (control bits, interrupt enables, etc.)
+  - A programmable interrupt vector (VAR)
+  - Two pointers (TX list base and RX list base)
+  - Bus-master DMA to fetch descriptors and packet data
+
+In this repo, the concrete implementation is:
+  - 10.02_devices/2_src/deqna.cpp
+  - 10.02_devices/2_src/deqna.hpp
+  - 10.02_devices/2_src/deqna_regs.h
+  - 10.02_devices/2_src/dec_ether_base.hpp (shared DMA/INTR helpers)
+
+Register block (8 words / 16 bytes) as implemented:
+
+  +0  STA0   station address byte / checksum byte (read)
+  +2  STA1   station address byte / checksum byte (read)
+  +4  RCLL   receive list base low  (write)
+  +6  RCLH   receive list base high (write; “kicks” RX list)
+  +8  XMTL   transmit list base low  (write)
+  +10 XMTH   transmit list base high (write; “kicks” TX list)
+  +12 VAR    interrupt vector register (write; readback)
+  +14 CSR    control/status register (write/readback)
+
+Note: The emulation also populates the “station address bytes” as readback on
+the low byte of DATI reads of the first six register addresses. This matches
+how real drivers commonly probe for the MAC without a separate ROM window.
+
+
+5) Descriptor rings: the real heart of QNA Ethernet
+---------------------------------------------------
+
+Instead of a BAR/WC pair, QNA uses descriptor lists in host memory. The driver
+allocates rings of descriptors (in PDP‑11 RAM), fills them in, and then tells
+the device where the rings live by writing the base pointers. The device then:
+
+  - DMA-reads descriptors to learn where buffers are
+  - DMA-reads (TX) or DMA-writes (RX) packet bytes to those buffers
+  - DMA-writes completion status back into descriptor words
+  - Sets CSR bits RI/XI and interrupts if IE=1
+
+Descriptor format used by the DEQNA emulation (6 words / 12 bytes):
+
+  Word 0: “flag/claim” word (device writes 0xFFFF when it takes the descriptor)
+  Word 1: buffer addr high bits (low 6 bits) + control flags:
+          V (valid), C (chain), E (end-of-message), S (setup),
+          H/L (odd byte adjust at begin/end)
+  Word 2: buffer addr low 16 bits
+  Word 3: buffer length, stored as one’s complement (so len_words = ~w3 + 1)
+  Word 4: status word 1 (device writes)
+  Word 5: status word 2 (device writes)
+
+Addressing: QBUS can be 16/18/22-bit. The helper make_addr(hi, lo) masks the
+high bits appropriately and returns a byte address.
+
+Length/odd-byte flags: Ethernet is byte-counted, but the bus is word-oriented.
+The H/L flags let the hardware shave one byte at the start/end to represent an
+odd byte count without inventing a byte-DMA mode.
+
+
+6) How the driver receives packets (RX ring walk)
+-------------------------------------------------
+
+Driver responsibilities:
+  1) Allocate N receive buffers in RAM (cluster/mbuf, static area, etc.)
+  2) Create N descriptors pointing at those buffers
+  3) Mark each descriptor V=1 (valid), set length, set buffer address
+  4) Write RCLL then RCLH to hand the RX list to the device
+  5) Enable receive (CSR.RE) and interrupts (CSR.IE) as desired
+
+Device responsibilities (emulator logic):
+  - When a packet arrives on the host interface, queue it (pcap callback/loop)
+  - When RX is enabled and the RX list is valid:
+      * DMA-read the current descriptor
+      * If V=0: set CSR.RL (receive list invalid/exhausted) and stop
+      * If C=1: treat words 1/2 as “next descriptor base”; jump there and
+                continue (this is list chaining, not packet segmentation)
+      * Otherwise:
+          - Write 0xFFFF to word 0 to claim it
+          - DMA-write the packet bytes into the buffer
+          - DMA-write status/length into words 4/5
+          - Advance to the next descriptor (cur + 12)
+          - Set CSR.RI (receive interrupt pending); interrupt if IE=1
+
+On the OS side, the driver “reclaims” a completed RX descriptor by:
+  - Inspecting status/length, building an mbuf chain, passing it up the stack
+  - Reinitializing the descriptor (buffer address, length, V=1)
+  - Clearing CSR.RI via W1C and ensuring the device sees a valid list again
+
+
+7) How the driver sends packets (TX ring walk)
+----------------------------------------------
+
+Driver responsibilities:
+  1) Build a packet in RAM (often an mbuf chain that may be non-contiguous)
+  2) Create one or more TX descriptors pointing at each segment
+  3) Mark each descriptor V=1; mark the last segment E=1
+  4) Write XMTL then XMTH to kick transmit processing
+
+Device responsibilities (emulator logic):
+  - DMA-read descriptors starting at the TX base
+  - For each descriptor:
+      * Claim it by writing 0xFFFF to word 0
+      * If C=1: jump to the chained base address and continue
+      * If V=0: set CSR.XL (xmit list invalid/exhausted) and also set XI to
+                wake the driver, then stop
+      * Otherwise DMA-read the buffer segment into an internal assembly buffer
+      * When E=1 (end of message): transmit the assembled frame
+        (or loop it back internally if loopback mode is enabled)
+      * DMA-write completion status into words 4/5 and set CSR.XI
+
+Setup packets: a special TX frame (descriptor has S=1) configures the receive
+filter. In the DEQNA emulation this is treated as a 128-byte “setup packet”
+carrying up to 14 MAC addresses plus option bits (promisc/multicast/sanity).
+
+
+8) Chain descriptors vs “end of packet” (and why chain exists)
+--------------------------------------------------------------
+
+Two different “chaining” ideas get confused:
+
+  - Packet segmentation: a single Ethernet frame may span multiple buffers.
+    That’s what E=1 means: “this segment ends the packet”. E=0 means “more
+    segments follow”; the device keeps accumulating data until it hits E=1.
+
+  - List chaining (C=1): this descriptor is not a buffer at all; it’s a pointer
+    to another descriptor list base address. The device “jumps” to that address
+    and continues scanning descriptors there.
+
+Why have C=1 chain pointers instead of a simple “terminal descriptor”?
+
+  1) Hardware doesn’t have a “ring length” register.
+     The device can’t do modulo arithmetic unless you also tell it the size.
+     A chain pointer makes the descriptor list self-describing: the “next”
+     address is stored in memory where the device is already DMA-reading.
+
+  2) It enables true circular rings.
+     The conventional pattern is to place a chain descriptor at the end of the
+     ring pointing back to the first descriptor. That gives you a continuous
+     loop without relocating the ring or reprogramming a “base pointer” every
+     time you wrap.
+
+  3) It permits non-contiguous rings.
+     The driver can allocate descriptor blocks wherever it can find memory and
+     chain them together (important on small systems with fragmentation).
+
+  4) It provides a clean “stop” mechanism.
+     Clearing V on a data descriptor causes the device to set RL/XL and stop.
+     The driver can then refill descriptors and restart by writing RCLH/XMTH.
+
+Emulation note: real/QNA-compatible code has some quirks in the exact order of
+checks. The DEQNA emulation mirrors SIMH behavior:
+  - RX: check V before following a chain (a chain is followed only if valid)
+  - TX: follow chain before checking V (chain is honored regardless of V)
+
+If you’re debugging a “mysteriously stuck” driver, these details matter.
+
+
+9) Emulator gotchas: interrupts, DMA, and deadlocks
+---------------------------------------------------
+
+On real QBUS/UNIBUS, arbitration for bus master DMA is asynchronous to CSR
+cycles: a device may request the bus while the CPU is doing register accesses.
+QUniBone’s PRU firmware has been updated to better match this (see PRU.md),
+avoiding a classic deadlock:
+
+  CPU polls CSR -> CSR cycle holds SSYN while ARM handles an “active register”
+  Device thread wants DMA -> PRU must arbitrate NPR/BR
+  If arbitration is incorrectly gated on SSYN/event completion -> deadlock
+
+Practical rules when implementing a DELQA/DEQNA style device:
+  - Keep register callbacks short; never block waiting for DMA in that path.
+  - Do DMA in worker threads; use mutexes to serialize DMA if needed.
+  - Be careful raising interrupts while DMA is active; QUniBone’s
+    dec_ether_base.hpp implements a short “post-INTR DMA holdoff” to reduce IACK
+    timeouts when the CPU is trying to fetch the interrupt vector.
+  - Treat CSR bits as the driver sees them: RI/XI are W1C; IE gates interrupt
+    assertion; RL/XL mean “list invalid/exhausted” and are cleared when the
+    driver rewrites the list base.
+
+
+10) Where to look next (code landmarks)
+---------------------------------------
+
+If you want to extend or build another Ethernet controller emulation, start at:
+
+  - 10.02_devices/2_src/deqna.cpp
+      Register semantics, ring walking, pcap bridge, RI/XI logic, reset paths.
+
+  - 10.02_devices/2_src/dec_ether_base.hpp
+      Safe DMA helpers and interrupt/DMA coordination patterns.
+
+  - 10.01_base/2_src/arm/qunibusdevice.hpp
+      Register definition model (active/passive), PRU shared register latches.
+
+  - 10.01_base/2_src/arm/qunibusadapter.hpp
+      How DMA and INTR requests are scheduled and executed on the PRU.
+
+This combination is the core “DELQA emulator programming” toolbox in QUniBone:
+define CSRs correctly, move data via DMA exactly as the driver expects, and
+match the ring-walk edge cases closely enough that 2.11BSD/Ultrix/etc. drivers
+behave like they would on real hardware.

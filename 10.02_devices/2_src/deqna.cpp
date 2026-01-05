@@ -1516,13 +1516,13 @@ bool deqna_c::process_rbdl(void)
 
     // Track starting address to detect circular chains (OpenSIMH-style)
     uint32_t start_rbdl_ba = 0;
-    uint32_t prev_start = 0;
+    uint32_t wrap_base = 0;
     bool wrap_guard_enabled = false;
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         start_rbdl_ba = rbdl_ba;
-        prev_start = last_rbdl_start;
         wrap_guard_enabled = rbdl_wrap_guard;
+        wrap_base = wrap_guard_enabled ? last_rbdl_start : start_rbdl_ba;
     }
     unsigned desc_count = 0;
     const unsigned max_desc_count = 256;  // Sanity limit to prevent infinite loops
@@ -1549,11 +1549,21 @@ bool deqna_c::process_rbdl(void)
 
         // Guard against lapping a circular ring across successive calls when
         // the guest hasn't reclaimed descriptors yet. If we return to the same
-        // start address as the previous call while packets remain queued, stop
-        // delivering and let packets be dropped at the queue/pcap level.
-        if (wrap_guard_enabled && cur_ba == prev_start) {
+        // start address we began this backlog with while packets remain queued,
+        // stop delivering and let packets be dropped at the queue/pcap level.
+        if (wrap_guard_enabled && cur_ba == wrap_base) {
+            size_t dropped = 0;
+            // Drop any queued packets so we don't spin on a full ring
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex);
+                if (!read_queue.empty()) {
+                    dropped = read_queue.size();
+                    read_queue_loss += static_cast<unsigned>(dropped);
+                    read_queue.clear();
+                }
+            }
             if (trace.value) {
-                DEBUG("DEQNA: RX wrap guard hit at %06o (prev_start=%06o)", cur_ba, prev_start);
+                DEBUG("DEQNA: RX wrap guard hit at %06o (wrap_base=%06o drop=%zu)", cur_ba, wrap_base, dropped);
             }
             break;
         }
@@ -1606,11 +1616,18 @@ bool deqna_c::process_rbdl(void)
         if (trace.value)
             DEBUG("DEQNA: RX desc_read_words @ %08o words=%u", cur_ba, 4u);
         if (!desc_read_words(cur_ba, words, 4)) {
+            WARNING("DEQNA: RX desc_read failed at %06o", cur_ba);
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             // OpenSIMH-compatible: NXM triggers NI|XI|XL|RL (and interrupts via XI).
             nxm_error();
             process_deferred_interrupts();
             return false;
+        }
+        if (trace.value) {
+            uint32_t buf_addr = make_addr(words[1], words[2]);
+            DEBUG("DEQNA: RX desc @ %06o: w0=%06o w1=%06o w2=%06o w3=%06o (V=%d C=%d buf=%06o)",
+                  cur_ba, words[0], words[1], words[2], words[3],
+                  (words[1] & QNA_DSC_V) ? 1 : 0, (words[1] & QNA_DSC_C) ? 1 : 0, buf_addr);
         }
         if (reset_in_progress.load(std::memory_order_acquire))
             return false;
@@ -1720,7 +1737,15 @@ bool deqna_c::process_rbdl(void)
             dma_failed = true;
             rbl = 0;
             item.packet.used = item.packet.len;
-            WARNING("DEQNA: RX DMA write failed at addr=%08o", address);
+            uint32_t rbdl_snapshot = 0;
+            {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                rbdl_snapshot = rbdl_ba;
+            }
+            WARNING("DEQNA: RX DMA write failed addr=%08o desc=%06o blen=%u words=%06o/%06o/%06o/%06o rbdl=%06o csr=%06o",
+                    address, cur_ba, static_cast<unsigned>(b_length),
+                    words[0], words[1], words[2], words[3],
+                    rbdl_snapshot, csr_snapshot);
         }
 
         uint16_t status1 = 0;
@@ -1804,6 +1829,7 @@ bool deqna_c::process_rbdl(void)
         if (reset_in_progress.load(std::memory_order_acquire))
             return false;
         if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
+            WARNING("DEQNA: RX status write failed at desc=%06o+8 (dma_failed=%d)", cur_ba, dma_failed ? 1 : 0);
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
             process_deferred_interrupts();
@@ -1837,9 +1863,10 @@ bool deqna_c::process_rbdl(void)
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         if (queue_empty) {
             rbdl_wrap_guard = false;
+            last_rbdl_start = 0;
         } else {
             rbdl_wrap_guard = true;
-            last_rbdl_start = start_rbdl_ba;
+            last_rbdl_start = wrap_base;
         }
     }
 
@@ -1899,6 +1926,7 @@ void deqna_c::touch_rbdl_if_idle(void)
  *
  * Returns: true on success, false on NXM error
  */
+
 bool deqna_c::dispatch_xbdl(void)
 {
     uint32_t cur_ba = 0;
@@ -1937,6 +1965,7 @@ bool deqna_c::dispatch_xbdl(void)
  * TDR (Transmit Delay Report) is a rough estimate of transmission time
  * in bit times, used by the driver for collision backoff calculations.
  */
+
 void deqna_c::write_callback(int status)
 {
     uint32_t cur_ba = 0;
@@ -2022,6 +2051,7 @@ void deqna_c::write_callback(int status)
  *   DMA from process_rbdl(). This is critical for deferred interrupt processing -
  *   we only fire the interrupt when BOTH RX and TX descriptor processing are complete.
  */
+
 bool deqna_c::process_xbdl(void)
 {
     // Serialize ALL descriptor processing (RX and TX) to prevent interrupt deadlock
@@ -2718,7 +2748,23 @@ void deqna_c::worker_rx(void)
 
         // Process receive ring - delivers queued packets to descriptors
         process_rbdl();
-        timeout_c::wait_ms(1);
+
+        // If we have packets queued and the driver is ready to receive them,
+        // loop immediately to process the backlog. Otherwise, sleep.
+        bool has_packets = false;
+        {
+            std::lock_guard<std::mutex> queue_lock(queue_mutex);
+            has_packets = !read_queue.empty();
+        }
+
+        bool driver_ready = false;
+        if (has_packets) {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            driver_ready = !(csr & QNA_CSR_RL);
+        }
+
+        if (!has_packets || !driver_ready)
+            timeout_c::wait_ms(1);
     }
 }
 
