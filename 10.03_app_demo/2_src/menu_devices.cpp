@@ -180,9 +180,7 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
     // uses all slot resource, can onyl run alone
     //testcontroller_c *test_controller = new testcontroller_c();
 
-#if defined(UNIBUS)
     cpu_c *cpu = NULL;
-#endif
     // create RF11 + RS11 drive
     rf11_c *RF11 = new rf11_c();
 
@@ -253,12 +251,12 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
 #if defined(UNIBUS)
     m9312_c *m9312 = new m9312_c();
     ke11_c *KE11A = new ke11_c();
+#endif
 
     if (with_emulated_CPU) {
         cpu = new cpu_c();
         cpu->enabled.set(true);
     }
-#endif
 
     if (with_storage_file_test) {
         const char *testfname = "/tmp/storagedrive_selftest.bin";
@@ -342,6 +340,8 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
             printf("h <1|0>              Set/release QBUS HALT, like front panel toggle switch\n");
             printf("pwr                  Simulate QBUS power cycle (DCOK/POK) like front panel RESTART\n");
 #endif
+            if (with_emulated_CPU)
+                printf("cpu start|halt|cont|boot   Control emulated CPU (START/HALT/CONT or power-up boot)\n");
             printf("q                    Quit\n");
         }
         s_choice = getchoice(menu_code);
@@ -362,6 +362,36 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
                 qunibus->parse_word(s_param[0], &active) ;
                 qunibus->set_halt(active) ;
 #endif
+            } else if (!strcasecmp(s_opcode, "cpu") && with_emulated_CPU) {
+                // Map simple menu verbs to CPU front-panel switch semantics.
+                if (!cpu) {
+                    printf("No emulated CPU instantiated.\n");
+                    show_help = true;
+                } else if (n_fields < 2) {
+                    printf("Usage: cpu start|halt|cont\n");
+                    show_help = true;
+                } else if (!strcasecmp(s_param[0], "start") || !strcasecmp(s_param[0], "reset")) {
+                    cpu->halt_switch.value = false;
+                    cpu->start_switch.value = true;
+                } else if (!strcasecmp(s_param[0], "halt")) {
+                    cpu->halt_switch.value = true;
+                } else if (!strcasecmp(s_param[0], "cont")) {
+                    cpu->continue_switch.value = true;
+                } else if (!strcasecmp(s_param[0], "boot")) {
+                    // Simulate power-up so CPU fetches vector 24/26.
+                    cpu->halt_switch.value = false;
+                    cpu->start_switch.value = false;
+                    cpu->continue_switch.value = false;
+#if defined(QBUS)
+                    // Keep a physical CPU quiet during the powercycle.
+                    qunibus->set_halt(true);
+                    qunibus->set_cpu_bus_activity(false);
+#endif
+                    qunibus->powercycle();
+                } else {
+                    printf("Unknown cpu command \"%s\"!\n", s_choice);
+                    show_help = true;
+                }
             } else if (!strcasecmp(s_opcode, "dbg") && n_fields == 2) {
                 if (!strcasecmp(s_param[0], "c")) {
                     logger->clear();
@@ -660,11 +690,11 @@ void application_c::menu_devices(const char *menu_code, bool with_emulated_CPU)
         }
     } // ready
 
-#if defined(UNIBUS)
     if (with_emulated_CPU) {
         cpu->enabled.set(false);
         delete cpu;
     }
+#if defined(UNIBUS)
     m9312->enabled.set(false) ;
     delete m9312 ;
     KE11A->enabled.set(false);

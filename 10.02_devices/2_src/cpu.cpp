@@ -256,6 +256,13 @@ cpu_c::cpu_c() :
     direct_memory.value = false;
     emulation_speed.value = 0.1 ; // non-PMI speed,  see on_param_changed() also
 
+    saved_bus_state = false;
+    saved_arbitrator_state = false;
+    bus_owner_active = false;
+    prev_arbitrator_active = false;
+    prev_cpu_bus_activity = true;
+    prev_halt_active = false;
+
 
     // current CPU does not publish registers to the bus
     // must be qunibusdevice_c then!
@@ -286,6 +293,17 @@ bool cpu_c::on_before_install(void)
 // all other switches parsed synchronically in worker()
     start_switch.value = false;
     continue_switch.value = false;
+    bus_owner_active = true;
+#if defined(QBUS)
+    if (!saved_bus_state) {
+        // Take ownership early so a physical CPU is silenced as soon as we enable emulation.
+        prev_cpu_bus_activity = qunibus->get_cpu_bus_activity();
+        prev_halt_active = qunibus->get_halt();
+        saved_bus_state = true;
+    }
+    qunibus->set_halt(true);
+    qunibus->set_cpu_bus_activity(false);
+#endif
 // enable active: assert CPU starts stopped
     stop("CPU stopped", show_none);
     return true;
@@ -297,6 +315,7 @@ void cpu_c::on_after_uninstall(void)
     start_switch.value = false;
     halt_switch.value = true;
     // HALT disabled CPU
+    bus_owner_active = false;
     stop(NULL, show_none);
 }
 
@@ -339,11 +358,32 @@ void cpu_c::start()
 #endif
 
     runmode.value = true;
+    if (!saved_arbitrator_state) {
+        // Preserve previous arbitration mode so we can restore it on stop.
+        prev_arbitrator_active = qunibus->get_arbitrator_active();
+        saved_arbitrator_state = true;
+    }
+#if defined(QBUS)
+    if (!bus_owner_active) {
+        // Fail-safe: if start() is invoked before enable, still take over the bus.
+        bus_owner_active = true;
+    }
+    if (!saved_bus_state) {
+        // Preserve previous bus quieting so we can restore it on uninstall.
+        prev_cpu_bus_activity = qunibus->get_cpu_bus_activity();
+        prev_halt_active = qunibus->get_halt();
+        saved_bus_state = true;
+    }
+    // Prefer a physical CPU to remain installed but quiet while emulation runs.
+    qunibus->set_halt(true);
+#endif
+    // Emulated CPU becomes the bus arbitrator; keep device DMA/INTR protocol active.
+    qunibus->set_cpu_bus_activity(false); // QBUS: inhibit any physical CPU bus traffic.
+    // Block interrupt grants until the first PSW fetch updates the CPU priority.
+    mailbox->arbitrator.ifs_priority_level = CPU_PRIORITY_LEVEL_FETCHING;
     mailbox->param = 1;
     mailbox_execute(ARM2PRU_CPU_ENABLE);
-    // Emulated CPU does not provide external DMA arbitration; allow devices to DMA without DMR/DMG.
-    qunibus->set_arbitrator_active(false);
-    WARNING("CPU emulation active: external DMA arbitration disabled");
+    qunibus->set_arbitrator_active(true);
     pc.readonly = true; // can only be set on stopped CPU
     ka11.state = KA11_STATE_RUNNING;
     // time base of all device emulators now based on CPU opcode execution
@@ -369,9 +409,23 @@ void cpu_c::stop(const char * info, int show_options)
     pc.value = ka11.r[7]; // update for editing
 
     runmode.value = false;
-    mailbox->param = 0;
+    mailbox->param = bus_owner_active ? 1 : 0;
     mailbox_execute(ARM2PRU_CPU_ENABLE);
-    qunibus->set_arbitrator_active(false);
+    if (saved_arbitrator_state) {
+        // Restore arbitration mode to whatever was active before CPU emulation.
+        qunibus->set_arbitrator_active(prev_arbitrator_active);
+        saved_arbitrator_state = false;
+    } else {
+        qunibus->set_arbitrator_active(false);
+    }
+    if (!bus_owner_active && saved_bus_state) {
+        // Only release the physical CPU when the CPU device is disabled.
+        qunibus->set_cpu_bus_activity(prev_cpu_bus_activity);
+#if defined(QBUS)
+        qunibus->set_halt(prev_halt_active);
+#endif
+        saved_bus_state = false;
+    }
 
     if (info && strlen(info)) {
         if (show_options & show_pc) {

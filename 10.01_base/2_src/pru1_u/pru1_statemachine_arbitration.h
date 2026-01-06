@@ -55,13 +55,17 @@ typedef struct {
 	// != saves GRANTed request and indicates BBSY wait state
 	uint8_t grant_bbsy_ssyn_wait_grant_mask;
 
+	// True when the PRU is acting as the CPU (no physical CPU on the bus).
+	// Used to shortcut interrupt delivery to the ARM emulator.
+	uint8_t emulate_cpu;
+
 	/*** master ****/
 	// CPU is requesting memory access via PRU2ARM_DMA/mailbox.dma
 	uint8_t cpu_request;
 
 	uint8_t arbitrator_grant_mask; // single GRANT line set by master
 
-	uint8_t dummy[2]; // make it dword-sized
+	uint8_t dummy[1]; // make it dword-sized
 
 } statemachine_arbitration_t;
 

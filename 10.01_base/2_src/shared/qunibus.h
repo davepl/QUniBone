@@ -122,6 +122,13 @@ private:
 	// 	devices do DMA without NPR/NPG protocol
 	// true:  active CPU. devices perform Request/Grant/SACK protocoll
 	bool arbitrator_active;
+	// Tracks whether we deliberately inhibited the physical QBUS CPU from bus activity.
+	// Used by higher-level tooling to restore pre-sizer state.
+	bool cpu_bus_activity;
+#if defined(QBUS)
+	// Tracks the state of the QBUS HALT line so callers can restore it.
+	bool halt_active;
+#endif
 
 	// disabled
 	uint8_t probe_grant_continuity(bool error_if_closed) ;
@@ -149,6 +156,7 @@ public:
 	void init(void);
 
 	void set_cpu_bus_activity(bool active) ;
+	bool get_cpu_bus_activity(void) const;
 	void set_arbitrator_active(bool active);
 
 	bool get_arbitrator_active(void);
@@ -156,6 +164,7 @@ public:
 	void powercycle(int phase = 3);
 #if defined(QBUS)	
 	void set_halt(bool active) ;
+	bool get_halt(void) const;
 #endif
 
 #if defined(UNIBUS)

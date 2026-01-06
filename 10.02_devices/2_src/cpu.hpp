@@ -121,6 +121,14 @@ private:
 	static const int show_state = 4 ;
 	static const int show_cycletrace = 8 ;
 
+	// Bus ownership while CPU device is enabled (used to silence a physical CPU).
+	bool saved_bus_state;
+	bool saved_arbitrator_state;
+	bool bus_owner_active;
+	bool prev_arbitrator_active;
+	bool prev_cpu_bus_activity;
+	bool prev_halt_active;
+
 public:
 
     cpu_c();

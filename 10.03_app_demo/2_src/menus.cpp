@@ -116,7 +116,20 @@ bool application_c::emulate_memory(uint32_t endaddr)
     emulated_memory_start_addr = 0xffffffff;
     emulated_memory_end_addr = 0; // start > end: disable
     ddrmem->set_range(emulated_memory_start_addr, emulated_memory_end_addr);
+#if defined(QBUS)
+    // QBUS note: the physical CPU may not grant NPR yet right after power-on.
+    // test_sizer() issues a huge DMA and can deadlock waiting for arbitration,
+    // so we temporarily quiesce the CPU bus and force no-arbitration DMA.
+    const bool prev_cpu_bus_activity = qunibus->get_cpu_bus_activity();
+    const bool prev_arbitrator_active = qunibus->get_arbitrator_active();
+    qunibus->set_cpu_bus_activity(false);
+    qunibus->set_arbitrator_active(false);
+#endif
     first_invalid_addr = qunibus->test_sizer();
+#if defined(QBUS)
+    qunibus->set_arbitrator_active(prev_arbitrator_active);
+    qunibus->set_cpu_bus_activity(prev_cpu_bus_activity);
+#endif
     if (first_invalid_addr >= qunibus->iopage_start_addr)
         printf("Found physical memory in full range 0..%s, no emulation necessary!\n", qunibus->addr2text(qunibus->iopage_start_addr-2));
     else if (endaddr > 0 && first_invalid_addr > endaddr)

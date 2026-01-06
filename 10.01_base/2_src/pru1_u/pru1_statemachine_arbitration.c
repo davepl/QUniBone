@@ -104,6 +104,8 @@ void sm_arb_reset() {
 	sm_arb.device_request_signalled_mask = 0;
 
 	sm_arb.grant_bbsy_ssyn_wait_grant_mask = 0;
+	// Default to physical CPU arbitration until ARM enables emulation.
+	sm_arb.emulate_cpu = 0;
 	sm_arb.cpu_request = 0;
 	sm_arb.arbitrator_grant_mask = 0;
 	timeout_cleanup(TIMEOUT_SACK);

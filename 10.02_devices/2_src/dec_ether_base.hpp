@@ -133,6 +133,14 @@ protected:
                     name.value.c_str(), addr, wordcount, static_cast<unsigned long long>(max));
             return false;
         }
+        if (qunibus && addr >= qunibus->iopage_start_addr) {
+            WARNING("%s: dma_read_words targets I/O page: addr=%06o words=%zu iopage=%06o",
+                    name.value.c_str(), addr, wordcount, qunibus->iopage_start_addr);
+        }
+        if (addr & 1) {
+            WARNING("%s: dma_read_words odd addr: addr=%06o words=%zu",
+                    name.value.c_str(), addr, wordcount);
+        }
 
         if (ddrmem && ddrmem->enabled &&
             addr64 >= ddrmem->qunibus_startaddr &&
@@ -153,6 +161,15 @@ protected:
 
         dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
         update_intr();
+        if (!dma_request.success) {
+            WARNING("%s: dma_read_words failed: addr=%06o words=%zu end=%06o aw=%u iopage=%06o ddr=%d [%06o..%06o]",
+                    name.value.c_str(), addr, wordcount, dma_request.qunibus_end_addr,
+                    qunibus ? qunibus->addr_width : 0,
+                    qunibus ? qunibus->iopage_start_addr : 0,
+                    (ddrmem && ddrmem->enabled) ? 1 : 0,
+                    (ddrmem && ddrmem->enabled) ? ddrmem->qunibus_startaddr : 0,
+                    (ddrmem && ddrmem->enabled) ? ddrmem->qunibus_endaddr : 0);
+        }
         return dma_request.success;
     }
 
@@ -167,6 +184,14 @@ protected:
             WARNING("%s: dma_write_words bounds check failed: addr=%06o words=%zu max=%llu",
                     name.value.c_str(), addr, wordcount, static_cast<unsigned long long>(max));
             return false;
+        }
+        if (qunibus && addr >= qunibus->iopage_start_addr) {
+            WARNING("%s: dma_write_words targets I/O page: addr=%06o words=%zu iopage=%06o",
+                    name.value.c_str(), addr, wordcount, qunibus->iopage_start_addr);
+        }
+        if (addr & 1) {
+            WARNING("%s: dma_write_words odd addr: addr=%06o words=%zu",
+                    name.value.c_str(), addr, wordcount);
         }
 
         if (ddrmem && ddrmem->enabled &&
@@ -189,6 +214,15 @@ protected:
 
         dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
         update_intr();
+        if (!dma_request.success) {
+            WARNING("%s: dma_write_words failed: addr=%06o words=%zu end=%06o aw=%u iopage=%06o ddr=%d [%06o..%06o]",
+                    name.value.c_str(), addr, wordcount, dma_request.qunibus_end_addr,
+                    qunibus ? qunibus->addr_width : 0,
+                    qunibus ? qunibus->iopage_start_addr : 0,
+                    (ddrmem && ddrmem->enabled) ? 1 : 0,
+                    (ddrmem && ddrmem->enabled) ? ddrmem->qunibus_startaddr : 0,
+                    (ddrmem && ddrmem->enabled) ? ddrmem->qunibus_endaddr : 0);
+        }
         return dma_request.success;
     }
 
@@ -203,6 +237,14 @@ protected:
             WARNING("%s: desc_read_words bounds check failed: addr=%06o words=%zu max=%llu",
                     name.value.c_str(), addr, wordcount, static_cast<unsigned long long>(max));
             return false;
+        }
+        if (qunibus && addr >= qunibus->iopage_start_addr) {
+            WARNING("%s: desc_read_words targets I/O page: addr=%06o words=%zu iopage=%06o",
+                    name.value.c_str(), addr, wordcount, qunibus->iopage_start_addr);
+        }
+        if (addr & 1) {
+            WARNING("%s: desc_read_words odd addr: addr=%06o words=%zu",
+                    name.value.c_str(), addr, wordcount);
         }
 
         if (ddrmem && ddrmem->enabled &&
@@ -224,6 +266,15 @@ protected:
 
         dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
         update_intr();
+        if (!dma_desc_request.success) {
+            WARNING("%s: desc_read_words failed: addr=%06o words=%zu end=%06o aw=%u iopage=%06o ddr=%d [%06o..%06o]",
+                    name.value.c_str(), addr, wordcount, dma_desc_request.qunibus_end_addr,
+                    qunibus ? qunibus->addr_width : 0,
+                    qunibus ? qunibus->iopage_start_addr : 0,
+                    (ddrmem && ddrmem->enabled) ? 1 : 0,
+                    (ddrmem && ddrmem->enabled) ? ddrmem->qunibus_startaddr : 0,
+                    (ddrmem && ddrmem->enabled) ? ddrmem->qunibus_endaddr : 0);
+        }
         return dma_desc_request.success;
     }
 
@@ -238,6 +289,14 @@ protected:
             WARNING("%s: desc_write_words bounds check failed: addr=%06o words=%zu max=%llu",
                     name.value.c_str(), addr, wordcount, static_cast<unsigned long long>(max));
             return false;
+        }
+        if (qunibus && addr >= qunibus->iopage_start_addr) {
+            WARNING("%s: desc_write_words targets I/O page: addr=%06o words=%zu iopage=%06o",
+                    name.value.c_str(), addr, wordcount, qunibus->iopage_start_addr);
+        }
+        if (addr & 1) {
+            WARNING("%s: desc_write_words odd addr: addr=%06o words=%zu",
+                    name.value.c_str(), addr, wordcount);
         }
 
         if (ddrmem && ddrmem->enabled &&
@@ -260,6 +319,15 @@ protected:
 
         dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
         update_intr();
+        if (!dma_desc_request.success) {
+            WARNING("%s: desc_write_words failed: addr=%06o words=%zu end=%06o aw=%u iopage=%06o ddr=%d [%06o..%06o]",
+                    name.value.c_str(), addr, wordcount, dma_desc_request.qunibus_end_addr,
+                    qunibus ? qunibus->addr_width : 0,
+                    qunibus ? qunibus->iopage_start_addr : 0,
+                    (ddrmem && ddrmem->enabled) ? 1 : 0,
+                    (ddrmem && ddrmem->enabled) ? ddrmem->qunibus_startaddr : 0,
+                    (ddrmem && ddrmem->enabled) ? ddrmem->qunibus_endaddr : 0);
+        }
         return dma_desc_request.success;
     }
 
@@ -270,12 +338,24 @@ protected:
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(len);
         uint64_t max = qunibus->addr_space_byte_count;
-        if (max == 0 || addr64 >= max || byte_count > max - addr64)
+        if (max == 0 || addr64 >= max || byte_count > max - addr64) {
+            WARNING("%s: dma_read_bytes bounds check failed: addr=%06o len=%zu max=%llu",
+                    name.value.c_str(), addr, len, static_cast<unsigned long long>(max));
             return false;
+        }
+        if (qunibus && addr >= qunibus->iopage_start_addr) {
+            WARNING("%s: dma_read_bytes targets I/O page: addr=%06o len=%zu iopage=%06o",
+                    name.value.c_str(), addr, len, qunibus->iopage_start_addr);
+        }
 
         if (addr & 1) {
             uint16_t word = 0;
-            if (addr == 0 || !dma_read_words(addr - 1, &word, 1))
+            if (addr == 0) {
+                WARNING("%s: dma_read_bytes odd addr underflow: addr=%06o len=%zu",
+                        name.value.c_str(), addr, len);
+                return false;
+            }
+            if (!dma_read_words(addr - 1, &word, 1))
                 return false;
             buffer[0] = static_cast<uint8_t>((word >> 8) & 0xff);
             addr += 1;
@@ -310,12 +390,24 @@ protected:
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(len);
         uint64_t max = qunibus->addr_space_byte_count;
-        if (max == 0 || addr64 >= max || byte_count > max - addr64)
+        if (max == 0 || addr64 >= max || byte_count > max - addr64) {
+            WARNING("%s: dma_write_bytes bounds check failed: addr=%06o len=%zu max=%llu",
+                    name.value.c_str(), addr, len, static_cast<unsigned long long>(max));
             return false;
+        }
+        if (qunibus && addr >= qunibus->iopage_start_addr) {
+            WARNING("%s: dma_write_bytes targets I/O page: addr=%06o len=%zu iopage=%06o",
+                    name.value.c_str(), addr, len, qunibus->iopage_start_addr);
+        }
 
         if (addr & 1) {
             uint16_t word = 0;
-            if (addr == 0 || !dma_read_words(addr - 1, &word, 1))
+            if (addr == 0) {
+                WARNING("%s: dma_write_bytes odd addr underflow: addr=%06o len=%zu",
+                        name.value.c_str(), addr, len);
+                return false;
+            }
+            if (!dma_read_words(addr - 1, &word, 1))
                 return false;
             word = static_cast<uint16_t>((word & 0x00ff) | (static_cast<uint16_t>(buffer[0]) << 8));
             if (!dma_write_words(addr - 1, &word, 1))

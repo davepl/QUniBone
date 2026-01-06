@@ -285,16 +285,15 @@ void main(void) {
 				}
 				mailbox.arm2pru_req = ARM2PRU_NONE; // ACK: done
 				break;
-#ifdef TODO				
 			case ARM2PRU_CPU_ENABLE:
 				// bool flag much faster to access than shared mailbox member.
 				if (emulate_cpu != mailbox.param) {
 					emulate_cpu = mailbox.param;
 					sm_arb_reset(); // new arbitration algorithms
+					sm_arb.emulate_cpu = emulate_cpu;
 				}
 				mailbox.arm2pru_req = ARM2PRU_NONE; // ACK: done
 				break;
-#endif				
 			case ARM2PRU_BUSLATCH_SET: { // set a mux register
 				// and read back
 				// don't feed "volatile" vars into buslatch_macros !!!
@@ -350,4 +349,3 @@ void main(void) {
 }
 
 #pragma diag_pop
-

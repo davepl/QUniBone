@@ -142,9 +142,9 @@ public:
     parameter_bool_c promisc = parameter_bool_c(this, "promisc", "pr", false,
             "Enable libpcap promiscuous capture");
     parameter_unsigned_c rx_slots = parameter_unsigned_c(this, "rx_slots", "rx", false, "",
-            "%d", "RX ring scan limit (0 = no limit)", 0, 10);
+            "%d", "RX ring scan limit (0 = no limit)", 8, 10);
     parameter_unsigned_c tx_slots = parameter_unsigned_c(this, "tx_slots", "tx", false, "",
-            "%d", "TX ring scan limit (0 = no limit)", 0, 10);
+            "%d", "TX ring scan limit (0 = no limit)", 8, 10);
     parameter_unsigned_c rx_start_delay_ms = parameter_unsigned_c(this, "rx_start_delay_ms", "rxd", false, "",
             "%d", "Receiver start delay in ms", 16, 10);
     parameter_unsigned_c intr_dma_holdoff_us = parameter_unsigned_c(this, "intr_dma_holdoff_us", "idh", false, "",

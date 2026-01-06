@@ -40,6 +40,10 @@ enum sm_arbitration_states_enum {
     state_arbitration_dma_grant_rply_sync_wait,
     state_arbitration_intr_vector,
     state_arbitration_intr_complete,
+    // emulated CPU interrupt acknowledge for physical devices
+    state_arbitration_cpu_intr_start,
+    state_arbitration_cpu_intr_wait_rply,
+    state_arbitration_cpu_intr_complete,
     // no arbitration, steady state
     state_arbitration_noop
 } ;
@@ -54,6 +58,10 @@ enum sm_arbitration_states_enum {
 
 typedef struct {
     enum sm_arbitration_states_enum state;
+
+    // True when the PRU is acting as the CPU (no physical CPU on the bus).
+    // Used to shortcut interrupt delivery to the ARM emulator.
+    uint8_t emulate_cpu;
 
     // There are 5 request/grant signals (INTR,5,6,7 and NPR).
     // INTR/DMR lines = set of _PRIORITY_ARBITRATION_BIT_*
@@ -72,6 +80,10 @@ typedef struct {
     // sm_arb has several states: for DMA and INTR ACK.
     // On INTR completion the ARM event for one of INTR4,5,6,7 must be signaled, save its idx.
     uint8_t intr_level_index ;
+
+    // Interrupt acknowledge from emulated CPU to a physical device.
+    uint8_t cpu_intr_grant_mask; // single bit for IRQ4..7
+    uint16_t cpu_intr_vector; // vector read from DAL
 
     /*** master ****/
     // CPU is requesting memory access via PRU2ARM_DMA/mailbox.dma

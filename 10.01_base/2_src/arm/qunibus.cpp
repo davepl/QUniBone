@@ -54,6 +54,10 @@ qunibus_c::qunibus_c()
     addr_space_word_count = 0;
     addr_space_byte_count = 0;
     iopage_start_addr = 0;
+    cpu_bus_activity = true;
+#if defined(QBUS)
+    halt_active = false;
+#endif
 #if defined(UNIBUS)
     set_addr_width(18); // const
 #endif
@@ -437,6 +441,12 @@ void qunibus_c::set_halt(bool active)
     mailbox->initializationsignal.id = INITIALIZATIONSIGNAL_HALT;
     mailbox->initializationsignal.val = active;
     mailbox_execute(ARM2PRU_INITALIZATIONSIGNAL_SET);
+    halt_active = active;
+}
+
+bool qunibus_c::get_halt(void) const
+{
+    return halt_active;
 }
 #endif
 
@@ -459,11 +469,16 @@ bool qunibus_c::is_address_overlay_active() {
 // even a HALTed CPU runs ODT and polls the SLU for user I/O.
 void qunibus_c::set_cpu_bus_activity(bool active)
 {
-    UNUSED(active) ;
+    cpu_bus_activity = active;
 #if defined(QBUS)
     mailbox->param = active ;
     mailbox_execute(ARM2PRU_CPU_BUS_ACCESS);
 #endif
+}
+
+bool qunibus_c::get_cpu_bus_activity(void) const
+{
+    return cpu_bus_activity;
 }
 
 void qunibus_c::set_arbitrator_active(bool active)
@@ -723,4 +738,3 @@ void qunibus_c::test_mem(uint32_t start_addr, uint32_t end_addr, unsigned mode)
         printf("All OK! Total %d passes, split into %d block writes and %d block reads\n",
                pass_count, total_write_block_count, total_read_block_count);
 }
-

@@ -68,6 +68,24 @@
 #pragma diag_push
 #pragma diag_remark=515
 
+static void deliver_intr_to_emulated_cpu(uint8_t level_index, uint16_t vector)
+{
+	// No physical CPU means no SSYN/IAK handshake; clear SACK and short-circuit.
+	buslatches_setbits(1, BIT(5), 0);
+
+	// Block further interrupt grants until the CPU fetches PSW and updates priority.
+	mailbox.arbitrator.ifs_priority_level = CPU_PRIORITY_LEVEL_FETCHING;
+
+	// Deliver vector directly to ARM CPU emulator.
+	mailbox.events.intr_slave.vector = vector;
+	EVENT_SIGNAL(mailbox, intr_slave);
+
+	// Also signal completion of the device interrupt request.
+	EVENT_SIGNAL(mailbox, intr_master[level_index]);
+
+	PRU2ARM_INTERRUPT;
+}
+
 /***
  3 major states executed in circular 1- 2- 3 order.
 
@@ -179,12 +197,17 @@ void main(void) {
 			} else if (granted_request & PRIORITY_ARBITRATION_INTR_MASK) {
 				// convert bit in grant_mask to INTR index
 				uint8_t idx = PRIORITY_ARBITRATION_INTR_BIT2IDX(granted_request);
-				// now transfer INTR vector for interrupt of GRANted level.
-				// vector and ARM context have been setup by ARM before ARM2PRU_INTR already
-				sm_intr_master.vector = mailbox.intr.vector[idx];
-				sm_intr_master.level_index = idx; // to be returned to ARM on complete
+				if (emulate_cpu) {
+					// Emulated CPU can't assert SSYN, so bypass bus-level INTR handshake.
+					deliver_intr_to_emulated_cpu(idx, mailbox.intr.vector[idx]);
+				} else {
+					// now transfer INTR vector for interrupt of GRANted level.
+					// vector and ARM context have been setup by ARM before ARM2PRU_INTR already
+					sm_intr_master.vector = mailbox.intr.vector[idx];
+					sm_intr_master.level_index = idx; // to be returned to ARM on complete
 
-				sm_data_master_state = (statemachine_state_func) &sm_intr_master_start;
+					sm_data_master_state = (statemachine_state_func) &sm_intr_master_start;
+				}
 			}
 		} else {
 			// State 3 "MASTER"
@@ -296,6 +319,7 @@ void main(void) {
 				if (emulate_cpu != mailbox.param) {
 					emulate_cpu = mailbox.param;
 					sm_arb_reset(); // new arbitration algorithms
+					sm_arb.emulate_cpu = emulate_cpu;
 				}
 				mailbox.arm2pru_req = ARM2PRU_NONE; // ACK: done
 				break;
