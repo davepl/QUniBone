@@ -380,6 +380,8 @@ private:
      * rx_enable_deadline_ns: Absolute time when RX delay expires
      * rbdl_pending: RX list needs dispatching (RCLH written)
      * xbdl_pending: TX list needs dispatching (XMTH written)
+     * BUGFIX: TX can stall under load if the guest doesn't rewrite XMTH.
+     * Tracking an active TX ring lets the worker rescan without new register writes.
      * idtmr: System ID timer countdown (sends MOP system ID periodically)
      */
     bool deqna_lock = false;
@@ -387,6 +389,7 @@ private:
     uint64_t rx_enable_deadline_ns = 0;
     bool rbdl_pending = false;
     bool xbdl_pending = false;
+    bool xbdl_active = false;
     uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
 
     /*
