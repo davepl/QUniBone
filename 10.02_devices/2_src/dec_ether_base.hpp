@@ -78,6 +78,18 @@ protected:
     // while we are waiting out the post-INTR DMA holdoff window.
     virtual void service_intr_complete_for_dma_holdoff(void) {}
 
+    inline bool addr_in_ram(uint32_t addr, uint64_t byte_count) const
+    {
+        if (byte_count == 0)
+            return true;
+        if (!qunibus)
+            return false;
+        uint64_t addr64 = addr;
+        uint64_t max = qunibus->addr_space_byte_count;
+        bool ok = !(max == 0 || addr64 >= max || byte_count > max - addr64);
+        return ok;
+    }
+
     inline void note_intr_asserted(void)
     {
         if (intr_dma_holdoff_armed.load(std::memory_order_acquire))
@@ -128,7 +140,7 @@ protected:
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
-        if (max == 0 || addr64 >= max || byte_count > max - addr64) {
+        if (!addr_in_ram(addr, byte_count)) {
             WARNING("%s: dma_read_words bounds check failed: addr=%06o words=%zu max=%llu",
                     name.value.c_str(), addr, wordcount, static_cast<unsigned long long>(max));
             return false;
@@ -144,15 +156,8 @@ protected:
             return true;
         }
 
-        holdoff_dma_if_intr_pending();
-        dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
-        update_intr();
-
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
-
-        dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
-        update_intr();
         return dma_request.success;
     }
 
@@ -163,7 +168,7 @@ protected:
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
-        if (max == 0 || addr64 >= max || byte_count > max - addr64) {
+        if (!addr_in_ram(addr, byte_count)) {
             WARNING("%s: dma_write_words bounds check failed: addr=%06o words=%zu max=%llu",
                     name.value.c_str(), addr, wordcount, static_cast<unsigned long long>(max));
             return false;
@@ -179,16 +184,9 @@ protected:
             return true;
         }
 
-        holdoff_dma_if_intr_pending();
-        dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
-        update_intr();
-
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
                 const_cast<uint16_t *>(buffer), wordcount);
-
-        dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
-        update_intr();
         return dma_request.success;
     }
 
@@ -199,7 +197,7 @@ protected:
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
-        if (max == 0 || addr64 >= max || byte_count > max - addr64) {
+        if (!addr_in_ram(addr, byte_count)) {
             WARNING("%s: desc_read_words bounds check failed: addr=%06o words=%zu max=%llu",
                     name.value.c_str(), addr, wordcount, static_cast<unsigned long long>(max));
             return false;
@@ -215,15 +213,8 @@ protected:
             return true;
         }
 
-        holdoff_dma_if_intr_pending();
-        dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
-        update_intr();
-
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
-
-        dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
-        update_intr();
         return dma_desc_request.success;
     }
 
@@ -234,7 +225,7 @@ protected:
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
-        if (max == 0 || addr64 >= max || byte_count > max - addr64) {
+        if (!addr_in_ram(addr, byte_count)) {
             WARNING("%s: desc_write_words bounds check failed: addr=%06o words=%zu max=%llu",
                     name.value.c_str(), addr, wordcount, static_cast<unsigned long long>(max));
             return false;
@@ -250,16 +241,9 @@ protected:
             return true;
         }
 
-        holdoff_dma_if_intr_pending();
-        dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
-        update_intr();
-
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,
                 const_cast<uint16_t *>(buffer), wordcount);
-
-        dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
-        update_intr();
         return dma_desc_request.success;
     }
 
@@ -267,10 +251,8 @@ protected:
     {
         if (len == 0)
             return true;
-        uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(len);
-        uint64_t max = qunibus->addr_space_byte_count;
-        if (max == 0 || addr64 >= max || byte_count > max - addr64)
+        if (!addr_in_ram(addr, byte_count))
             return false;
 
         if (addr & 1) {
@@ -307,10 +289,8 @@ protected:
     {
         if (len == 0)
             return true;
-        uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(len);
-        uint64_t max = qunibus->addr_space_byte_count;
-        if (max == 0 || addr64 >= max || byte_count > max - addr64)
+        if (!addr_in_ram(addr, byte_count))
             return false;
 
         if (addr & 1) {

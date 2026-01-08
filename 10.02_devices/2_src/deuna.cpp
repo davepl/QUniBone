@@ -54,6 +54,7 @@
 #include <errno.h>
 #include <algorithm>
 #include <vector>
+#include <atomic>
 #include <memory>
 #include <chrono>
 #include <condition_variable>
@@ -83,12 +84,14 @@ static const size_t UNA_MAX_RCV_PACKET = 1600;
  * Queue and timer constants
  */
 static const unsigned UNA_QUE_MAX = 500;
+static const unsigned DEUNA_WARN_LIMIT = 8;
 
 /*
  * Internal memory sizes (word counts)
  */
 static const size_t DEUNA_WCS_WORDS = 8192;
 static const size_t DEUNA_LINK_WORDS = 1024;
+static const unsigned DEUNA_DESC_WORDS = 4;
 
 /*
  * Default DEUNA hardware address (DEC OUI)
@@ -241,7 +244,7 @@ static const uint16_t RXR_MLEN = 0007777;
 /*
  * Version string
  */
-static const char *DEUNA_VERSION = "v002";  // Only poll pcap when STATE_RUNNING
+static const char *DEUNA_VERSION = "v003";  // Only poll pcap when STATE_RUNNING
 
 /*
  * mac_is_zero
@@ -361,8 +364,8 @@ deuna_c::deuna_c() : dec_ether_base_c()
     /* Default MAC in DEC range */
     memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
 
-    read_buffer.msg.reserve(UNA_MAX_RCV_PACKET);
-    write_buffer.msg.reserve(UNA_MAX_RCV_PACKET);
+    read_buffer.msg.resize(ETH_FRAME_SIZE);
+    write_buffer.msg.resize(ETH_FRAME_SIZE);
 
     wcs_mem.assign(DEUNA_WCS_WORDS, 0);
     link_mem.assign(DEUNA_LINK_WORDS, 0);
@@ -504,6 +507,7 @@ bool deuna_c::on_before_install(void)
  */
 void deuna_c::on_after_install(void)
 {
+    INFO("DEUNA: Installed %s", DEUNA_VERSION);
     reset_controller();
 }
 
@@ -869,6 +873,15 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
                 if (needs_dma) {
                     // Queue for worker thread - it will call port_command
                     std::lock_guard<std::mutex> cmdlock(pending_cmd_mutex);
+                    if (pending_cmd != 0 && pending_cmd != cmd) {
+                        static std::atomic<unsigned> pending_cmd_warns{0};
+                        unsigned prev = pending_cmd_warns.fetch_add(1, std::memory_order_relaxed);
+                        if (prev < DEUNA_WARN_LIMIT) {
+                            WARNING("DEUNA: pending_cmd overwrite old=%03o new=%03o", pending_cmd, cmd);
+                        } else if (prev == DEUNA_WARN_LIMIT) {
+                            WARNING("DEUNA: pending_cmd overwrite warnings suppressed");
+                        }
+                    }
                     pending_cmd = cmd;
                     if (trace.value)
                         WARNING("DEUNA: Queued command %03o for worker", cmd);
@@ -890,11 +903,23 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         // read-only
         break;
     case DEUNA_REG_PCSR2:
-        pcsr2 = val & 0177776;  // MBZ LSB
+        if (access == DATO_WORD)
+            pcsr2 = val;
+        else if (access == DATO_BYTEH)
+            pcsr2 = static_cast<uint16_t>((pcsr2 & 0x00ff) | (val & 0xff00));
+        else
+            pcsr2 = static_cast<uint16_t>((pcsr2 & 0xff00) | (val & 0x00ff));
+        pcsr2 &= 0177776;  // MBZ LSB
         update_pcsr_regs();
         break;
     case DEUNA_REG_PCSR3:
-        pcsr3 = val & 0000003;
+        if (access == DATO_WORD)
+            pcsr3 = val;
+        else if (access == DATO_BYTEH)
+            pcsr3 = static_cast<uint16_t>((pcsr3 & 0x00ff) | (val & 0xff00));
+        else
+            pcsr3 = static_cast<uint16_t>((pcsr3 & 0xff00) | (val & 0x00ff));
+        pcsr3 &= 0000003;
         update_pcsr_regs();
         break;
     default:
@@ -940,10 +965,18 @@ void deuna_c::process_pending_command(void)
     }
 
     if (cmd != 0) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        static std::atomic<unsigned> pending_cmd_exec_warns{0};
+        unsigned prev = pending_cmd_exec_warns.fetch_add(1, std::memory_order_relaxed);
+        if (prev < DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: processing queued command %03o state=%03o pcsr0=%06o",
+                    cmd, pcsr1 & PCSR1_STATE, pcsr0);
+        } else if (prev == DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: queued command warnings suppressed");
+        }
         if (trace.value)
             WARNING("DEUNA: Worker processing queued command %03o", cmd);
-        
-        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+
         port_command(cmd);
         
         if (trace.value)
@@ -1024,6 +1057,8 @@ bool deuna_c::process_bootrom(uint32_t dst_addr)
 {
     if (dst_addr == 0 || deuna_bootrom_size == 0)
         return false;
+    if (!addr_in_ram(dst_addr, deuna_bootrom_size))
+        return false;
 
     const size_t chunk_bytes = 512;
     for (size_t offset = 0; offset < deuna_bootrom_size; offset += chunk_bytes) {
@@ -1070,8 +1105,7 @@ bool deuna_c::transfer_internal_memory(uint32_t udbb, bool to_internal)
 
     uint16_t mem_addr = hdr[0];
     uint16_t wordcount = hdr[1];
-    uint32_t host_addr = make_addr(static_cast<uint16_t>(hdr[3] & 0x0003),
-                                   static_cast<uint16_t>(hdr[2] & 0177776));
+    uint32_t host_addr = make_addr(hdr[3], hdr[2] & 0177776);
 
     if (trace.value) {
         WARNING("DEUNA: %s internal mem addr=%06o words=%u host=%08o",
@@ -1080,6 +1114,8 @@ bool deuna_c::transfer_internal_memory(uint32_t udbb, bool to_internal)
     }
 
     if (wordcount == 0 || host_addr == 0)
+        return false;
+    if (!addr_in_ram(host_addr, static_cast<size_t>(wordcount) * 2u))
         return false;
 
     bool link = (mem_addr & 0x8000u) != 0;
@@ -1166,6 +1202,7 @@ uint32_t deuna_c::make_addr(uint16_t hi, uint16_t lo) const
     return (static_cast<uint32_t>(hi & mask) << 16) | lo;
 }
 
+
 /*
  * deuna_c::port_command
  * Purpose: execute PCSR0 port commands from the driver.
@@ -1202,15 +1239,24 @@ void deuna_c::port_command(uint16_t cmd)
         pcsr0 |= PCSR0_DNI;
         break;
     case CMD_GETCMD:
-        if (!execute_command())
+        DEBUG("DEUNA: GETCMD pcbb=%08o", pcbb);
+        if (!execute_command()) {
             pcsr0 |= PCSR0_PCEI;
+            static std::atomic<unsigned> getcmd_warns{0};
+            unsigned prev = getcmd_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: GETCMD failed pcbb=%08o pcsr0=%06o pcsr1=%06o",
+                        pcbb, pcsr0, pcsr1);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: GETCMD failure warnings suppressed");
+            }
+        }
         pcsr0 |= PCSR0_DNI;
         break;
     case CMD_GETPCBB:
         pcbb = (static_cast<uint32_t>(pcsr3) << 16) | pcsr2;
         pcsr0 |= PCSR0_DNI;
-        if (trace.value)
-            WARNING("DEUNA: GETPCBB pcbb=%08o (pcsr2=%06o pcsr3=%06o) pcsr0=%06o", pcbb, pcsr2, pcsr3, pcsr0);
+        DEBUG("DEUNA: GETPCBB pcbb=%08o pcsr2=%06o pcsr3=%06o", pcbb, pcsr2, pcsr3);
         break;
     case CMD_SELFTEST:
         init_internal_memory();
@@ -1221,23 +1267,25 @@ void deuna_c::port_command(uint16_t cmd)
         pcsr1 |= STATE_READY;
         break;
     case CMD_START:
+        DEBUG("DEUNA: START state=%03o tdrb=%08o telen=%u trlen=%u rdrb=%08o relen=%u rrlen=%u",
+              state, tdrb, telen, trlen, rdrb, relen, rrlen);
+        {
+            static std::atomic<unsigned> start_warns{0};
+            unsigned prev = start_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: START state=%03o tdrb=%08o telen=%u trlen=%u rdrb=%08o relen=%u rrlen=%u",
+                        state, tdrb, telen, trlen, rdrb, relen, rrlen);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: START warnings suppressed");
+            }
+        }
         if (state == STATE_READY) {
             pcsr1 &= ~PCSR1_STATE;
             pcsr1 |= STATE_RUNNING;
+            DEBUG("DEUNA: State changed to RUNNING");
             pcsr0 |= PCSR0_DNI;
             rxnext = 0;
             txnext = 0;
-            // For diagnostic compatibility, set OWN on receive descriptors
-            if (rrlen > 0 && relen > 0) {
-                for (unsigned i = 0; i < rrlen; ++i) {
-                    uint32_t desc_addr = rdrb + (relen * 2) * i;
-                    std::vector<uint16_t> desc(relen, 0);
-                    if (desc_read_words(desc_addr, desc.data(), relen)) {
-                        desc[2] |= RXR_OWN;
-                        desc_write_words(desc_addr, desc.data(), relen);
-                    }
-                }
-            }
         } else {
             pcsr0 |= PCSR0_PCEI;
         }
@@ -1265,10 +1313,18 @@ void deuna_c::port_command(uint16_t cmd)
             uint32_t boot_addr = (static_cast<uint32_t>(pcsr3) << 16) | (pcsr2 & 0177776);
             if (trace.value)
                 WARNING("DEUNA: BOOT requested, dest=%08o size=%u", boot_addr, deuna_bootrom_size);
-            if (boot_addr == 0 || !process_bootrom(boot_addr))
+            if (boot_addr == 0 || !process_bootrom(boot_addr)) {
                 pcsr0 |= PCSR0_PCEI;
-            else
+                static std::atomic<unsigned> boot_warns{0};
+                unsigned prev = boot_warns.fetch_add(1, std::memory_order_relaxed);
+                if (prev < DEUNA_WARN_LIMIT) {
+                    WARNING("DEUNA: BOOT failed dest=%08o size=%u", boot_addr, deuna_bootrom_size);
+                } else if (prev == DEUNA_WARN_LIMIT) {
+                    WARNING("DEUNA: BOOT warnings suppressed");
+                }
+            } else {
                 pcsr0 |= PCSR0_DNI;
+            }
         }
         break;
     case CMD_NOOP:
@@ -1295,6 +1351,10 @@ void deuna_c::port_command(uint16_t cmd)
  */
 bool deuna_c::execute_command(void)
 {
+    if (pcbb == 0 || !addr_in_ram(pcbb, 8)) {
+        WARNING("DEUNA: PCBB invalid pcbb=%08o", pcbb);
+        return false;
+    }
     if (!dma_read_words(pcbb, pcb, 4)) {
         WARNING("DEUNA: PCB read failed pcbb=%08o", pcbb);
         return false;
@@ -1311,12 +1371,40 @@ bool deuna_c::execute_command(void)
     }
 
     uint16_t fnc = pcb[0] & 0377;
+    static std::atomic<unsigned> exec_warns{0};
+    unsigned exec_prev = exec_warns.fetch_add(1, std::memory_order_relaxed);
+    if (exec_prev < DEUNA_WARN_LIMIT) {
+        WARNING("DEUNA: execute_command fnc=%03o pcbb=%08o pcb=%06o %06o %06o %06o",
+                fnc, pcbb, pcb[0], pcb[1], pcb[2], pcb[3]);
+    } else if (exec_prev == DEUNA_WARN_LIMIT) {
+        WARNING("DEUNA: execute_command warnings suppressed");
+    }
     uint32_t udbb = 0;
-    auto get_udb_addr = [&](uint32_t &out) -> bool {
-        if ((pcb[1] & 1) || (pcb[2] & 0374))
+    static std::atomic<unsigned> udb_align_warns{0};
+    static std::atomic<unsigned> udb_zero_warns{0};
+    auto get_udb_addr = [&](uint32_t &out, size_t bytes) -> bool {
+        if ((pcb[1] & 1) || (pcb[2] & 0374)) {
+            unsigned prev = udb_align_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: UDB alignment invalid fnc=%03o pcb1=%06o pcb2=%06o bytes=%zu",
+                        fnc, pcb[1], pcb[2], bytes);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: UDB alignment warnings suppressed");
+            }
             return false;
-        out = make_addr(pcb[2] & 0x0003, pcb[1] & 0177776);
-        return true;
+        }
+        out = make_addr(pcb[2], pcb[1] & 0177776);
+        if (out == 0) {
+            unsigned prev = udb_zero_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: UDB addr zero fnc=%03o pcb1=%06o pcb2=%06o bytes=%zu",
+                        fnc, pcb[1], pcb[2], bytes);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: UDB zero warnings suppressed");
+            }
+            return false;
+        }
+        return addr_in_ram(out, bytes);
     };
 
     switch (fnc) {
@@ -1332,7 +1420,7 @@ bool deuna_c::execute_command(void)
         }
         if (!dma_write_bytes(pcbb + 2, mac_addr, 6))
             return false;
-        if (get_udb_addr(udbb) && udbb != pcbb + 2) {
+        if (get_udb_addr(udbb, 6) && udbb != pcbb + 2) {
             if (!dma_write_bytes(udbb, mac_addr, 6))
                 return false;
         }
@@ -1347,7 +1435,7 @@ bool deuna_c::execute_command(void)
         }
         if (!dma_write_bytes(pcbb + 2, setup.macs[0], 6))
             return false;
-        if (get_udb_addr(udbb) && udbb != pcbb + 2) {
+        if (get_udb_addr(udbb, 6) && udbb != pcbb + 2) {
             if (!dma_write_bytes(udbb, setup.macs[0], 6))
                 return false;
         }
@@ -1366,10 +1454,8 @@ bool deuna_c::execute_command(void)
             uint8_t tmp[6] = {0};
             if (!dma_read_bytes(pcbb + 2, tmp, 6))
                 return false;
-            if (trace.value) {
-                WARNING("DEUNA: FC_WPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
-                        tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5]);
-            }
+            DEBUG("DEUNA: FC_WPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                  tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5]);
             if (mac_is_zero(tmp)) {
                 memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
             } else {
@@ -1385,9 +1471,9 @@ bool deuna_c::execute_command(void)
         break;
     case FC_RMAL: {
         int mtlen = (pcb[2] & 0xFF00) >> 8;
-        if (!get_udb_addr(udbb))
-            return false;
         if (mtlen < 0 || mtlen > 10)
+            return false;
+        if (!get_udb_addr(udbb, static_cast<size_t>(mtlen) * 6))
             return false;
         if (!dma_write_bytes(udbb, reinterpret_cast<const uint8_t*>(&setup.macs[2]), mtlen * 6))
             return false;
@@ -1397,8 +1483,9 @@ bool deuna_c::execute_command(void)
         int mtlen = (pcb[2] & 0xFF00) >> 8;
         if (mtlen < 0 || mtlen > 10)
             return false;
-        if (!get_udb_addr(udbb))
+        if (!get_udb_addr(udbb, static_cast<size_t>(mtlen) * 6))
             return false;
+        DEBUG("DEUNA: FC_WMAL mtlen=%d", mtlen);
         for (int i = 2; i < DEUNA_FILTER_MAX; ++i)
             memset(setup.macs[i], 0, 6);
         if (!dma_read_bytes(udbb, reinterpret_cast<uint8_t*>(&setup.macs[2]), mtlen * 6))
@@ -1409,36 +1496,115 @@ bool deuna_c::execute_command(void)
         break;
     }
     case FC_RRF:
-        if ((pcb[1] & 1) || (pcb[2] & 0374))
+        if ((pcb[1] & 1) || (pcb[2] & 0374)) {
+            static std::atomic<unsigned> rrf_warns{0};
+            unsigned prev = rrf_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: FC_RRF alignment invalid pcb1=%06o pcb2=%06o", pcb[1], pcb[2]);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: FC_RRF alignment warnings suppressed");
+            }
             return false;
+        }
         udb[0] = tdrb & 0177776;
         udb[1] = static_cast<uint16_t>((telen << 8) + ((tdrb >> 16) & 3));
         udb[2] = static_cast<uint16_t>(trlen);
         udb[3] = rdrb & 0177776;
         udb[4] = static_cast<uint16_t>((relen << 8) + ((rdrb >> 16) & 3));
         udb[5] = static_cast<uint16_t>(rrlen);
-        if (!get_udb_addr(udbb))
+        if (!get_udb_addr(udbb, 12))
             return false;
         if (!dma_write_words(udbb, udb, 6))
             return false;
         break;
-    case FC_WRF:
-        if ((pcb[1] & 1) || (pcb[2] & 0374))
+    case FC_WRF: {
+        static std::atomic<unsigned> wrf_warns{0};
+        auto warn_wrf = [&](const char *msg) {
+            unsigned prev = wrf_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: FC_WRF %s", msg);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: FC_WRF warnings suppressed");
+            }
+        };
+        auto clear_rings = [&] {
+            tdrb = 0;
+            telen = 0;
+            trlen = 0;
+            rdrb = 0;
+            relen = 0;
+            rrlen = 0;
+            rxnext = 0;
+            txnext = 0;
+        };
+        if ((pcb[1] & 1) || (pcb[2] & 0374)) {
+            warn_wrf("pcb alignment invalid");
+            clear_rings();
             return false;
-        if ((pcsr1 & PCSR1_STATE) == STATE_RUNNING)
+        }
+        if ((pcsr1 & PCSR1_STATE) == STATE_RUNNING) {
+            warn_wrf("requested while running");
+            clear_rings();
             return false;
-        if (!get_udb_addr(udbb))
+        }
+        if (!get_udb_addr(udbb, 12)) {
+            warn_wrf("udb addr invalid");
+            clear_rings();
             return false;
-        if (!dma_read_words(udbb, udb, 6))
+        }
+        if (!dma_read_words(udbb, udb, 6)) {
+            warn_wrf("udb read failed");
+            clear_rings();
             return false;
-        if ((udb[0] & 1) || (udb[1] & 0374) || (udb[3] & 1) || (udb[4] & 0374) || (udb[5] < 2))
+        }
+        if ((udb[0] & 1) || (udb[1] & 0374) || (udb[3] & 1) || (udb[4] & 0374) || (udb[5] < 2)) {
+            warn_wrf("udb format invalid");
+            clear_rings();
             return false;
-        tdrb = ((udb[1] & 3) << 16) + (udb[0] & 0177776);
-        telen = (udb[1] >> 8) & 0377;
-        trlen = udb[2];
-        rdrb = ((udb[4] & 3) << 16) + (udb[3] & 0177776);
-        relen = (udb[4] >> 8) & 0377;
-        rrlen = udb[5];
+        }
+        uint32_t new_tdrb = ((udb[1] & 3) << 16) + (udb[0] & 0177776);
+        uint32_t new_telen = (udb[1] >> 8) & 0377;
+        uint32_t new_trlen = udb[2];
+        uint32_t new_rdrb = ((udb[4] & 3) << 16) + (udb[3] & 0177776);
+        uint32_t new_relen = (udb[4] >> 8) & 0377;
+        uint32_t new_rrlen = udb[5];
+        DEBUG("DEUNA: FC_WRF tdrb=%08o telen=%u trlen=%u rdrb=%08o relen=%u rrlen=%u",
+              new_tdrb, new_telen, new_trlen, new_rdrb, new_relen, new_rrlen);
+        if (new_telen != DEUNA_DESC_WORDS || new_relen != DEUNA_DESC_WORDS) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "desc words mismatch telen=%u relen=%u", new_telen, new_relen);
+            warn_wrf(msg);
+            clear_rings();
+            return false;
+        }
+        auto ring_fits = [&](uint32_t base, uint32_t entry_words, uint32_t count) -> bool {
+            if (entry_words == 0 || count == 0)
+                return false;
+            uint64_t bytes = static_cast<uint64_t>(entry_words) * 2u * count;
+            uint64_t max = qunibus ? qunibus->addr_space_byte_count : 0;
+            if (max == 0 || base >= max || bytes > max - base)
+                return false;
+            if (qunibus && qunibus->iopage_start_addr &&
+                base + bytes > qunibus->iopage_start_addr)
+                return false;
+            return true;
+        };
+        if (!ring_fits(new_tdrb, new_telen, new_trlen) ||
+            !ring_fits(new_rdrb, new_relen, new_rrlen)) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "ring size invalid tdrb=%08o telen=%u trlen=%u rdrb=%08o relen=%u rrlen=%u",
+                     new_tdrb, new_telen, new_trlen, new_rdrb, new_relen, new_rrlen);
+            warn_wrf(msg);
+            clear_rings();
+            return false;
+        }
+        tdrb = new_tdrb;
+        telen = new_telen;
+        trlen = new_trlen;
+        rdrb = new_rdrb;
+        relen = new_relen;
+        rrlen = new_rrlen;
         rxnext = 0;
         txnext = 0;
         if (trace.value) {
@@ -1446,6 +1612,7 @@ bool deuna_c::execute_command(void)
             WARNING("DEUNA: FC_WRF rx rdrb=%08o relen=%u rrlen=%u", rdrb, relen, rrlen);
         }
         break;
+    }
     case FC_RDCTR:
     case FC_RDCLCTR: {
         memset(udb, 0, sizeof(udb));
@@ -1483,7 +1650,7 @@ bool deuna_c::execute_command(void)
         udb[31] = 0;
         udb[32] = stats.porterr;
         udb[33] = stats.bablcnt;
-        if (!get_udb_addr(udbb))
+        if (!get_udb_addr(udbb, 68u * 2u))
             return false;
         if (!dma_write_words(udbb, udb, 68))
             return false;
@@ -1539,18 +1706,35 @@ bool deuna_c::execute_command(void)
         udb[24] = mac_w[2];
         udb[25] = 0x64;
         udb[26] = static_cast<uint16_t>((11 << 8) + 1);
-        if (!get_udb_addr(udbb))
+        if (!get_udb_addr(udbb, 52u * 2u))
             return false;
         if (!dma_write_words(udbb, udb, 52))
             return false;
         break;
     }
     case FC_WSID: {
+        static std::atomic<unsigned> wsid_warns{0};
         uint16_t pltlen = pcb[3];
-        if (!get_udb_addr(udbb))
+        if (pltlen == 0) {
+            unsigned prev = wsid_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: FC_WSID invalid length pltlen=0");
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: FC_WSID length warnings suppressed");
+            }
             return false;
-        if (pltlen > DEUNA_UDB_WORDS)
+        }
+        if (!get_udb_addr(udbb, static_cast<size_t>(pltlen) * 2u))
             return false;
+        if (pltlen > DEUNA_UDB_WORDS) {
+            unsigned prev = wsid_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: FC_WSID length too large pltlen=%u", pltlen);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: FC_WSID length warnings suppressed");
+            }
+            return false;
+        }
         if (!dma_read_words(udbb, udb, pltlen))
             return false;
         break;
@@ -1567,7 +1751,7 @@ bool deuna_c::execute_command(void)
             return false;
         break;
     case FC_LSM:
-        if (get_udb_addr(udbb)) {
+        if (get_udb_addr(udbb, 8)) {
             if (!load_system_microcode(udbb))
                 return false;
         } else {
@@ -1576,18 +1760,27 @@ bool deuna_c::execute_command(void)
         }
         break;
     case FC_DIM:
-        if (!get_udb_addr(udbb))
+        if (!get_udb_addr(udbb, 8))
             return false;
         if (!transfer_internal_memory(udbb, false))
             return false;
         break;
     case FC_LIM:
-        if (!get_udb_addr(udbb))
+        if (!get_udb_addr(udbb, 8))
             return false;
         if (!transfer_internal_memory(udbb, true))
             return false;
         break;
     default:
+        {
+            static std::atomic<unsigned> fnc_warns{0};
+            unsigned prev = fnc_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: unsupported function code fnc=%03o pcbb=%08o", fnc, pcbb);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: unsupported fnc warnings suppressed");
+            }
+        }
         return false;
     }
 
@@ -1615,12 +1808,11 @@ void deuna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
         queue_item item;
         item.loopback = loopback;
         item.packet.msg.assign(data, data + len);
-        if (item.packet.msg.size() < ETH_MIN_PACKET)
-            item.packet.msg.resize(ETH_MIN_PACKET, 0);
         item.packet.len = item.packet.msg.size();
-        item.packet.crc_len = std::min(item.packet.len + 4, ETH_FRAME_SIZE);
-        if (item.packet.msg.size() < item.packet.crc_len)
-            item.packet.msg.resize(item.packet.crc_len, 0);
+        item.packet.used = 0;
+        item.packet.crc_len = item.packet.len;
+
+        DEBUG("DEUNA: Enqueue RX len=%zu loopback=%d queue=%zu", len, loopback, read_queue.size() + 1);
         read_queue.push_back(item);
 
         if (read_queue.size() > UNA_QUE_MAX) {
@@ -1689,6 +1881,8 @@ void deuna_c::update_pcap_filter(void)
 #ifdef HAVE_PCAP
     if (!pcap.is_open())
         return;
+
+    DEBUG("DEUNA: Updating pcap filter, setup.valid=%d mac_count=%d", setup.valid, setup.mac_count);
 
     // Build a filter to exclude packets from our own source MAC.
     // libpcap can deliver outgoing packets back to us; we want to reject them.
@@ -1760,15 +1954,34 @@ bool deuna_c::process_receive(void)
     if ((pcsr1 & PCSR1_STATE) != STATE_RUNNING)
         return false;
 
+    DEBUG("DEUNA: Process RX start");
+
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
         if (read_queue.empty())
             return false;
     }
 
-    if (rrlen == 0 || relen == 0)
+    if (rrlen == 0 || relen == 0) {
+        static std::atomic<unsigned> rx_ring_warns{0};
+        unsigned prev = rx_ring_warns.fetch_add(1, std::memory_order_relaxed);
+        if (prev < DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: RX ring not configured rrlen=%u relen=%u state=%03o",
+                    rrlen, relen, pcsr1 & PCSR1_STATE);
+        } else if (prev == DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: RX ring not configured warnings suppressed");
+        }
         return false;
-    if (relen < 4) {
+    }
+    if (relen != DEUNA_DESC_WORDS) {
+        // Guard against corrupted descriptor length to avoid overrunning the ring.
+        static std::atomic<unsigned> rx_relen_warns{0};
+        unsigned prev = rx_relen_warns.fetch_add(1, std::memory_order_relaxed);
+        if (prev < DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: RX desc words invalid relen=%u rrlen=%u", relen, rrlen);
+        } else if (prev == DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: RX desc words warnings suppressed");
+        }
         stat |= STAT_ERRS | STAT_RRNG;
         pcsr0 |= PCSR0_SERI;
         return false;
@@ -1789,6 +2002,14 @@ bool deuna_c::process_receive(void)
         uint32_t desc_addr = rdrb + (relen * 2) * rxnext;
         std::vector<uint16_t> desc(relen, 0);
         if (!desc_read_words(desc_addr, desc.data(), relen)) {
+            static std::atomic<unsigned> rx_desc_read_warns{0};
+            unsigned prev = rx_desc_read_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: RX desc read failed addr=%08o idx=%u relen=%u",
+                        desc_addr, rxnext, relen);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: RX desc read warnings suppressed");
+            }
             stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_RRNG;
             pcsr0 |= PCSR0_SERI;
             break;
@@ -1812,7 +2033,10 @@ bool deuna_c::process_receive(void)
         }
 
         uint16_t slen = rxhdr[0];
-        uint32_t segb = make_addr(rxhdr[2] & 0x0003, rxhdr[1]);
+        uint32_t segb = make_addr(rxhdr[2], rxhdr[1]);
+
+        DEBUG("DEUNA: RX deliver len=%zu to addr=%08o blen=%u desc=%08o",
+              current_item->packet.len, segb, slen, desc_addr);
 
         rxhdr[2] &= static_cast<uint16_t>(~(RXR_FRAM | RXR_OFLO | RXR_CRC | RXR_STF | RXR_ENF | RXR_ERRS));
         rxhdr[3] &= static_cast<uint16_t>(~(RXR_BUFL | RXR_UBTO | RXR_NCHN | RXR_OVRN | RXR_MLEN));
@@ -1820,11 +2044,17 @@ bool deuna_c::process_receive(void)
         if (current_item->packet.used == 0)
             rxhdr[2] |= RXR_STF;
 
-        size_t remaining = current_item->packet.crc_len - current_item->packet.used;
+        if (current_item->packet.used == 0 && current_item->packet.len < ETH_MIN_PACKET) {
+            current_item->packet.msg.resize(ETH_MIN_PACKET, 0);
+            current_item->packet.len = ETH_MIN_PACKET;
+        }
+
+        size_t remaining = current_item->packet.len - current_item->packet.used;
         size_t wlen = std::min(static_cast<size_t>(slen), remaining);
 
         if (wlen > 0) {
-            if (!dma_write_bytes(segb, &current_item->packet.msg[current_item->packet.used], wlen)) {
+            if (!addr_in_ram(segb, wlen) ||
+                !dma_write_bytes(segb, &current_item->packet.msg[current_item->packet.used], wlen)) {
                 stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_RRNG;
                 pcsr0 |= PCSR0_SERI;
                 break;
@@ -1833,7 +2063,7 @@ bool deuna_c::process_receive(void)
 
         current_item->packet.used += wlen;
 
-        bool end_of_frame = (current_item->packet.used >= current_item->packet.crc_len) || (mode & MODE_DRDC);
+        bool end_of_frame = (current_item->packet.used >= current_item->packet.len) || (mode & MODE_DRDC);
         if (end_of_frame) {
             rxhdr[2] |= RXR_ENF;
 
@@ -1843,8 +2073,8 @@ bool deuna_c::process_receive(void)
             }
 
             // Set message length in word 3
-            rxhdr[3] |= static_cast<uint16_t>(current_item->packet.crc_len & RXR_MLEN);
-            if ((mode & MODE_DRDC) && current_item->packet.used < current_item->packet.crc_len) {
+            rxhdr[3] |= static_cast<uint16_t>(current_item->packet.len & RXR_MLEN);
+            if ((mode & MODE_DRDC) && current_item->packet.used < current_item->packet.len) {
                 rxhdr[3] |= RXR_NCHN;
                 rxhdr[2] |= RXR_ERRS;
                 stats.frecve++;
@@ -1870,6 +2100,14 @@ bool deuna_c::process_receive(void)
         desc[2] = rxhdr[2];
         desc[3] = rxhdr[3];
         if (!desc_write_words(desc_addr, desc.data(), relen)) {
+            static std::atomic<unsigned> rx_desc_write_warns{0};
+            unsigned prev = rx_desc_write_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: RX desc write failed addr=%08o idx=%u relen=%u",
+                        desc_addr, rxnext, relen);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: RX desc write warnings suppressed");
+            }
             pcsr0 |= PCSR0_PCEI;
             break;
         }
@@ -1916,9 +2154,26 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
     if ((pcsr1 & PCSR1_STATE) != STATE_RUNNING)
         return false;
 
-    if (trlen == 0 || telen == 0)
+    if (trlen == 0 || telen == 0) {
+        static std::atomic<unsigned> tx_ring_warns{0};
+        unsigned prev = tx_ring_warns.fetch_add(1, std::memory_order_relaxed);
+        if (prev < DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: TX ring not configured trlen=%u telen=%u state=%03o",
+                    trlen, telen, pcsr1 & PCSR1_STATE);
+        } else if (prev == DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: TX ring not configured warnings suppressed");
+        }
         return false;
-    if (telen < 4) {
+    }
+    if (telen != DEUNA_DESC_WORDS) {
+        // Guard against corrupted descriptor length to avoid overrunning the ring.
+        static std::atomic<unsigned> tx_telen_warns{0};
+        unsigned prev = tx_telen_warns.fetch_add(1, std::memory_order_relaxed);
+        if (prev < DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: TX desc words invalid telen=%u trlen=%u", telen, trlen);
+        } else if (prev == DEUNA_WARN_LIMIT) {
+            WARNING("DEUNA: TX desc words warnings suppressed");
+        }
         stat |= STAT_ERRS | STAT_TRNG;
         pcsr0 |= PCSR0_SERI;
         return false;
@@ -1957,6 +2212,14 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         uint32_t desc_addr = tdrb + (telen * 2) * txnext;
         std::vector<uint16_t> desc(telen, 0);
         if (!desc_read_words(desc_addr, desc.data(), telen)) {
+            static std::atomic<unsigned> tx_desc_read_warns{0};
+            unsigned prev = tx_desc_read_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: TX desc read failed addr=%08o idx=%u telen=%u",
+                        desc_addr, txnext, telen);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: TX desc read warnings suppressed");
+            }
             stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_TRNG;
             pcsr0 |= PCSR0_SERI;
             break;
@@ -1996,7 +2259,7 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         }
 
         uint16_t slen = txhdr[0];
-        uint32_t segb = make_addr(txhdr[2] & 0x0003, txhdr[1]);
+        uint32_t segb = make_addr(txhdr[2], txhdr[1]);
         size_t wlen = slen;
 
         txhdr[2] &= static_cast<uint16_t>(~(TXR_ERRS | TXR_MTCH | TXR_MORE | TXR_ONE | TXR_DEF));
@@ -2019,7 +2282,8 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         }
 
         if (wlen > 0) {
-            if (!dma_read_bytes(segb, write_buffer.msg.data() + write_buffer.len, wlen)) {
+            if (!addr_in_ram(segb, wlen) ||
+                !dma_read_bytes(segb, write_buffer.msg.data() + write_buffer.len, wlen)) {
                 stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_TRNG;
                 pcsr0 |= PCSR0_SERI;
                 break;
@@ -2099,6 +2363,14 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         desc[2] = txhdr[2];
         desc[3] = txhdr[3];
         if (!desc_write_words(desc_addr, desc.data(), telen)) {
+            static std::atomic<unsigned> tx_desc_write_warns{0};
+            unsigned prev = tx_desc_write_warns.fetch_add(1, std::memory_order_relaxed);
+            if (prev < DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: TX desc write failed addr=%08o idx=%u telen=%u",
+                        desc_addr, txnext, telen);
+            } else if (prev == DEUNA_WARN_LIMIT) {
+                WARNING("DEUNA: TX desc write warnings suppressed");
+            }
             pcsr0 |= PCSR0_PCEI;
             stats.ftransa++;
             break;
@@ -2224,6 +2496,7 @@ void deuna_c::worker_rx(void)
                 continue;
             }
             if (len > 0) {
+                DEBUG("DEUNA: RX polled len=%zu", len);
                 bool should_accept = false;
                 {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
