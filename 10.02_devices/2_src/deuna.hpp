@@ -23,7 +23,9 @@
 #include <condition_variable>
 #include <atomic>
 
-#include "dec_ether_base.hpp"
+#include "qunibusdevice.hpp"
+#include "priorityrequest.hpp"
+#include "pcap_bridge.hpp"
 #include "parameter.hpp"
 
 /*
@@ -43,7 +45,7 @@
 #define DEUNA_REG_PCSR2 2
 #define DEUNA_REG_PCSR3 3
 
-class deuna_c : public dec_ether_base_c {
+class deuna_c : public qunibusdevice_c {
 public:
     deuna_c();
     ~deuna_c() override;
@@ -95,6 +97,23 @@ public:
     void worker(unsigned instance) override;
 
 private:
+    /*
+     * Bus requests for interrupts and DMA
+     */
+    intr_request_c intr_request{this};
+    dma_request_c dma_request{this};
+    dma_request_c dma_desc_request{this};
+
+    /*
+     * Network bridge
+     */
+    PcapBridge pcap;
+
+    /*
+     * DMA synchronization
+     */
+    std::recursive_mutex dma_mutex;
+
     /*
      * Device Registers
      */
@@ -238,11 +257,7 @@ private:
      */
     void update_pcsr_regs(void);
     void update_transceiver_bits(void);
-    void update_intr(void) override;
-    uint64_t intr_dma_holdoff_us_value(void) const override
-    {
-        return static_cast<uint64_t>(intr_dma_holdoff_us.value);
-    }
+    void update_intr(void);
 
     /*
      * Register write handling
@@ -252,7 +267,15 @@ private:
     void apply_pending_reg_writes(void);
     void process_pending_command(void);
 
-    // DMA operations are inherited from dec_ether_base_c.
+    /*
+     * DMA operations
+     */
+    bool dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
+    bool dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
+    bool desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
+    bool desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
+    bool dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len);
+    bool dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len);
     bool cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
     bool cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len);
     bool process_bootrom(uint32_t dst_addr);

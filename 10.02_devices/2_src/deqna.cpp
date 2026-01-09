@@ -1,7 +1,7 @@
 /*
  * DEQNA Ethernet Controller Emulation for QUniBone
  * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
- * Contributed under the GPL2 License
+ * Contributed under the BSD License
  *
  * This is a scratch implementation based on:
  *   - DEC DEQNA hardware documentation
@@ -9,7 +9,7 @@
  *   - Q-bus specification
  *   - Reading the OpenSIMH code when mine didn't work to see what it did
  *
- * This file is part of the QUniBone project, licensed under GPLv2.
+ * This file is part of the QUniBone project, licensed under the BSD License.
  *
  *   May be based in part on the DEQNA implementation in the OpenSIMH project:
  * 
