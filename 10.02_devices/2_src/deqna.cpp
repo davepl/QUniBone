@@ -179,7 +179,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v044";  // TX V=0 indefinite defer
+static const char *DEQNA_VERSION = "v048";  // sw_reset preserves vector, quiets interrupts
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -765,6 +765,14 @@ void deqna_c::start_rx_delay(void)
  */
 void deqna_c::update_intr(void)
 {
+    if (reset_in_progress.load(std::memory_order_acquire)) {
+        if (irq && qunibusadapter)
+            qunibusadapter->cancel_INTR(intr_request);
+        intr_request.edge_detect_reset();
+        irq = false;
+        return;
+    }
+
     // Assert interrupt based purely on irq state. Previous versions gated this
     // on dma_in_progress==0 to work around PRU arbitration issues, but that
     // caused TX completion interrupts to be blocked during RX floods, leading
@@ -828,14 +836,24 @@ void deqna_c::update_intr(void)
 
 void deqna_c::process_deferred_interrupts(void)
 {
-    if (dma_in_progress.load(std::memory_order_acquire) != 0)
+    if (reset_in_progress.load(std::memory_order_acquire)) {
+        deferred_set_int.store(false, std::memory_order_release);
+        deferred_clr_int.store(false, std::memory_order_release);
         return;
+    }
 
-    // Process clr_int first to avoid unnecessary interrupt assertions
+    // Process clr_int first to avoid unnecessary interrupt assertions.
+    // Deassert is safe even during DMA; IE should gate the bus interrupt.
     if (deferred_clr_int.exchange(false, std::memory_order_acq_rel)) {
-        if (!(csr & QNA_CSR_XIRI) && irq)
+        if (irq && (!(csr & QNA_CSR_IE) || !(csr & QNA_CSR_XIRI)))
             clr_int();
     }
+
+    if (timeout_c::abstime_ns() < intr_quiet_until_ns)
+        return;
+
+    if (dma_in_progress.load(std::memory_order_acquire) != 0)
+        return;
     if (deferred_set_int.exchange(false, std::memory_order_acq_rel)) {
         if ((csr & QNA_CSR_IE) && (csr & QNA_CSR_XIRI) && !irq)
             set_int();
@@ -946,6 +964,7 @@ void deqna_c::reset_controller(void)
     rbdl_wrap_guard = false;
     irq = false;
     intr_pending_since_ns = 0;
+    intr_quiet_until_ns = timeout_c::abstime_ns() + 100000000ull;
     if (qunibusadapter)
         qunibusadapter->cancel_INTR(intr_request);
     intr_request.edge_detect_reset();
@@ -967,12 +986,19 @@ void deqna_c::reset_controller(void)
     setup.multicast = false;
 
     rbdl_pending = false;
+    rbdl_hi_written = false;
     tx_state = tx_state_enum::idle;
     tx_kick = false;
+    xbdl_hi_written = false;
     tx_wait_ba = 0;
     tx_wait_until_ns = 0;
     tx_v0_retries = 0;
     tx_invalid_dumped = false;
+    pending_reg_mask.store(0, std::memory_order_release);
+    for (int i = 0; i < 8; ++i) {
+        pending_reg_byteflags[i].store(0, std::memory_order_relaxed);
+        pending_reg_value[i].store(0, std::memory_order_relaxed);
+    }
 
     // Clear deferred interrupt state
     deferred_set_int.store(false, std::memory_order_release);
@@ -1028,8 +1054,6 @@ void deqna_c::sw_reset(void)
     }
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex);
 
-    const uint16_t set_bits = QNA_CSR_XL | QNA_CSR_RL;
-
     if (trace.value) {
         uint16_t csr_snapshot = 0;
         {
@@ -1042,9 +1066,9 @@ void deqna_c::sw_reset(void)
     // Clear pending dispatch flags BEFORE modifying CSR
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        rbdl_pending = false;
+        rbdl_pending = (rbdl[0] || rbdl[1]);
         tx_state = tx_state_enum::idle;
-        tx_kick = false;
+        tx_kick = (xbdl[0] || xbdl[1]);
         tx_wait_ba = 0;
         tx_wait_until_ns = 0;
         tx_v0_retries = 0;
@@ -1055,20 +1079,34 @@ void deqna_c::sw_reset(void)
         write_buffer.used = 0;
         irq = false;
         intr_pending_since_ns = 0;
+        intr_quiet_until_ns = timeout_c::abstime_ns() + 100000000ull;
     }
 
-    csr_set_clr(set_bits, static_cast<uint16_t>(~set_bits));
+    // Reset CSR to lists invalid; update transceiver state afterward.
+    csr = static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_RL);
 
-    if (pcap.is_open())
-        csr_set_clr(QNA_CSR_OK, 0);
+    update_mac_checksum();
+    update_transceiver_bits();
+    update_station_regs();
+    update_vector_reg();
+    update_csr_reg();
 
     // Cancel any pending interrupt request at the bus level
     if (qunibusadapter)
         qunibusadapter->cancel_INTR(intr_request);
     intr_request.edge_detect_reset();
+    // Preserve the vector programmed in VAR register
+    intr_request.set_vector(var & QNA_VEC_IV);
 
     // Reset dma_in_progress counter to known state (used by DMA helper functions)
     dma_in_progress.store(0, std::memory_order_release);
+
+    // Clear any pending register writes captured during reset.
+    pending_reg_mask.store(0, std::memory_order_release);
+    for (int i = 0; i < 8; ++i) {
+        pending_reg_byteflags[i].store(0, std::memory_order_relaxed);
+        pending_reg_value[i].store(0, std::memory_order_relaxed);
+    }
 
     // Clear deferred interrupt state
     deferred_set_int.store(false, std::memory_order_release);
@@ -1091,8 +1129,10 @@ void deqna_c::sw_reset(void)
     last_rbdl_start = 0;
     rbdl_wrap_guard = false;
 
+    setup.valid = false;
     setup.multicast = false;
     setup.promiscuous = false;
+    sanity.timer = sanity.max;
     timers_last_service_ns = timeout_c::abstime_ns();
 
     update_pcap_filter();
@@ -1269,11 +1309,41 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         return;
     }
     if (device_reg->index < 8) {
-        pending_reg_value[device_reg->index].store(val, std::memory_order_relaxed);
-        pending_reg_access[device_reg->index].store(static_cast<uint8_t>(access),
-                std::memory_order_relaxed);
-        pending_reg_mask.fetch_or(static_cast<uint16_t>(1u << device_reg->index),
-                std::memory_order_release);
+        const uint16_t byte_mask =
+            (access == DATO_WORD) ? 0xffff :
+            (access == DATO_BYTEH) ? 0xff00 :
+            0x00ff;
+        const uint16_t reg_bit = static_cast<uint16_t>(1u << device_reg->index);
+        uint16_t merged = val;
+
+        if (pending_reg_mask.load(std::memory_order_acquire) & reg_bit) {
+            const uint16_t base = pending_reg_value[device_reg->index].load(std::memory_order_relaxed);
+            merged = static_cast<uint16_t>((base & ~byte_mask) | (val & byte_mask));
+        } else if (device_reg->index >= DEQNA_REG_RCVLIST_LO &&
+                   device_reg->index <= DEQNA_REG_XMTLIST_HI) {
+            uint16_t base = 0;
+            {
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                if (device_reg->index == DEQNA_REG_RCVLIST_LO)
+                    base = rbdl[0];
+                else if (device_reg->index == DEQNA_REG_RCVLIST_HI)
+                    base = rbdl[1];
+                else if (device_reg->index == DEQNA_REG_XMTLIST_LO)
+                    base = xbdl[0];
+                else if (device_reg->index == DEQNA_REG_XMTLIST_HI)
+                    base = xbdl[1];
+            }
+            merged = static_cast<uint16_t>((base & ~byte_mask) | (val & byte_mask));
+        }
+
+        pending_reg_value[device_reg->index].store(merged, std::memory_order_relaxed);
+        uint8_t flag = 0x01;
+        if (access == DATO_WORD)
+            flag = 0x03;
+        else if (access == DATO_BYTEH)
+            flag = 0x02;
+        pending_reg_byteflags[device_reg->index].fetch_or(flag, std::memory_order_relaxed);
+        pending_reg_mask.fetch_or(reg_bit, std::memory_order_release);
     }
 }
 
@@ -1305,7 +1375,8 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
     case DEQNA_REG_RCVLIST_HI:
         rbdl[1] = static_cast<uint16_t>((rbdl[1] & ~byte_mask) | (val & byte_mask));
         if (access != DATO_BYTEL)
-            rbdl_pending = true;
+            rbdl_hi_written = true;
+        rbdl_pending = true;
         if (trace.value)
             DEBUG("DEQNA: RX list update pending (RCLH=%06o RCLL=%06o csr=%06o)", rbdl[1], rbdl[0], csr);
         break;
@@ -1315,7 +1386,8 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
     case DEQNA_REG_XMTLIST_HI:
         xbdl[1] = static_cast<uint16_t>((xbdl[1] & ~byte_mask) | (val & byte_mask));
         if (access != DATO_BYTEL)
-            tx_kick = true;
+            xbdl_hi_written = true;
+        tx_kick = true;
         tx_v0_retries = 0;
         tx_wait_until_ns = 0;
         tx_invalid_dumped = false;
@@ -1356,13 +1428,14 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         // OpenSIMH-compatible: reset controller when SR transitions to cleared.
         // Only applies if the SR bit is actually being written (low byte or full word).
         if ((byte_mask & QNA_CSR_SR) && (prev & QNA_CSR_SR) && !(data_masked & QNA_CSR_SR)) {
-            // Log SW reset - this is "qerestart" from the BSD driver
-            WARNING("DEQNA: SW reset by driver (qerestart): prev_csr=%06o RI=%d XI=%d RL=%d XL=%d",
+            WARNING("DEQNA: SW reset by driver (qerestart): prev_csr=%06o RI=%d XI=%d RL=%d XL=%d irq=%d vec=%03o",
                     prev,
                     (prev & QNA_CSR_RI) ? 1 : 0,
                     (prev & QNA_CSR_XI) ? 1 : 0,
                     (prev & QNA_CSR_RL) ? 1 : 0,
-                    (prev & QNA_CSR_XL) ? 1 : 0);
+                    (prev & QNA_CSR_XL) ? 1 : 0,
+                    irq ? 1 : 0,
+                    var & QNA_VEC_IV);
             sw_reset();
             return;
         }
@@ -1412,8 +1485,13 @@ void deqna_c::apply_pending_reg_writes(void)
     for (uint8_t idx = 0; idx < 8; ++idx) {
         if (mask & static_cast<uint16_t>(1u << idx)) {
             uint16_t val = pending_reg_value[idx].load(std::memory_order_relaxed);
-            uint8_t access_raw = pending_reg_access[idx].load(std::memory_order_relaxed);
-            DATO_ACCESS access = (access_raw <= DATO_BYTEL) ? static_cast<DATO_ACCESS>(access_raw) : DATO_WORD;
+            uint8_t flags = pending_reg_byteflags[idx].exchange(0, std::memory_order_relaxed);
+            DATO_ACCESS access = DATO_BYTEL;
+            if (flags & 0x02) {
+                access = (flags & 0x01) ? DATO_WORD : DATO_BYTEH;
+            } else if (!(flags & 0x01)) {
+                access = DATO_WORD;
+            }
             handle_register_write(idx, val, access);
         }
     }

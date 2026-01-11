@@ -236,11 +236,11 @@ private:
      * PRU waits for bus grant while the CPU polls CSR waiting for completion.
      *
      * pending_reg_mask: Bitmask of registers with pending writes (bit N = reg N)
-     * pending_reg_access[]: DATO access type for the pending write
-     * pending_reg_value[]: Written values for each register
+     * pending_reg_byteflags[]: Which bytes were written (bit0=low, bit1=high)
+     * pending_reg_value[]: Written values for each register (byte writes merged)
      */
     std::atomic<uint16_t> pending_reg_mask{0};
-    std::atomic<uint8_t> pending_reg_access[8];
+    std::atomic<uint8_t> pending_reg_byteflags[8];
     std::atomic<uint16_t> pending_reg_value[8];
 
     /*
@@ -395,14 +395,17 @@ private:
     bool rx_delay_active = false;
     uint64_t rx_enable_deadline_ns = 0;
     bool rbdl_pending = false;
+    bool rbdl_hi_written = false;
     tx_state_enum tx_state = tx_state_enum::idle;
     bool tx_kick = false;
+    bool xbdl_hi_written = false;
     uint32_t tx_wait_ba = 0;
     uint64_t tx_wait_until_ns = 0;
     unsigned tx_v0_retries = 0;
     bool tx_invalid_dumped = false;
     uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
     uint64_t intr_pending_since_ns = 0; // Interrupt pending timestamp for IACK quiesce
+    uint64_t intr_quiet_until_ns = 0; // Suppress interrupts briefly after reset
 
     /*
      * Deferred interrupt signaling
