@@ -30,13 +30,12 @@
  *
  * THREADING MODEL:
  * ----------------
- * Two worker threads handle RX and TX independently:
- *   - Instance 0 (worker_rx): Polls pcap for incoming packets, processes RX ring
- *   - Instance 1 (worker_tx): Processes TX ring when software writes XMTH
- *
- * Register writes from the PDP-11 are captured atomically and processed by
- * the appropriate worker thread to avoid DMA deadlocks (the PRU can grant
- * the bus to DMA while holding a register access pending).
+ * Single deterministic state-machine worker:
+ *   - One worker thread handles RX and TX in a fixed sequence each loop.
+ *   - Register writes from the PDP-11 are captured atomically and applied in
+ *     the worker loop to avoid DMA/IACK deadlocks.
+ *   - RX capture, RX ring processing, and TX ring processing are interleaved
+ *     deterministically to keep the driver serviced.
  *
  * LOOPBACK MODE:
  * --------------
@@ -82,13 +81,13 @@
  *  │  └─────────────────────────────────────────────────────────┘   │
  *  └────────────────────────────────────────────────────────────────┘
  * 
- *  The read_qyeye is a staging buffer that allows packets to come in
- *  faster than the PDP-11 can process them. The RX worker thread
+ *  The read_queue is a staging buffer that allows packets to come in
+ *  faster than the PDP-11 can process them. The state-machine loop
  *  dequeues packets from read_queue and DMA's them into the RX descriptor
  *  ring in PDP-11 memory.
  * 
- *  The TX worker thread processes the TX descriptor ring and sends
- *  packets out via pcap.
+ *  The same loop processes the TX descriptor ring and sends packets out
+ *  via pcap.
  * 
  */
 
@@ -174,7 +173,7 @@ public:
      * on_power_changed: Handle DCLO (power fail) - reset on power restore
      * on_init_changed: Handle BINIT signal - reset controller
      * on_after_register_access: Process PDP-11 register writes
-     * worker: Entry point for worker threads (instance 0=RX, 1=TX)
+     * worker: Entry point for the single state-machine worker loop
      */
     bool on_param_changed(parameter_c *param) override;
     bool on_before_install(void) override;
@@ -188,6 +187,9 @@ public:
             DATO_ACCESS access) override;
 
     void worker(unsigned instance) override;
+    void on_dma_quiet(void) override;
+    void service_intr_complete_for_dma_holdoff(void) override;
+    bool block_dma_while_intr_asserted(void) const override;
 
 private:
     /*
@@ -218,9 +220,8 @@ private:
      * dma_mutex: Serializes DMA operations (only one DMA at a time)
      * queue_mutex: Serializes queue access from PCAP callbacks
      * descriptor_process_mutex: Serializes process_rbdl() and process_xbdl() to
-     *                           prevent concurrent DMA from RX and TX threads.
-     *                           This ensures deferred interrupts only fire when
-     *                           ALL descriptor processing is complete.
+     *                           avoid re-entrancy and keep deferred interrupts
+     *                           aligned with completed descriptor work.
      */
     std::recursive_mutex state_mutex;
     std::mutex queue_mutex;  // Serialize queue access from PCAP callbacks
@@ -231,13 +232,15 @@ private:
      * Pending register writes from PDP-11
      * -----------------------------------
      * Register writes are captured atomically by on_after_register_access()
-     * and processed by worker threads. This avoids DMA deadlocks where the
+     * and processed by the worker loop. This avoids DMA deadlocks where the
      * PRU waits for bus grant while the CPU polls CSR waiting for completion.
      *
      * pending_reg_mask: Bitmask of registers with pending writes (bit N = reg N)
+     * pending_reg_access[]: DATO access type for the pending write
      * pending_reg_value[]: Written values for each register
      */
     std::atomic<uint16_t> pending_reg_mask{0};
+    std::atomic<uint8_t> pending_reg_access[8];
     std::atomic<uint16_t> pending_reg_value[8];
 
     /*
@@ -379,18 +382,27 @@ private:
      * rx_delay_active: Artificial RX delay in effect (for timing compat)
      * rx_enable_deadline_ns: Absolute time when RX delay expires
      * rbdl_pending: RX list needs dispatching (RCLH written)
-     * xbdl_pending: TX list needs dispatching (XMTH written)
-     * BUGFIX: TX can stall under load if the guest doesn't rewrite XMTH.
-     * Tracking an active TX ring lets the worker rescan without new register writes.
+     * tx_state: TX state machine (idle/active/wait_valid)
+     * tx_kick: TX list written event (XMTH write)
      * idtmr: System ID timer countdown (sends MOP system ID periodically)
      */
+    enum class tx_state_enum {
+        idle,
+        active,
+        wait_valid
+    };
     bool deqna_lock = false;
     bool rx_delay_active = false;
     uint64_t rx_enable_deadline_ns = 0;
     bool rbdl_pending = false;
-    bool xbdl_pending = false;
-    bool xbdl_active = false;
+    tx_state_enum tx_state = tx_state_enum::idle;
+    bool tx_kick = false;
+    uint32_t tx_wait_ba = 0;
+    uint64_t tx_wait_until_ns = 0;
+    unsigned tx_v0_retries = 0;
+    bool tx_invalid_dumped = false;
     uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
+    uint64_t intr_pending_since_ns = 0; // Interrupt pending timestamp for IACK quiesce
 
     /*
      * Deferred interrupt signaling
@@ -438,10 +450,6 @@ private:
     {
         return static_cast<uint64_t>(intr_dma_holdoff_us.value);
     }
-    void service_intr_complete_for_dma_holdoff(void) override
-    {
-        service_intr_complete();
-    }
 
     /*
      * Interrupt control
@@ -454,7 +462,10 @@ private:
     void set_int(void);
     void clr_int(void);
     void process_deferred_interrupts(void);
+    bool wait_for_interrupt_ack(void);
     void csr_set_clr(uint16_t set_bits, uint16_t clear_bits);
+    void note_xl_set(const char *reason, uint32_t desc_ba, const uint16_t *desc_words,
+            size_t desc_word_count);
     void nxm_error(void);
 
     /*
@@ -467,15 +478,6 @@ private:
      * Update libpcap BPF filter based on current setup/promisc state
      */
     void update_pcap_filter(void);
-
-    /*
-     * Worker thread entry points
-     * ---------------------------
-     * worker_rx: Instance 0 - polls pcap, processes RX ring
-     * worker_tx: Instance 1 - processes TX ring
-     */
-    void worker_rx(void);
-    void worker_tx(void);
 
     /*
      * Register write handling

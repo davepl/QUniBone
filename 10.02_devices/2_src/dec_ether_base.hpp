@@ -67,6 +67,7 @@ protected:
     // Ensure we only arm the holdoff once per interrupt condition, not per
     // bus-level INTR edge (which may be gated off/on around DMA).
     std::atomic<bool> intr_dma_holdoff_armed{false};
+    std::atomic<bool> intr_block_dma{false};
 
     // Device-specific interrupt update (must consider dma_in_progress if used to gate INTR).
     virtual void update_intr(void) = 0;
@@ -77,6 +78,23 @@ protected:
     // Optional: allow derived devices to consume intr_request.complete and/or clear internal latches
     // while we are waiting out the post-INTR DMA holdoff window.
     virtual void service_intr_complete_for_dma_holdoff(void) {}
+    // Optional: block DMA while an interrupt is asserted (device specific).
+    virtual bool block_dma_while_intr_asserted(void) const { return false; }
+    // Optional: called when DMA transitions to idle (dma_in_progress -> 0).
+    virtual void on_dma_quiet(void) {}
+
+    struct dma_inflight_guard {
+        dec_ether_base_c &dev;
+        explicit dma_inflight_guard(dec_ether_base_c &device) : dev(device)
+        {
+            dev.dma_in_progress.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~dma_inflight_guard()
+        {
+            if (dev.dma_in_progress.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                dev.on_dma_quiet();
+        }
+    };
 
     inline bool addr_in_ram(uint32_t addr, uint64_t byte_count) const
     {
@@ -102,16 +120,31 @@ protected:
         } else {
             intr_dma_holdoff_until_ns.store(0, std::memory_order_release);
         }
+        if (block_dma_while_intr_asserted())
+            intr_block_dma.store(true, std::memory_order_release);
     }
 
     inline void note_intr_deasserted(void)
     {
         intr_dma_holdoff_until_ns.store(0, std::memory_order_release);
         intr_dma_holdoff_armed.store(false, std::memory_order_release);
+        intr_block_dma.store(false, std::memory_order_release);
     }
 
     inline void holdoff_dma_if_intr_pending(void)
     {
+        const uint64_t block_us = intr_dma_holdoff_us_value();
+        if (block_us && intr_block_dma.load(std::memory_order_acquire)) {
+            const uint64_t deadline = timeout_c::abstime_ns() + block_us * 1000ull;
+            while (intr_block_dma.load(std::memory_order_acquire)) {
+                service_intr_complete_for_dma_holdoff();
+                if (!intr_block_dma.load(std::memory_order_acquire))
+                    return;
+                if (timeout_c::abstime_ns() >= deadline)
+                    break;
+                timeout_c::wait_us(10);
+            }
+        }
         // Hold off DMA briefly after asserting INTR to give the CPU time to complete IACK.
         // This reduces IACK timeouts caused by the PRU being mid-DMA and unable to respond.
         for (;;) {
@@ -157,8 +190,17 @@ protected:
         }
 
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-        qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
-        return dma_request.success;
+        holdoff_dma_if_intr_pending();
+        dma_inflight_guard guard(*this);
+        const int max_attempts = 3;
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
+            if (dma_request.success)
+                return true;
+            if (attempt + 1 < max_attempts)
+                timeout_c::wait_us(10);
+        }
+        return false;
     }
 
     inline bool dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
@@ -185,9 +227,18 @@ protected:
         }
 
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-        qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
-                const_cast<uint16_t *>(buffer), wordcount);
-        return dma_request.success;
+        holdoff_dma_if_intr_pending();
+        dma_inflight_guard guard(*this);
+        const int max_attempts = 3;
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
+                    const_cast<uint16_t *>(buffer), wordcount);
+            if (dma_request.success)
+                return true;
+            if (attempt + 1 < max_attempts)
+                timeout_c::wait_us(10);
+        }
+        return false;
     }
 
     inline bool desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
@@ -214,8 +265,17 @@ protected:
         }
 
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-        qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
-        return dma_desc_request.success;
+        holdoff_dma_if_intr_pending();
+        dma_inflight_guard guard(*this);
+        const int max_attempts = 3;
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
+            if (dma_desc_request.success)
+                return true;
+            if (attempt + 1 < max_attempts)
+                timeout_c::wait_us(10);
+        }
+        return false;
     }
 
     inline bool desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
@@ -242,9 +302,18 @@ protected:
         }
 
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-        qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,
-                const_cast<uint16_t *>(buffer), wordcount);
-        return dma_desc_request.success;
+        holdoff_dma_if_intr_pending();
+        dma_inflight_guard guard(*this);
+        const int max_attempts = 3;
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,
+                    const_cast<uint16_t *>(buffer), wordcount);
+            if (dma_desc_request.success)
+                return true;
+            if (attempt + 1 < max_attempts)
+                timeout_c::wait_us(10);
+        }
+        return false;
     }
 
     inline bool dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)

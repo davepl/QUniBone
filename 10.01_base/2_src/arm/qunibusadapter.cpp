@@ -60,6 +60,7 @@
 //#include <unistd.h> // sleep()
 //#include <sys/time.h>
 
+#include "timeout.hpp"
 #include "logsource.hpp"
 #include "logger.hpp"
 #include "mailbox.h"
@@ -86,6 +87,15 @@ static uint8_t priority_level_idx_to_arbitration_bit[PRIORITY_LEVEL_COUNT] = {
     PRIORITY_ARBITRATION_BIT_B7,
     PRIORITY_ARBITRATION_BIT_NP
 };
+
+static bool intr_active_locked(const priority_request_level_c *levels)
+{
+    for (int level = PRIORITY_LEVEL_INDEX_BR4; level <= PRIORITY_LEVEL_INDEX_BR7; ++level) {
+        if (levels[level].active)
+            return true;
+    }
+    return false;
+}
 
 qunibusadapter_c::qunibusadapter_c() :     device_c() 
 {
@@ -645,6 +655,22 @@ void qunibusadapter_c::DMA(dma_request_c& dma_request, bool blocking, uint8_t qu
         dma_request.complete = true;
         return;
     }
+
+    // Give pending interrupts a short quiet window before starting DMA.
+    // This mitigates NPR vs IACK contention in the PRU arbitration.
+    if (!dma_request.is_cpu_access) {
+        const uint64_t quiet_us = 200;
+        const uint64_t deadline = timeout_c::abstime_ns() + quiet_us * 1000ull;
+        for (;;) {
+            bool intr_active = false;
+            pthread_mutex_lock(&requests_mutex);
+            intr_active = intr_active_locked(request_levels);
+            pthread_mutex_unlock(&requests_mutex);
+            if (!intr_active || timeout_c::abstime_ns() >= deadline)
+                break;
+            timeout_c::wait_us(10);
+        }
+    }
     pthread_mutex_lock(&requests_mutex); // lock schedule table operations
 
     // In contrast to re-raised INTR, overlapping DMA requests from same board
@@ -1097,7 +1123,6 @@ void qunibusadapter_c::worker_device_dma_chunk_complete_event()
         // inserted in parallel (interrupt this DMA)
         prl->active = NULL;
         request_activate_lowest_slot(PRIORITY_LEVEL_INDEX_NPR);
-
         request_execute_active_on_PRU(PRIORITY_LEVEL_INDEX_NPR);
         more_chunks = true;
 
@@ -1145,6 +1170,7 @@ void qunibusadapter_c::worker_intr_complete_event(uint8_t level_index)
         _DEBUG_FAST("INTR() complete, no next scheduled");
     }
     // else INTRs for all slots of this level completed
+
 }
 
 // runs in background, catches and distributes PRU events
