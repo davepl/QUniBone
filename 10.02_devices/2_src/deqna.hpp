@@ -146,10 +146,14 @@ public:
             "%d", "TX ring scan limit (0 = no limit)", 0, 10);
     parameter_unsigned_c rx_start_delay_ms = parameter_unsigned_c(this, "rx_start_delay_ms", "rxd", false, "",
             "%d", "Receiver start delay in ms", 16, 10);
-    parameter_unsigned_c intr_dma_holdoff_us = parameter_unsigned_c(this, "intr_dma_holdoff_us", "idh", false, "",
-            "%d", "DMA holdoff after INTR assert in us (0 = disable)", 16, 10);
     parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
             "Trace CSR/ring events to log");
+
+    /*
+     * Read-only info (visible in menu with 'p')
+     */
+    parameter_string_c version = parameter_string_c(this, "version", "ver", true,
+            "DEQNA emulation version");
 
     /*
      * Read-only statistics (updated during operation, visible in menu)
@@ -187,9 +191,6 @@ public:
             DATO_ACCESS access) override;
 
     void worker(unsigned instance) override;
-    void on_dma_quiet(void) override;
-    void service_intr_complete_for_dma_holdoff(void) override;
-    bool block_dma_while_intr_asserted(void) const override;
 
 private:
     /*
@@ -217,16 +218,12 @@ private:
      * Thread synchronization
      * ----------------------
      * state_mutex: Protects device state (csr, rbdl_ba, ring state, setup, etc.)
-     * dma_mutex: Serializes DMA operations (only one DMA at a time)
+     * dma_mutex: Serializes DMA operations (inherited from base class)
      * queue_mutex: Serializes queue access from PCAP callbacks
-     * descriptor_process_mutex: Serializes process_rbdl() and process_xbdl() to
-     *                           avoid re-entrancy and keep deferred interrupts
-     *                           aligned with completed descriptor work.
      */
     std::recursive_mutex state_mutex;
     std::mutex queue_mutex;  // Serialize queue access from PCAP callbacks
-    std::mutex descriptor_process_mutex;  // Serialize ALL descriptor processing (RX + TX)
-    std::atomic<bool> reset_in_progress{false};  // Flag to abort worker operations during reset
+    // Note: reset_in_progress is inherited from dec_ether_base_c
 
     /*
      * Pending register writes from PDP-11
@@ -404,19 +401,7 @@ private:
     unsigned tx_v0_retries = 0;
     bool tx_invalid_dumped = false;
     uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
-    uint64_t intr_pending_since_ns = 0; // Interrupt pending timestamp for IACK quiesce
-    uint64_t intr_quiet_until_ns = 0; // Suppress interrupts briefly after reset
-
-    /*
-     * Deferred interrupt signaling
-     * -----------------------------
-     * QuNiBone's PRU can deadlock if we assert a bus interrupt while DMA is
-     * underway. csr_set_clr() therefore sets deferred flags instead of
-     * calling set_int/clr_int directly; process_deferred_interrupts() is
-     * called after DMA-heavy operations complete.
-     */
-    std::atomic<bool> deferred_set_int{false};
-    std::atomic<bool> deferred_clr_int{false};
+    uint64_t intr_pending_since_ns = 0; // Interrupt pending timestamp (for diagnostics)
 
     int idtmr = 0;
 
@@ -449,10 +434,6 @@ private:
     void update_transceiver_bits(void);
     void update_intr(void) override;
     void service_intr_complete(void);
-    uint64_t intr_dma_holdoff_us_value(void) const override
-    {
-        return static_cast<uint64_t>(intr_dma_holdoff_us.value);
-    }
 
     /*
      * Interrupt control
@@ -464,8 +445,8 @@ private:
      */
     void set_int(void);
     void clr_int(void);
-    void process_deferred_interrupts(void);
-    bool wait_for_interrupt_ack(void);
+    void process_deferred_interrupts(void);  // Now a no-op stub
+    bool wait_for_interrupt_ack(void);  // Now returns false immediately
     void csr_set_clr(uint16_t set_bits, uint16_t clear_bits);
     void note_xl_set(const char *reason, uint32_t desc_ba, const uint16_t *desc_words,
             size_t desc_word_count);

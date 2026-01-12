@@ -59,30 +59,13 @@ protected:
 
     // DMA synchronization and tracking
     std::recursive_mutex dma_mutex;
-    std::atomic<unsigned> dma_in_progress{0};
+    std::atomic<unsigned> dma_in_progress{0};  // For diagnostic output only
+    std::atomic<bool> reset_in_progress{false};  // Flag to abort operations during reset
 
-    // Short DMA holdoff window after raising INTR to reduce PRU deadlocks during IACK.
-    // If the CPU doesn't acknowledge quickly (e.g., interrupts masked), DMA resumes.
-    std::atomic<uint64_t> intr_dma_holdoff_until_ns{0};
-    // Ensure we only arm the holdoff once per interrupt condition, not per
-    // bus-level INTR edge (which may be gated off/on around DMA).
-    std::atomic<bool> intr_dma_holdoff_armed{false};
-    std::atomic<bool> intr_block_dma{false};
-
-    // Device-specific interrupt update (must consider dma_in_progress if used to gate INTR).
+    // Device-specific interrupt update
     virtual void update_intr(void) = 0;
 
-    // Device-specific holdoff duration (microseconds). 0 disables holdoff.
-    virtual uint64_t intr_dma_holdoff_us_value(void) const = 0;
-
-    // Optional: allow derived devices to consume intr_request.complete and/or clear internal latches
-    // while we are waiting out the post-INTR DMA holdoff window.
-    virtual void service_intr_complete_for_dma_holdoff(void) {}
-    // Optional: block DMA while an interrupt is asserted (device specific).
-    virtual bool block_dma_while_intr_asserted(void) const { return false; }
-    // Optional: called when DMA transitions to idle (dma_in_progress -> 0).
-    virtual void on_dma_quiet(void) {}
-
+    // DMA tracking guard (for diagnostic output)
     struct dma_inflight_guard {
         dec_ether_base_c &dev;
         explicit dma_inflight_guard(dec_ether_base_c &device) : dev(device)
@@ -91,8 +74,7 @@ protected:
         }
         ~dma_inflight_guard()
         {
-            if (dev.dma_in_progress.fetch_sub(1, std::memory_order_acq_rel) == 1)
-                dev.on_dma_quiet();
+            dev.dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
         }
     };
 
@@ -110,60 +92,20 @@ protected:
 
     inline void note_intr_asserted(void)
     {
-        if (intr_dma_holdoff_armed.load(std::memory_order_acquire))
-            return;
-        const uint64_t holdoff_us = intr_dma_holdoff_us_value();
-        if (holdoff_us) {
-            intr_dma_holdoff_until_ns.store(timeout_c::abstime_ns() + holdoff_us * 1000ull,
-                    std::memory_order_release);
-            intr_dma_holdoff_armed.store(true, std::memory_order_release);
-        } else {
-            intr_dma_holdoff_until_ns.store(0, std::memory_order_release);
-        }
-        if (block_dma_while_intr_asserted())
-            intr_block_dma.store(true, std::memory_order_release);
+        // SIMPLIFIED: No-op. DMA holdoff logic has been removed.
     }
 
     inline void note_intr_deasserted(void)
     {
-        intr_dma_holdoff_until_ns.store(0, std::memory_order_release);
-        intr_dma_holdoff_armed.store(false, std::memory_order_release);
-        intr_block_dma.store(false, std::memory_order_release);
+        // SIMPLIFIED: No-op. DMA holdoff logic has been removed.
     }
 
     inline void holdoff_dma_if_intr_pending(void)
     {
-        const uint64_t block_us = intr_dma_holdoff_us_value();
-        if (block_us && intr_block_dma.load(std::memory_order_acquire)) {
-            const uint64_t deadline = timeout_c::abstime_ns() + block_us * 1000ull;
-            while (intr_block_dma.load(std::memory_order_acquire)) {
-                service_intr_complete_for_dma_holdoff();
-                if (!intr_block_dma.load(std::memory_order_acquire))
-                    return;
-                if (timeout_c::abstime_ns() >= deadline)
-                    break;
-                timeout_c::wait_us(10);
-            }
-        }
-        // Hold off DMA briefly after asserting INTR to give the CPU time to complete IACK.
-        // This reduces IACK timeouts caused by the PRU being mid-DMA and unable to respond.
-        for (;;) {
-            uint64_t until = intr_dma_holdoff_until_ns.load(std::memory_order_acquire);
-            if (until == 0)
-                return;
-            const uint64_t now = timeout_c::abstime_ns();
-            if (now >= until) {
-                // Expired; clear for next time.
-                (void)intr_dma_holdoff_until_ns.compare_exchange_strong(until, 0,
-                        std::memory_order_acq_rel, std::memory_order_acquire);
-                return;
-            }
-            service_intr_complete_for_dma_holdoff();
-            // If the CPU already fetched the vector, allow DMA to proceed.
-            if (intr_request.complete)
-                return;
-            timeout_c::wait_us(10);
-        }
+        // SIMPLIFIED: No DMA holdoff. The QBUS allows concurrent DMA and interrupt
+        // handling. The PRU handles NPR (DMA) and BR (interrupt) independently.
+        // Previous versions blocked DMA while interrupts were pending, causing
+        // deadlocks and TX watchdog timeouts.
     }
 
     inline bool dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
