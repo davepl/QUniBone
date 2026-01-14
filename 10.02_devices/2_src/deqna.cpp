@@ -179,7 +179,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v051";  // Fix RSX boot: remove reset_in_progress check in update_intr, remove 1ms delay
+static const char *DEQNA_VERSION = "v053";  // Simplify pcap filter and accept_packet to match old working code
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -1050,31 +1050,12 @@ void deqna_c::update_pcap_filter(void)
     if (!pcap.is_open())
         return;
 
-    // Build a filter to exclude packets from our own source MAC.
-    // libpcap can deliver outgoing packets back to us; we want to reject them.
-    // Make room for "not (ether src ... or ether src ...)" with two MACs.
-    char srcbuf[160] = {0};
-    const uint8_t *phys = (setup.valid && !mac_is_zero(setup.macs[0])) ? setup.macs[0] : mac_addr;
-    if (setup.valid && !mac_is_zero(setup.macs[0]) && !mac_is_zero(mac_addr) && !mac_equal(setup.macs[0], mac_addr)) {
-        snprintf(srcbuf, sizeof(srcbuf),
-                 "not (ether src %02x:%02x:%02x:%02x:%02x:%02x or ether src %02x:%02x:%02x:%02x:%02x:%02x)",
-                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
-                 setup.macs[0][0], setup.macs[0][1], setup.macs[0][2], setup.macs[0][3], setup.macs[0][4], setup.macs[0][5]);
-    } else if (!mac_is_zero(phys)) {
-        snprintf(srcbuf, sizeof(srcbuf), "not ether src %02x:%02x:%02x:%02x:%02x:%02x",
-                 phys[0], phys[1], phys[2], phys[3], phys[4], phys[5]);
-    }
-    const bool have_src_excl = srcbuf[0] != '\0';
-
-    // setup.promiscuous is set by the guest OS via setup frame - if set, deliver all packets.
-    // promisc.value controls whether the HOST interface is in promiscuous mode (pcap.open),
-    // but does NOT bypass emulated MAC filtering - only setup.promiscuous does that.
-    if (setup.promiscuous) {
-        std::string filter = "ip or not ip";
-        if (have_src_excl) {
-            filter = std::string(srcbuf) + " and (" + filter + ")";
-        }
-        if (!pcap.set_filter(filter)) {
+    // promisc.value: host parameter to enable promiscuous mode (allows all traffic, needed for DHCP
+    //                before setup frame is processed)
+    // setup.promiscuous: set by guest OS via setup frame to enable promiscuous mode
+    // Either one enables full packet delivery.
+    if (promisc.value || setup.promiscuous) {
+        if (!pcap.set_filter("ip or not ip")) {
             WARNING("DEQNA: pcap filter set failed: %s", pcap.last_error().c_str());
         }
         return;
@@ -1097,22 +1078,17 @@ void deqna_c::update_pcap_filter(void)
     if (setup.multicast)
         append_term("ether multicast");
 
-    if (!mac_is_zero(phys))
-        add_mac(phys);
+    // Add our MAC addresses to the filter
+    add_mac(mac_addr);
     if (setup.valid) {
         for (int i = 0; i < QNA_FILTER_MAX; ++i) {
-            if (!mac_is_zero(setup.macs[i]) && !mac_equal(setup.macs[i], phys))
+            if (!mac_is_zero(setup.macs[i]))
                 add_mac(setup.macs[i]);
         }
     }
 
     if (filter.empty())
         filter = "ip or not ip";
-
-    // Exclude packets from our own source MAC
-    if (have_src_excl) {
-        filter = "(" + filter + ") and " + srcbuf;
-    }
 
     if (!pcap.set_filter(filter)) {
         WARNING("DEQNA: pcap filter set failed: %s", pcap.last_error().c_str());
@@ -1131,26 +1107,14 @@ bool deqna_c::accept_packet(const uint8_t *data, size_t len) const
     if (!data || len < 6)
         return false;
 
-    // libpcap can deliver "outgoing" packets for the capture interface. Real DEQNA
-    // hardware doesn't receive its own transmitted frames unless loopback is active.
-    if (len >= 12) {
-        const bool il_clear = (csr & QNA_CSR_IL) == 0;
-        const bool el_set = (csr & QNA_CSR_EL) != 0;
-        const bool loopback = el_set || il_clear;
-        const uint8_t *src = data + 6;
-        const uint8_t *phys = (setup.valid && !mac_is_zero(setup.macs[0])) ? setup.macs[0] : mac_addr;
-        if (!loopback &&
-            ((!mac_is_zero(mac_addr) && mac_equal(src, mac_addr)) ||
-             (!mac_is_zero(phys) && mac_equal(src, phys))))
-            return false;
-    }
-
-    if (setup.promiscuous)
+    // promisc.value: host parameter to enable promiscuous mode (allows all traffic, needed for DHCP
+    //                before setup frame is processed)
+    // setup.promiscuous: set by guest OS via setup frame to enable promiscuous mode
+    if (promisc.value || setup.promiscuous)
         return true;
 
     const uint8_t *dst = data;
-    const uint8_t *phys = (setup.valid && !mac_is_zero(setup.macs[0])) ? setup.macs[0] : mac_addr;
-    if (!mac_is_zero(phys) && mac_equal(dst, phys))
+    if (!mac_is_zero(mac_addr) && mac_equal(dst, mac_addr))
         return true;
 
     if (mac_is_broadcast(dst))
