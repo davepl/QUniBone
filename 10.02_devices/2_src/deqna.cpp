@@ -179,7 +179,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v048";  // sw_reset preserves vector, quiets interrupts
+static const char *DEQNA_VERSION = "v051";  // Fix RSX boot: remove reset_in_progress check in update_intr, remove 1ms delay
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -740,19 +740,8 @@ void deqna_c::start_rx_delay(void)
  */
 void deqna_c::update_intr(void)
 {
-    if (reset_in_progress.load(std::memory_order_acquire)) {
-        if (irq && qunibusadapter)
-            qunibusadapter->cancel_INTR(intr_request);
-        intr_request.edge_detect_reset();
-        irq = false;
-        return;
-    }
-
-    // Assert interrupt based purely on irq state. Previous versions gated this
-    // on dma_in_progress==0 to work around PRU arbitration issues, but that
-    // caused TX completion interrupts to be blocked during RX floods, leading
-    // to watchdog timeout and qerestart. The PRU should handle concurrent
-    // NPR (DMA) and BR (interrupt) requests properly per QBUS spec.
+    // OLD SIMPLE VERSION - no reset_in_progress check that calls cancel_INTR
+    // The reset_in_progress path was calling cancel_INTR which races with PRU
     bool level = irq;
 
     switch (intr_request.edge_detect(level)) {
@@ -894,14 +883,13 @@ void deqna_c::reset_controller(void)
     // Match SIMH: set CSR directly, then clear interrupt unconditionally
     csr = static_cast<uint16_t>(QNA_CSR_RL | QNA_CSR_XL);
 
-    // Clear interrupt state BEFORE updating transceiver bits or registers
-    // This matches SIMH's unconditional xq_clrint() after CSR setup
+    // Clear interrupt state using clr_int() which naturally handles cancellation
+    // via edge detection in update_intr(). Do NOT call cancel_INTR or set_vector
+    // directly - this avoids race conditions with qunibusadapter's interrupt processing.
     irq = false;
     intr_pending_since_ns = 0;
-    if (qunibusadapter)
-        qunibusadapter->cancel_INTR(intr_request);
     intr_request.edge_detect_reset();
-    intr_request.set_vector(var & QNA_VEC_IV);
+    // clr_int() will call update_intr() which handles cancellation via edge detection
 
     // Now safe to update MAC checksum and transceiver bits
     // update_transceiver_bits() sets OK directly in csr (no interrupt side effects)
@@ -975,9 +963,8 @@ void deqna_c::sw_reset(void)
     // Signal reset early so worker loops can abort
     reset_in_progress.store(true, std::memory_order_release);
 
-    // Brief delay to let any in-flight descriptor processing notice reset_in_progress
-    // and abort. DMA operations are short (a few microseconds) so 1ms is plenty.
-    timeout_c::wait_ms(1);
+    // NO DELAY - the old working code didn't have a delay here
+    // The 1ms delay was creating a race window
 
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex);
 
@@ -1002,15 +989,12 @@ void deqna_c::sw_reset(void)
     // Match SIMH: set CSR directly, then clear interrupt unconditionally
     csr = static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_RL);
 
-    // Clear interrupt state BEFORE updating transceiver bits or registers
-    // This matches SIMH's unconditional xq_clrint() after CSR setup
+    // Clear interrupt state using clr_int() which naturally handles cancellation
+    // via edge detection in update_intr(). Do NOT call cancel_INTR or set_vector
+    // directly - this avoids race conditions with qunibusadapter's interrupt processing.
     irq = false;
     intr_pending_since_ns = 0;
-    if (qunibusadapter)
-        qunibusadapter->cancel_INTR(intr_request);
     intr_request.edge_detect_reset();
-    // Preserve the vector programmed in VAR register
-    intr_request.set_vector(var & QNA_VEC_IV);
 
     // Now safe to update MAC checksum and transceiver bits
     // update_transceiver_bits() sets OK directly in csr (no interrupt side effects)

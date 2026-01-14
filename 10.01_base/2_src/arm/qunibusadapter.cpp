@@ -88,14 +88,7 @@ static uint8_t priority_level_idx_to_arbitration_bit[PRIORITY_LEVEL_COUNT] = {
     PRIORITY_ARBITRATION_BIT_NP
 };
 
-static bool intr_active_locked(const priority_request_level_c *levels)
-{
-    for (int level = PRIORITY_LEVEL_INDEX_BR4; level <= PRIORITY_LEVEL_INDEX_BR7; ++level) {
-        if (levels[level].active)
-            return true;
-    }
-    return false;
-}
+// REMOVED: intr_active_locked() - was used for DMA holdoff that caused RSX boot faults
 
 qunibusadapter_c::qunibusadapter_c() :     device_c() 
 {
@@ -656,21 +649,10 @@ void qunibusadapter_c::DMA(dma_request_c& dma_request, bool blocking, uint8_t qu
         return;
     }
 
-    // Give pending interrupts a short quiet window before starting DMA.
-    // This mitigates NPR vs IACK contention in the PRU arbitration.
-    if (!dma_request.is_cpu_access) {
-        const uint64_t quiet_us = 200;
-        const uint64_t deadline = timeout_c::abstime_ns() + quiet_us * 1000ull;
-        for (;;) {
-            bool intr_active = false;
-            pthread_mutex_lock(&requests_mutex);
-            intr_active = intr_active_locked(request_levels);
-            pthread_mutex_unlock(&requests_mutex);
-            if (!intr_active || timeout_c::abstime_ns() >= deadline)
-                break;
-            timeout_c::wait_us(10);
-        }
-    }
+    // REMOVED: DMA holdoff code that waited for pending interrupts.
+    // This caused RSX boot faults by creating a race condition where
+    // the interrupt vector could be corrupted (vector 137 instead of 136).
+
     pthread_mutex_lock(&requests_mutex); // lock schedule table operations
 
     // In contrast to re-raised INTR, overlapping DMA requests from same board
