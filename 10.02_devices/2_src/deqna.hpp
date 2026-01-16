@@ -382,7 +382,19 @@ private:
      * tx_state: TX state machine (idle/active/wait_valid)
      * tx_kick: TX list written event (XMTH write)
      * idtmr: System ID timer countdown (sends MOP system ID periodically)
+     *
+     * Interrupt holdoff (post-reset protection)
+     * ------------------------------------------
+     * After sw_reset() or reset_controller(), there's a fragile window where
+     * the driver hasn't yet written the VAR (vector) register. If we assert
+     * INTR during this window, the CPU may fetch an invalid vector causing
+     * OD:010704 (odd address trap). The holdoff prevents INTR assertion until:
+     *   - VAR is written (clears holdoff immediately), OR
+     *   - A timeout expires (5ms safety fallback)
      */
+    bool intr_holdoff_active = false;
+    uint64_t intr_holdoff_until_ns = 0;
+
     enum class tx_state_enum {
         idle,
         active,

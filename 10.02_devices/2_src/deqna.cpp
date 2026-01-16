@@ -270,7 +270,7 @@ deqna_c::deqna_c() : dec_ether_base_c()
     dma_desc_request.set_priority_slot(priority_slot.value);
     intr_request.set_priority_slot(priority_slot.value);
     intr_request.set_level(intr_level.value);
-    intr_request.set_vector(intr_vector.value);
+    intr_request.set_vector(intr_vector.value & QNA_VEC_IV);  // Mask to valid vector bits
 
     /*
      * Register layout (8 registers, 16 bytes total at base address):
@@ -403,7 +403,7 @@ bool deqna_c::on_param_changed(parameter_c *param)
     } else if (param == &intr_level) {
         intr_request.set_level(intr_level.new_value);
     } else if (param == &intr_vector) {
-        intr_request.set_vector(intr_vector.new_value);
+        intr_request.set_vector(intr_vector.new_value & QNA_VEC_IV);  // Mask to valid vector bits
     } else if (param == &ifname) {
         if (handle) {
             WARNING("DEQNA: ifname cannot be changed while device is installed");
@@ -737,18 +737,38 @@ void deqna_c::start_rx_delay(void)
  * The SIMH-compatible interrupt auto-clear happens in service_intr_complete()
  * when we detect that intr_request.complete is true (vector was fetched).
  * This clears irq, allowing new RI/XI events to trigger new interrupts.
+ *
+ * POST-RESET HOLDOFF:
+ * After sw_reset() or reset_controller(), there's a fragile window where
+ * the driver hasn't yet written the VAR register. If we assert INTR during
+ * this window, the CPU may fetch an invalid vector causing OD:010704.
+ * The holdoff prevents INTR assertion until VAR is written or timeout expires.
  */
 void deqna_c::update_intr(void)
 {
-    // OLD SIMPLE VERSION - no reset_in_progress check that calls cancel_INTR
-    // The reset_in_progress path was calling cancel_INTR which races with PRU
     bool level = irq;
+
+    // Check if interrupt holdoff is active (post-reset protection)
+    if (intr_holdoff_active) {
+        uint64_t now = timeout_c::abstime_ns();
+        if (now >= intr_holdoff_until_ns) {
+            // Holdoff expired - allow normal interrupt behavior
+            intr_holdoff_active = false;
+            DEBUG("DEQNA: Interrupt holdoff expired (timeout)");
+        } else if (level) {
+            // Still in holdoff window - don't assert INTR, but log it
+            DEBUG("DEQNA: Interrupt holdoff active, deferring INTR assertion (irq=%d)", level ? 1 : 0);
+            return;
+        }
+    }
 
     switch (intr_request.edge_detect(level)) {
     case intr_request_c::INTERRUPT_EDGE_RAISING:
         note_intr_asserted();
-        DEBUG("DEQNA: update_intr RAISING edge, calling INTR vec=%03o level=%d csr=%06o",
-              intr_request.get_vector(), intr_request.get_level(), csr);
+        if (trace.value) {
+            DEBUG("DEQNA: INTR RAISING edge, calling INTR vec=%03o level=%d csr=%06o var=%06o",
+                  intr_request.get_vector(), intr_request.get_level(), csr, var);
+        }
         qunibusadapter->INTR(intr_request, nullptr, 0);
         break;
     case intr_request_c::INTERRUPT_EDGE_FALLING:
@@ -800,9 +820,6 @@ void deqna_c::process_deferred_interrupts(void)
     // SIMPLIFIED: This function is now a no-op. Interrupts are handled directly
     // in csr_set_clr() when RI/XI bits change. Keeping this function as a stub
     // to avoid modifying all call sites.
-}
-
-/*
 }
 
 /*
@@ -883,13 +900,19 @@ void deqna_c::reset_controller(void)
     // Match SIMH: set CSR directly, then clear interrupt unconditionally
     csr = static_cast<uint16_t>(QNA_CSR_RL | QNA_CSR_XL);
 
-    // Clear interrupt state using clr_int() which naturally handles cancellation
-    // via edge detection in update_intr(). Do NOT call cancel_INTR or set_vector
-    // directly - this avoids race conditions with qunibusadapter's interrupt processing.
+    // Clear interrupt state and reset edge detection.
+    // IMPORTANT: We must set_vector() AFTER edge_detect_reset() to ensure the
+    // interrupt request object has the correct vector before any interrupt can fire.
+    // The edge_detect_reset() clears signal_level but doesn't touch the vector.
     irq = false;
     intr_pending_since_ns = 0;
     intr_request.edge_detect_reset();
-    // clr_int() will call update_intr() which handles cancellation via edge detection
+    intr_request.set_vector(var & QNA_VEC_IV);  // Ensure vector is valid after reset
+
+    // Set interrupt holdoff to protect the fragile post-reset window.
+    // Holdoff only applies immediately after reset and expires by timeout.
+    intr_holdoff_active = true;
+    intr_holdoff_until_ns = timeout_c::abstime_ns() + 2000000ull;  // 2ms
 
     // Now safe to update MAC checksum and transceiver bits
     // update_transceiver_bits() sets OK directly in csr (no interrupt side effects)
@@ -989,12 +1012,19 @@ void deqna_c::sw_reset(void)
     // Match SIMH: set CSR directly, then clear interrupt unconditionally
     csr = static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_RL);
 
-    // Clear interrupt state using clr_int() which naturally handles cancellation
-    // via edge detection in update_intr(). Do NOT call cancel_INTR or set_vector
-    // directly - this avoids race conditions with qunibusadapter's interrupt processing.
+    // Clear interrupt state and reset edge detection.
+    // IMPORTANT: We must set_vector() AFTER edge_detect_reset() to ensure the
+    // interrupt request object has the correct vector before any interrupt can fire.
+    // The edge_detect_reset() clears signal_level but doesn't touch the vector.
     irq = false;
     intr_pending_since_ns = 0;
     intr_request.edge_detect_reset();
+    intr_request.set_vector(var & QNA_VEC_IV);  // Ensure vector is valid after reset
+
+    // Set interrupt holdoff to protect the fragile post-reset window.
+    // Holdoff only applies immediately after reset and expires by timeout.
+    intr_holdoff_active = true;
+    intr_holdoff_until_ns = timeout_c::abstime_ns() + 2000000ull;  // 2ms
 
     // Now safe to update MAC checksum and transceiver bits
     // update_transceiver_bits() sets OK directly in csr (no interrupt side effects)
@@ -1026,7 +1056,9 @@ void deqna_c::sw_reset(void)
     last_rbdl_start = 0;
     rbdl_wrap_guard = false;
 
-    setup.valid = false;
+    // OpenSIMH-compatible: sw_reset preserves setup.valid and setup.macs[].
+    // Only clear multicast and promiscuous flags, not the MAC addresses.
+    // The driver expects the station address to persist across soft resets.
     setup.multicast = false;
     setup.promiscuous = false;
     sanity.timer = sanity.max;
@@ -1263,7 +1295,8 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         else
             merged = static_cast<uint16_t>((var & 0xff00) | (val & 0x00ff));
 
-        uint16_t new_var = static_cast<uint16_t>((var & QNA_VEC_RO) | (merged & QNA_VEC_RW));
+        uint16_t writable = static_cast<uint16_t>(QNA_VEC_RW | QNA_VEC_IV);
+        uint16_t new_var = static_cast<uint16_t>((var & ~writable) | (merged & writable));
         // DEQNA: MS is fixed to 0 and ID bit always reads 0.
         new_var &= ~QNA_VEC_MS;
         new_var &= ~(QNA_VEC_OS | QNA_VEC_RS | QNA_VEC_ST | QNA_VEC_ID);
@@ -1272,6 +1305,7 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         var = new_var;
         update_vector_reg();
         intr_request.set_vector(var & QNA_VEC_IV);
+
         break;
     }
     case DEQNA_REG_CSR: {
@@ -1306,6 +1340,12 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
                 start_rx_delay();
             else
                 rx_delay_active = false;
+        }
+
+        // Clear interrupt holdoff once the driver enables interrupts.
+        if (intr_holdoff_active && ((prev ^ csr) & QNA_CSR_IE) && (csr & QNA_CSR_IE)) {
+            intr_holdoff_active = false;
+            DEBUG("DEQNA: Interrupt holdoff cleared (IE set, vec=%03o)", var & QNA_VEC_IV);
         }
 
         if ((prev ^ csr) & QNA_CSR_EL)
@@ -1818,17 +1858,22 @@ bool deqna_c::process_rbdl(void)
         }
 
         const bool packet_complete = (item.packet.used >= item.packet.len);
+        bool stop_after_ri = false;
         if (!packet_complete) {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
             read_queue.push_front(std::move(item));
         } else {
             ri_pending = true;
+            stop_after_ri = true;
         }
 
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             rbdl_ba = cur_ba + QE_RING_BYTES;
         }
+
+        if (stop_after_ri)
+            break;
 
         if (limit && (++processed >= limit))
             break;
@@ -2308,10 +2353,23 @@ bool deqna_c::process_xbdl(void)
                     }
                 }
 
-                if (!pcap.send(write_buffer.msg.data(), write_buffer.len))
+                if (!pcap.send(write_buffer.msg.data(), write_buffer.len)) {
+                    WARNING("DEQNA: TX packet FAILED len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x",
+                            write_buffer.len,
+                            write_buffer.msg[0], write_buffer.msg[1], write_buffer.msg[2],
+                            write_buffer.msg[3], write_buffer.msg[4], write_buffer.msg[5],
+                            write_buffer.msg[6], write_buffer.msg[7], write_buffer.msg[8],
+                            write_buffer.msg[9], write_buffer.msg[10], write_buffer.msg[11]);
                     write_callback(1);
-                else
+                } else {
+                    WARNING("DEQNA: TX packet sent len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x",
+                            write_buffer.len,
+                            write_buffer.msg[0], write_buffer.msg[1], write_buffer.msg[2],
+                            write_buffer.msg[3], write_buffer.msg[4], write_buffer.msg[5],
+                            write_buffer.msg[6], write_buffer.msg[7], write_buffer.msg[8],
+                            write_buffer.msg[9], write_buffer.msg[10], write_buffer.msg[11]);
                     write_callback(0);
+                }
                 ++packets_processed;
                 // Yield after one TX completion so the CPU can acknowledge XI
                 // before we start more DMA.
@@ -2438,6 +2496,12 @@ void deqna_c::process_setup(void)
     }
 
     setup.valid = true;
+
+    // Log the MAC address the driver configured (setup.macs[0] is the station address)
+    WARNING("DEQNA: Driver configured MAC address: %02x:%02x:%02x:%02x:%02x:%02x",
+            setup.macs[0][0], setup.macs[0][1], setup.macs[0][2],
+            setup.macs[0][3], setup.macs[0][4], setup.macs[0][5]);
+
     // Apply new filter settings to pcap (now that setup.valid is set)
     update_pcap_filter();
 
@@ -2775,6 +2839,13 @@ void deqna_c::worker(unsigned instance)
                 {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
                     should_accept = accept_packet(pkt_buf, len);
+                }
+                if (trace.value) {
+                    DEBUG("DEQNA: RX packet len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x accept=%d",
+                          len,
+                          pkt_buf[0], pkt_buf[1], pkt_buf[2], pkt_buf[3], pkt_buf[4], pkt_buf[5],
+                          pkt_buf[6], pkt_buf[7], pkt_buf[8], pkt_buf[9], pkt_buf[10], pkt_buf[11],
+                          should_accept ? 1 : 0);
                 }
                 if (should_accept) {
                     // Try to handle MOP protocols locally first
