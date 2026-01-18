@@ -179,7 +179,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v053";  // Simplify pcap filter and accept_packet to match old working code
+static const char *DEQNA_VERSION = "v063";  // Add TX STUCK warning when V=0 persists >100ms
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -765,6 +765,16 @@ void deqna_c::update_intr(void)
     switch (intr_request.edge_detect(level)) {
     case intr_request_c::INTERRUPT_EDGE_RAISING:
         note_intr_asserted();
+        // Extra safety: clamp vector to valid bits before asserting interrupt
+        {
+            const uint16_t current_vec = intr_request.get_vector();
+            const uint16_t masked_vec = static_cast<uint16_t>(current_vec & QNA_VEC_IV);
+            if (masked_vec != current_vec) {
+                WARNING("DEQNA: clamping invalid vector %03o -> %03o before INTR",
+                        current_vec, masked_vec);
+                intr_request.set_vector(masked_vec);
+            }
+        }
         if (trace.value) {
             DEBUG("DEQNA: INTR RAISING edge, calling INTR vec=%03o level=%d csr=%06o var=%06o",
                   intr_request.get_vector(), intr_request.get_level(), csr, var);
@@ -995,10 +1005,12 @@ void deqna_c::sw_reset(void)
         DEBUG("DEQNA: sw_reset() begin csr=%06o", csr);
     }
 
-    // Clear pending dispatch flags BEFORE modifying CSR
-    rbdl_pending = (rbdl[0] || rbdl[1]);
+    // CRITICAL: Clear all pending dispatch flags on sw_reset.
+    // The driver MUST write XMTH/RCLH to re-arm TX/RX after reset.
+    // Old code incorrectly set these from stale register values!
+    rbdl_pending = false;
     tx_state = tx_state_enum::idle;
-    tx_kick = (xbdl[0] || xbdl[1]);
+    tx_kick = false;
     tx_wait_ba = 0;
     tx_wait_until_ns = 0;
     tx_v0_retries = 0;
@@ -1087,6 +1099,8 @@ void deqna_c::update_pcap_filter(void)
     // setup.promiscuous: set by guest OS via setup frame to enable promiscuous mode
     // Either one enables full packet delivery.
     if (promisc.value || setup.promiscuous) {
+        WARNING("DEQNA: pcap filter set to promiscuous (promisc.value=%d setup.promiscuous=%d)",
+                promisc.value ? 1 : 0, setup.promiscuous ? 1 : 0);
         if (!pcap.set_filter("ip or not ip")) {
             WARNING("DEQNA: pcap filter set failed: %s", pcap.last_error().c_str());
         }
@@ -1139,10 +1153,10 @@ bool deqna_c::accept_packet(const uint8_t *data, size_t len) const
     if (!data || len < 6)
         return false;
 
-    // promisc.value: host parameter to enable promiscuous mode (allows all traffic, needed for DHCP
-    //                before setup frame is processed)
     // setup.promiscuous: set by guest OS via setup frame to enable promiscuous mode
-    if (promisc.value || setup.promiscuous)
+    // Note: promisc.value (host parameter) only affects pcap capture, not our software filter.
+    // DHCP works via broadcast which we accept below, so we don't need promisc here.
+    if (setup.promiscuous)
         return true;
 
     const uint8_t *dst = data;
@@ -1282,8 +1296,10 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         tx_v0_retries = 0;
         tx_wait_until_ns = 0;
         tx_invalid_dumped = false;
-        if (trace.value)
-            DEBUG("DEQNA: TX list update pending (XMTH=%06o XMTL=%06o csr=%06o)", xbdl[1], xbdl[0], csr);
+        // Always log TX kicks to track what the driver is sending
+        WARNING("DEQNA: TX KICK XMTH=%06o XMTL=%06o addr=%06o csr=%06o IL=%d EL=%d",
+                xbdl[1], xbdl[0], make_addr(xbdl[1], static_cast<uint16_t>(xbdl[0] & ~1u)),
+                csr, (csr & QNA_CSR_IL) ? 1 : 0, (csr & QNA_CSR_EL) ? 1 : 0);
         break;
     case DEQNA_REG_VECTOR: {
         // Byte writes only update the targeted byte.
@@ -1305,6 +1321,12 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         var = new_var;
         update_vector_reg();
         intr_request.set_vector(var & QNA_VEC_IV);
+
+        // Clear interrupt holdoff - driver has set the vector, so we're safe
+        if (intr_holdoff_active) {
+            intr_holdoff_active = false;
+            DEBUG("DEQNA: Interrupt holdoff cleared (VAR written, vec=%03o)", var & QNA_VEC_IV);
+        }
 
         break;
     }
@@ -1334,6 +1356,14 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         }
 
         csr_set_clr(set_bits, clr_bits);
+
+        // Log changes to loopback bits for debugging
+        if ((prev ^ csr) & (QNA_CSR_IL | QNA_CSR_EL)) {
+            WARNING("DEQNA: Loopback bits changed: IL=%d->%d EL=%d->%d csr=%06o->%06o",
+                    (prev & QNA_CSR_IL) ? 1 : 0, (csr & QNA_CSR_IL) ? 1 : 0,
+                    (prev & QNA_CSR_EL) ? 1 : 0, (csr & QNA_CSR_EL) ? 1 : 0,
+                    prev, csr);
+        }
 
         if ((prev ^ csr) & QNA_CSR_RE) {
             if (csr & QNA_CSR_RE)
@@ -1774,6 +1804,21 @@ bool deqna_c::process_rbdl(void)
             DEBUG("DEQNA: RX deliver type=%d rbl=%zu to addr=%08o blen=%u desc=%06o",
                   item.type, rbl, address, static_cast<unsigned>(b_length), cur_ba);
         }
+        // Enhanced logging for DHCP/IP packets (EtherType 0x0800 at offset 12-13)
+        if (rbuf && rbl >= 14 && rbuf[12] == 0x08 && rbuf[13] == 0x00) {
+            // This is an IP packet - log key details
+            uint16_t ip_total_len = 0;
+            uint32_t ip_src = 0, ip_dst = 0;
+            if (rbl >= 34) {  // Need at least Ethernet(14) + IP header(20)
+                ip_total_len = (rbuf[16] << 8) | rbuf[17];
+                ip_src = (rbuf[26] << 24) | (rbuf[27] << 16) | (rbuf[28] << 8) | rbuf[29];
+                ip_dst = (rbuf[30] << 24) | (rbuf[31] << 16) | (rbuf[32] << 8) | rbuf[33];
+            }
+            WARNING("DEQNA: RX IP packet: eth_len=%zu ip_total_len=%u src=%u.%u.%u.%u dst=%u.%u.%u.%u",
+                    rbl, ip_total_len,
+                    (ip_src >> 24) & 0xff, (ip_src >> 16) & 0xff, (ip_src >> 8) & 0xff, ip_src & 0xff,
+                    (ip_dst >> 24) & 0xff, (ip_dst >> 16) & 0xff, (ip_dst >> 8) & 0xff, ip_dst & 0xff);
+        }
         if (rbl && !dma_write_bytes(address, rbuf, rbl)) {
             dma_failed = true;
             rbl = 0;
@@ -1844,6 +1889,10 @@ bool deqna_c::process_rbdl(void)
         words[4] = status1;
         const uint16_t rbl_low = static_cast<uint16_t>(report_rbl & 0x00FF);
         words[5] = static_cast<uint16_t>((rbl_low << 8) | rbl_low);
+
+        // Always log RX completion status for DHCP debugging
+        WARNING("DEQNA: RX COMPLETE type=%d pkt_len=%zu rbl_delivered=%zu report_rbl=%u st1=%06o st2=%06o desc=%06o",
+                item.type, item.packet.len, rbl, report_rbl, words[4], words[5], cur_ba + 8);
 
         if (trace.value) {
             DEBUG("DEQNA: RX status type=%d st1=%06o st2=%06o desc=%06o",
@@ -2160,6 +2209,7 @@ bool deqna_c::process_xbdl(void)
         // Check V (valid) bit - if clear, pause and wait for the driver
         if (~words[1] & QNA_DSC_V) {
             bool do_dump = false;
+            bool do_stuck_warn = false;
             uint16_t xmtl = 0;
             uint16_t xmth = 0;
             unsigned prior_retry = 0;
@@ -2178,6 +2228,14 @@ bool deqna_c::process_xbdl(void)
                 // Keep retrying until it becomes valid or XMTH is rewritten.
                 if (tx_v0_retries < UINT_MAX)
                     tx_v0_retries += 1;
+                
+                // Warn if stuck waiting for V=1 for too long (>100ms)
+                if (tx_v0_retries == 100) {
+                    do_stuck_warn = true;
+                    xmtl = xbdl[0];
+                    xmth = xbdl[1];
+                }
+                
                 tx_state = tx_state_enum::wait_valid;
                 tx_wait_ba = cur_ba;
                 tx_wait_until_ns = timeout_c::abstime_ns() + v0_retry_delay_us * 1000ull;
@@ -2190,6 +2248,12 @@ bool deqna_c::process_xbdl(void)
                       "w0=%06o w1=%06o w2=%06o w3=%06o w4=%06o w5=%06o defer=%u",
                       cur_ba, xmth, xmtl, words[0], words[1], words[2],
                       words[3], words[4], words[5], prior_retry == 0 ? 1u : 0u);
+            }
+            if (do_stuck_warn) {
+                WARNING("DEQNA: TX STUCK V=0 >100ms @%06o XMTH=%06o XMTL=%06o "
+                        "w0=%06o w1=%06o w2=%06o w3=%06o w4=%06o w5=%06o",
+                        cur_ba, xmth, xmtl, words[0], words[1], words[2],
+                        words[3], words[4], words[5]);
             }
             process_deferred_interrupts();
             return true;
@@ -2269,11 +2333,12 @@ bool deqna_c::process_xbdl(void)
             }
             bool loopback = el_set || il_clear;
 
-            if (trace.value) {
-                DEBUG("DEQNA: TX EOMSG len=%u setup=%d loopback=%d (IL_clear=%d EL_set=%d) csr=%06o",
-                        static_cast<unsigned>(len_snapshot), setup_packet ? 1 : 0, loopback ? 1 : 0,
-                        il_clear ? 1 : 0, el_set ? 1 : 0, csr_snapshot);
-            }
+            // Always log TX decisions to help debug DHCP issues
+            WARNING("DEQNA: TX EOMSG len=%u setup=%d loopback=%d (IL_clear=%d EL_set=%d) csr=%06o dst=%02x:%02x:%02x:%02x:%02x:%02x",
+                    static_cast<unsigned>(len_snapshot), setup_packet ? 1 : 0, loopback ? 1 : 0,
+                    il_clear ? 1 : 0, el_set ? 1 : 0, csr_snapshot,
+                    write_buffer.msg[0], write_buffer.msg[1], write_buffer.msg[2],
+                    write_buffer.msg[3], write_buffer.msg[4], write_buffer.msg[5]);
 
             if (loopback || setup_packet) {
                 bool enqueued = false;
@@ -2497,10 +2562,17 @@ void deqna_c::process_setup(void)
 
     setup.valid = true;
 
-    // Log the MAC address the driver configured (setup.macs[0] is the station address)
-    WARNING("DEQNA: Driver configured MAC address: %02x:%02x:%02x:%02x:%02x:%02x",
-            setup.macs[0][0], setup.macs[0][1], setup.macs[0][2],
-            setup.macs[0][3], setup.macs[0][4], setup.macs[0][5]);
+    // Log ALL configured MAC addresses from the setup packet
+    for (int i = 0; i < QNA_FILTER_MAX; ++i) {
+        if (!mac_is_zero(setup.macs[i])) {
+            WARNING("DEQNA: Driver configured MAC[%d]: %02x:%02x:%02x:%02x:%02x:%02x",
+                    i, setup.macs[i][0], setup.macs[i][1], setup.macs[i][2],
+                    setup.macs[i][3], setup.macs[i][4], setup.macs[i][5]);
+        }
+    }
+    WARNING("DEQNA: Setup complete: multicast=%d promiscuous=%d station_mac=%02x:%02x:%02x:%02x:%02x:%02x",
+            setup.multicast ? 1 : 0, setup.promiscuous ? 1 : 0,
+            mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
 
     // Apply new filter settings to pcap (now that setup.valid is set)
     update_pcap_filter();
@@ -2836,16 +2908,26 @@ void deqna_c::worker(unsigned instance)
             }
             if (len > 0) {
                 bool should_accept = false;
+                bool is_unicast = false;
                 {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
                     should_accept = accept_packet(pkt_buf, len);
+                    // Check if it's a unicast packet (not broadcast, not multicast)
+                    is_unicast = !mac_is_broadcast(pkt_buf) && !mac_is_multicast(pkt_buf);
                 }
-                if (trace.value) {
-                    DEBUG("DEQNA: RX packet len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x accept=%d",
+                // Log accepted packets
+                if (should_accept) {
+                    WARNING("DEQNA: RX ACCEPT len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x",
                           len,
                           pkt_buf[0], pkt_buf[1], pkt_buf[2], pkt_buf[3], pkt_buf[4], pkt_buf[5],
-                          pkt_buf[6], pkt_buf[7], pkt_buf[8], pkt_buf[9], pkt_buf[10], pkt_buf[11],
-                          should_accept ? 1 : 0);
+                          pkt_buf[6], pkt_buf[7], pkt_buf[8], pkt_buf[9], pkt_buf[10], pkt_buf[11]);
+                }
+                // Log rejected unicast packets - these are important to diagnose!
+                if (!should_accept && is_unicast) {
+                    WARNING("DEQNA: RX REJECT unicast len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x",
+                          len,
+                          pkt_buf[0], pkt_buf[1], pkt_buf[2], pkt_buf[3], pkt_buf[4], pkt_buf[5],
+                          pkt_buf[6], pkt_buf[7], pkt_buf[8], pkt_buf[9], pkt_buf[10], pkt_buf[11]);
                 }
                 if (should_accept) {
                     // Try to handle MOP protocols locally first
