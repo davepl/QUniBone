@@ -1,94 +1,12 @@
-/*
- * Author: Dave Plummer (davepl@davepl.com)
- * (c) 2026 Plummer's Software LLC
- * Contributed under the GPL2 License
+/* deqna.hpp - Simplified DEQNA Ethernet Controller Emulation
  *
- * DEQNA Ethernet Controller Emulation for QUniBone
- * ================================================
+ * Minimal DEQNA (M7504) implementation for QUniBone:
+ * - TX/RX packet handling via descriptor rings
+ * - Internal/external loopback
+ * - Setup packet processing
+ * - STA ON deferred interrupt (400µs delay after SR clear)
  *
- * This module emulates the DEC DEQNA (M7504) Q-bus Ethernet controller.
- *
- * HARDWARE OVERVIEW:
- * ------------------
- * The DEQNA occupies 16 bytes of I/O space and provides:
- *   - Six station address registers (SA0-SA5): Read MAC or checksum
- *   - RCV list address (RCLL/RCLH): 22-bit pointer to RX descriptor ring
- *   - XMT list address (XMTL/XMTH): 22-bit pointer to TX descriptor ring
- *   - Vector Address Register (VAR): Interrupt vector and mode control
- *   - Control/Status Register (CSR): Device control and status
- *
- * DMA DESCRIPTOR RING ARCHITECTURE:
- * ---------------------------------
- * Both TX and RX use linked descriptor rings in host memory. Each descriptor
- * is 12 bytes (6 words):
- *   Word 0: Flag word (0xFFFF when in-use by device)
- *   Word 1: Address high bits + control flags (V=valid, C=chain, E=end, S=setup, L/H=length adjust)
- *   Word 2: Buffer address low 16 bits
- *   Word 3: Buffer length (one's complement)
- *   Word 4: Status word 1 (written by device after completion)
- *   Word 5: Status word 2 (written by device after completion)
- *
- * THREADING MODEL:
- * ----------------
- * Single deterministic state-machine worker:
- *   - One worker thread handles RX and TX in a fixed sequence each loop.
- *   - Register writes from the PDP-11 are captured atomically and applied in
- *     the worker loop to avoid DMA/IACK deadlocks.
- *   - RX capture, RX ring processing, and TX ring processing are interleaved
- *     deterministically to keep the driver serviced.
- *
- * LOOPBACK MODE:
- * --------------
- * Loopback is controlled by CSR bits IL (internal) and EL (external):
- *   - IL=0 (internal loopback) OR EL=1 (external loopback) → packets loop back
- *   - This behavior is derived from hardware testing, independent of RE
- *
- * NETWORK BRIDGING:
- * -----------------
- * libpcap bridges the emulated Ethernet to a real host interface. The pcap
- * filter is dynamically updated based on setup packet contents and promisc
- * mode to minimize unnecessary packet processing.
- *
- * REFERENCE:
- * ----------
- * This implementation derives behavior from reference behavior where the
- * hardware documentation is ambiguous. Key compatibility behaviors:
- *   - Descriptor base address is recalculated from registers on each dispatch
- *   - Loopback is IL=0 OR EL=1 (not AND, not dependent on RE)
- *   - Boot ROM handling is not applicable for DEQNA
- * 
- * Ring Buffer Architecture
- * ------------------------
- * 
- *  ┌────────────────────────────────────────────────────────────────┐
- *  │                      BeagleBone (Linux)                        │
- *  │  ┌──────────────┐    ┌──────────────────────────────────────┐  │
- *  │  │ Host Network │───▶│ read_queue (up to 500 packets)       │  │
- *  │  │   (pcap)     │    │ std::deque in Linux memory           │  │
- *  │  └──────────────┘    └───────────────┬──────────────────────┘  │
- *  │                                      │ DMA                     │
- *  └──────────────────────────────────────│─────────────────────────┘
- *                                         ▼
- *  ┌────────────────────────────────────────────────────────────────┐
- *  │                    PDP-11 System Memory                        │
- *  │  ┌─────────────────────────────────────────────────────────┐   │
- *  │  │ RX Descriptor Ring (driver-allocated, 4-16 descriptors) │   │
- *  │  │ rbdl_ba → [desc0] → [desc1] → [desc2] → ... (C=0 ends)  │   │
- *  │  └─────────────────────────────────────────────────────────┘   │
- *  │  ┌─────────────────────────────────────────────────────────┐   │
- *  │  │ TX Descriptor Ring (driver-allocated, 4-16 descriptors) │   │
- *  │  │ xbdl_ba → [desc0] → [desc1] → [desc2] → ... (C=0 ends)  │   │
- *  │  └─────────────────────────────────────────────────────────┘   │
- *  └────────────────────────────────────────────────────────────────┘
- * 
- *  The read_queue is a staging buffer that allows packets to come in
- *  faster than the PDP-11 can process them. The state-machine loop
- *  dequeues packets from read_queue and DMA's them into the RX descriptor
- *  ring in PDP-11 memory.
- * 
- *  The same loop processes the TX descriptor ring and sends packets out
- *  via pcap.
- * 
+ * Copyright (c) 2024-2026 QUniBone project
  */
 
 #ifndef _DEQNA_HPP_
@@ -96,475 +14,146 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <string>
 #include <vector>
 #include <deque>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 
-#include "dec_ether_base.hpp"
-#include "parameter.hpp"
+#include "logger.hpp"
+#include "timeout.hpp"
+#include "qunibus.h"
+#include "qunibusadapter.hpp"
+#include "ddrmem.h"
+#include "qunibusdevice.hpp"
+#include "priorityrequest.hpp"
+#include "pcap_bridge.hpp"
 #include "deqna_regs.h"
 
-/*
- * Default DEQNA I/O page parameters
- * Base address 017774440 = IOPAGE + 014440 (octal)
- * Slot 18 is typical for network devices
- * Vector is software-programmable via VAR register (usually 0120 or similar)
- * Level 5 is standard for network devices (BR5)
- */
-#define DEQNA_DEFAULT_ADDR 014440
-#define DEQNA_DEFAULT_SLOT 18
-#define DEQNA_DEFAULT_VECTOR 0  // Vector is software-programmable via VAR register
-#define DEQNA_DEFAULT_LEVEL 5
+// Constants not in deqna_regs.h
+#define ETH_MIN_PACKET  60      // Minimum Ethernet packet size
+#define ETH_MAX_PACKET  1514    // Maximum Ethernet packet size
+#define QNA_FILTER_MAX  14      // Max MAC addresses in filter
 
-/*
- * DEQNA Device Class
- * ==================
- * Inherits from qunibusdevice_c to participate in the QUniBone device framework.
- * Provides all register handling, DMA operations, and network bridging for
- * DEQNA Ethernet controller emulation.
- */
-class deqna_c : public dec_ether_base_c {
+class deqna_c : public qunibusdevice_c {
 public:
     deqna_c();
-    ~deqna_c() override;
+    virtual ~deqna_c();
 
-    /*
-     * User-configurable parameters (set via menu system before install)
-     * -----------------------------------------------------------------
-     */
-    parameter_string_c ifname = parameter_string_c(this, "ifname", "if", false,
-            "Host interface for libpcap, e.g. \"eth0\"");
-    parameter_string_c mac = parameter_string_c(this, "mac", "mac", false,
-            "MAC address override (aa:bb:cc:dd:ee:ff), empty = device default");
-    parameter_bool_c promisc = parameter_bool_c(this, "promisc", "pr", false,
-            "Enable libpcap promiscuous capture");
-    parameter_unsigned_c rx_slots = parameter_unsigned_c(this, "rx_slots", "rx", false, "",
-            "%d", "RX ring scan limit (0 = no limit)", 0, 10);
-    parameter_unsigned_c tx_slots = parameter_unsigned_c(this, "tx_slots", "tx", false, "",
-            "%d", "TX ring scan limit (0 = no limit)", 0, 10);
-    parameter_unsigned_c rx_start_delay_ms = parameter_unsigned_c(this, "rx_start_delay_ms", "rxd", false, "",
-            "%d", "Receiver start delay in ms", 16, 10);
-    parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
-            "Trace CSR/ring events to log");
-
-    /*
-     * Read-only info (visible in menu with 'p')
-     */
-    parameter_string_c version = parameter_string_c(this, "version", "ver", true,
-            "DEQNA emulation version");
-
-    /*
-     * Read-only statistics (updated during operation, visible in menu)
-     */
-    parameter_unsigned64_c stat_rx_frames = parameter_unsigned64_c(this, "rx_frames", "rxf", true, "",
-            "%llu", "Received frames count", 64, 10);
-    parameter_unsigned64_c stat_tx_frames = parameter_unsigned64_c(this, "tx_frames", "txf", true, "",
-            "%llu", "Transmitted frames count", 64, 10);
-    parameter_unsigned64_c stat_rx_errors = parameter_unsigned64_c(this, "rx_errors", "rxe", true, "",
-            "%llu", "Receive error count", 64, 10);
-    parameter_unsigned64_c stat_tx_errors = parameter_unsigned64_c(this, "tx_errors", "txe", true, "",
-            "%llu", "Transmit error count", 64, 10);
-
-    /*
-     * QUniBone device framework callbacks
-     * -----------------------------------
-     * on_param_changed: Handle runtime parameter changes (MAC, promisc, etc.)
-     * on_before_install: Open pcap interface, validate configuration
-     * on_after_install: Reset controller to initial state
-     * on_after_uninstall: Close pcap, release resources
-     * on_power_changed: Handle DCLO (power fail) - reset on power restore
-     * on_init_changed: Handle BINIT signal - reset controller
-     * on_after_register_access: Process PDP-11 register writes
-     * worker: Entry point for the single state-machine worker loop
-     */
     bool on_param_changed(parameter_c *param) override;
     bool on_before_install(void) override;
     void on_after_install(void) override;
     void on_after_uninstall(void) override;
-
     void on_power_changed(signal_edge_enum aclo_edge, signal_edge_enum dclo_edge) override;
     void on_init_changed(void) override;
-
-    void on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
-            DATO_ACCESS access) override;
-
     void worker(unsigned instance) override;
 
 private:
-    /*
-     * Device Registers (directly accessed by PDP-11 via DATO/DATI)
-     * -------------------------------------------------------------
-     * reg_sta_addr[0-5]: Station Address registers (SA0-SA5)
-     *                    Read returns MAC address bytes (or checksum if EL set)
-     *                    Write has no effect
-     * reg_rcvlist_lo/hi: Receive descriptor list base address (22-bit)
-     *                    Writing RCLH triggers RX ring processing
-     * reg_xmtlist_lo/hi: Transmit descriptor list base address (22-bit)
-     *                    Writing XMTH triggers TX ring processing
-     * reg_vector:        Vector Address Register (VAR) - interrupt vector + mode
-     * reg_csr:           Control/Status Register - main device control
-     */
-    qunibusdevice_register_t *reg_sta_addr[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-    qunibusdevice_register_t *reg_rcvlist_lo = nullptr;
-    qunibusdevice_register_t *reg_rcvlist_hi = nullptr;
-    qunibusdevice_register_t *reg_xmtlist_lo = nullptr;
-    qunibusdevice_register_t *reg_xmtlist_hi = nullptr;
-    qunibusdevice_register_t *reg_vector = nullptr;
-    qunibusdevice_register_t *reg_csr = nullptr;
-
-    /*
-     * Thread synchronization
-     * ----------------------
-     * state_mutex: Protects device state (csr, rbdl_ba, ring state, setup, etc.)
-     * dma_mutex: Serializes DMA operations (inherited from base class)
-     * queue_mutex: Serializes queue access from PCAP callbacks
-     */
-    std::recursive_mutex state_mutex;
-    std::mutex queue_mutex;  // Serialize queue access from PCAP callbacks
-    // Note: reset_in_progress is inherited from dec_ether_base_c
-
-    /*
-     * Pending register writes from PDP-11
-     * -----------------------------------
-     * Register writes are captured atomically by on_after_register_access()
-     * and processed by the worker loop. This avoids DMA deadlocks where the
-     * PRU waits for bus grant while the CPU polls CSR waiting for completion.
-     *
-     * pending_reg_mask: Bitmask of registers with pending writes (bit N = reg N)
-     * pending_reg_byteflags[]: Which bytes were written (bit0=low, bit1=high)
-     * pending_reg_value[]: Written values for each register (byte writes merged)
-     */
-    std::atomic<uint16_t> pending_reg_mask{0};
-    std::atomic<uint8_t> pending_reg_byteflags[8];
-    std::atomic<uint16_t> pending_reg_value[8];
-
-    /*
-     * Setup packet state (from last processed setup frame)
-     * -----------------------------------------------------
-     * The setup packet configures the device's receive filter. It's sent
-     * as a transmit with the S (setup) bit set in the descriptor. Contains:
-     *   - Up to 14 multicast/unicast MAC addresses to accept
-     *   - Promiscuous mode flag
-     *   - Multicast all flag
-     *   - Sanity timer configuration
-     *   - LED control bits (l1/l2/l3)
-     */
-    struct setup_state {
-        bool valid = false;         // true after first setup packet processed
-        bool promiscuous = false;   // accept all packets
-        bool multicast = false;     // accept all multicast
-        bool l1 = true;             // LED 1 state (active low in hardware)
-        bool l2 = true;             // LED 2 state
-        bool l3 = true;             // LED 3 state
-        int sanity_timer = 0;       // unused legacy field
-        uint8_t macs[QNA_FILTER_MAX][6] = {{0}};  // up to 14 filter MACs
-    } setup;
-
-    /*
-     * Sanity timer state (watchdog timer)
-     * ------------------------------------
-     * If enabled, the sanity timer resets the controller if no TX completes
-     * within the configured timeout. This prevents hung driver situations.
-     * The timer is reset on each successful transmit.
-     *
-     * enabled: 0=off, 1=software sanity (from setup), 2=hardware sanity
-     * quarter_secs: timeout in 0.25-second units (from setup packet)
-     * max: timeout in service_timers() call units
-     * timer: countdown, reset on TX completion
-     */
-    struct sanity_state {
-        int enabled = 0; // 2=HW, 1=SW, 0=off
-        int quarter_secs = 0;
-        int max = 0;
-        int timer = 0;
-    } sanity;
-
-    /*
-     * Packet statistics
-     */
-    struct stats_state {
-        uint64_t recv = 0;    // packets received from network
-        uint64_t filter = 0;  // packets filtered out (unused currently)
-        uint64_t xmit = 0;    // packets transmitted
-        uint64_t fail = 0;    // transmit failures (NXM, etc.)
-        uint64_t runt = 0;    // received packets < 64 bytes (padded)
-        uint64_t giant = 0;   // received packets > 1518 bytes (truncated)
-        uint64_t setup = 0;   // setup packets processed
-        uint64_t loop = 0;    // loopback packets processed
-    } stats;
-
-    /*
-     * Packet buffer for RX/TX operations
-     * -----------------------------------
-     * msg: Packet data (up to ETH_FRAME_SIZE bytes)
-     * len: Total packet length
-     * used: Bytes already transferred (for multi-segment packets)
-     * status: Status code for completed packet
-     */
-    struct packet_buffer {
+    // Packet buffer structure
+    struct packet_t {
         std::vector<uint8_t> msg;
         size_t len = 0;
         size_t used = 0;
-        int status = 0;
-    } read_buffer, write_buffer;
-
-    /*
-     * Queue item for received packets waiting to be delivered
-     * --------------------------------------------------------
-     * type: Packet type for status word generation
-     *       0 = setup (ESETUP + length)
-     *       1 = loopback (status 0x2000 + length)
-     *       2 = normal receive (length only in status)
-     * enqueue_time: Timestamp when packet was enqueued (for loopback delay)
-     */
-    struct queue_item {
-        int type = 0; // 0=setup, 1=loopback, 2=normal
-        packet_buffer packet;
-        std::chrono::steady_clock::time_point enqueue_time;
+        int type = 2;  // 0=setup, 1=loopback, 2=normal
+        packet_t() : msg(ETH_MAX_PACKET + 64) {}
     };
 
-    /*
-     * Receive queue: packets waiting for RX descriptors
-     * --------------------------------------------------
-     * Packets are queued when received from pcap or loopback, then
-     * delivered to host memory when RX descriptors are available.
-     * If queue is full, oldest packets are dropped (read_queue_loss counts).
-     */
-    std::deque<queue_item> read_queue;
-    unsigned read_queue_loss = 0;
-
-    /*
-     * Descriptor ring state
-     * ----------------------
-     * rbdl[0]/rbdl[1]: Last written values to RCLL/RCLH registers
-     * xbdl[0]/xbdl[1]: Last written values to XMTL/XMTH registers
-     * var: Vector Address Register value (vector + mode bits)
-     * csr: Control/Status Register value
-     * irq: Current interrupt request state (true = asserting)
-     *
-     * rbdl_ba/xbdl_ba: Calculated 22-bit base addresses for current
-     *                  descriptor being processed. Recalculated from
-     *                  rbdl[]/xbdl[] on each dispatch.
-     */
-    uint16_t rbdl[2] = {0, 0};
-    uint16_t xbdl[2] = {0, 0};
-    uint16_t var = 0;
-    uint16_t csr = 0;
-    bool irq = false;
-
-    uint32_t rbdl_ba = 0;
-    uint32_t xbdl_ba = 0;
-    // Remember the last RX ring start we saw when packets remained queued.
-    // Used to avoid lapping a circular ring across process_rbdl() calls.
-    uint32_t last_rbdl_start = 0;
-    bool rbdl_wrap_guard = false;
-
-    /*
-     * MAC address state
-     * ------------------
-     * mac_override: true if user specified custom MAC via parameter
-     * mac_addr[6]: Current MAC address (device default or user-specified)
-     * mac_checksum[2]: Checksum of MAC for EL mode station register reads
-     */
-    bool mac_override = false;
-    uint8_t mac_addr[6] = {0};
-    uint8_t mac_checksum[2] = {0};
-
-    /*
-     * Device operational flags
-     * -------------------------
-     * deqna_lock: DEQNA compatibility mode locked (MS bit cleared)
-     * rx_delay_active: Artificial RX delay in effect (for timing compat)
-     * rx_enable_deadline_ns: Absolute time when RX delay expires
-     * rbdl_pending: RX list needs dispatching (RCLH written)
-     * tx_state: TX state machine (idle/active/wait_valid)
-     * tx_kick: TX list written event (XMTH write)
-     * idtmr: System ID timer countdown (sends MOP system ID periodically)
-     *
-     * Interrupt holdoff (post-reset protection)
-     * ------------------------------------------
-     * After sw_reset() or reset_controller(), there's a fragile window where
-     * the driver hasn't yet written the VAR (vector) register. If we assert
-     * INTR during this window, the CPU may fetch an invalid vector causing
-     * OD:010704 (odd address trap). The holdoff prevents INTR assertion until:
-     *   - VAR is written (clears holdoff immediately), OR
-     *   - A timeout expires (5ms safety fallback)
-     */
-    bool intr_holdoff_active = false;
-    uint64_t intr_holdoff_until_ns = 0;
-
-    enum class tx_state_enum {
-        idle,
-        active,
-        wait_valid
+    // Setup configuration
+    struct setup_t {
+        uint8_t macs[QNA_FILTER_MAX][6] = {};
+        bool valid = false;
+        bool promiscuous = false;
+        bool multicast = false;
     };
-    bool deqna_lock = false;
-    bool rx_delay_active = false;
-    uint64_t rx_enable_deadline_ns = 0;
-    bool rbdl_pending = false;
-    bool rbdl_hi_written = false;
-    tx_state_enum tx_state = tx_state_enum::idle;
-    bool tx_kick = false;
-    bool xbdl_hi_written = false;
-    uint32_t tx_wait_ba = 0;
-    uint64_t tx_wait_until_ns = 0;
-    unsigned tx_v0_retries = 0;
-    bool tx_invalid_dumped = false;
-    uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
-    uint64_t intr_pending_since_ns = 0; // Interrupt pending timestamp (for diagnostics)
 
-    int idtmr = 0;
+    // Parameters
+    parameter_string_c version = parameter_string_c(this, "version", "ver", /*readonly*/true,
+            "DEQNA driver version");
+    parameter_string_c ifname = parameter_string_c(this, "ifname", "if", false,
+            "Host interface for libpcap, e.g. \"eth0\"");
+    parameter_string_c mac = parameter_string_c(this, "mac", "mac", false,
+            "MAC address (aa:bb:cc:dd:ee:ff)");
+    parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
+            "Trace events to log");
 
-    /*
-     * Controller reset/initialization
-     * --------------------------------
-     * reset_controller: Full hardware reset (power-on, BINIT, sanity timeout)
-     * sw_reset: Software reset via SR bit in CSR (preserves some state)
-     */
-    void reset_controller(void);
-    void sw_reset(void);
+    // Bus requests
+    intr_request_c intr_request;
+    dma_request_c dma_request;
 
-    /*
-     * Register value update functions
-     * ---------------------------------
-     * These update the DATI (read) values of device registers to reflect
-     * current internal state. Called after state changes.
-     *
-     * update_mac_checksum: Recompute MAC checksum for EL mode reads
-     * update_station_regs: Update SA0-SA5 with MAC or checksum values
-     * update_vector_reg: Update VAR register read value
-     * update_csr_reg: Update CSR register read value
-     * update_transceiver_bits: Update OK/CA bits based on pcap state
-     * update_intr: Update interrupt signal based on IE and pending conditions
-     */
-    void update_mac_checksum(void);
-    void update_station_regs(void);
-    void update_vector_reg(void);
-    void update_csr_reg(void);
-    void update_transceiver_bits(void);
-    void update_intr(void) override;
-    void service_intr_complete(void);
+    // Network bridge
+    PcapBridge pcap;
 
-    /*
-     * Interrupt control
-     * ------------------
-     * set_int: Assert interrupt request (sets RI or XI in CSR)
-     * clr_int: Deassert interrupt request
-     * csr_set_clr: Atomic set/clear of CSR bits with interrupt side effects
-     * nxm_error: Handle NXM (non-existent memory) DMA error
-     */
-    void set_int(void);
-    void clr_int(void);
-    void process_deferred_interrupts(void);  // Now a no-op stub
-    bool wait_for_interrupt_ack(void);  // Now returns false immediately
-    void csr_set_clr(uint16_t set_bits, uint16_t clear_bits);
-    void note_xl_set(const char *reason, uint32_t desc_ba, const uint16_t *desc_words,
-            size_t desc_word_count);
-    void nxm_error(void);
+    // State protected by state_mutex
+    std::recursive_mutex state_mutex;
+    std::recursive_mutex dma_mutex;     // Serialize DMA operations
+    uint16_t csr = 0;                   // Control/Status Register
+    uint16_t var = 0;                   // Vector Address Register
+    uint16_t rbdl[2] = {0, 0};          // Receive base address registers
+    uint16_t xbdl[2] = {0, 0};          // Transmit base address registers
+    uint32_t rbdl_ba = 0;               // Current RX descriptor address
+    uint32_t xbdl_ba = 0;               // Current TX descriptor address
+    uint8_t mac_addr[6] = {};           // MAC address
+    setup_t setup;                      // Setup packet configuration
+    packet_t write_buffer;              // TX packet assembly buffer
+    std::atomic<bool> irq{false};       // Interrupt request pending (atomic for cross-thread visibility)
+    bool var_written = false;           // VAR has been written - interrupts allowed
+    bool tx_kick = false;               // TX dispatch requested
+    bool rx_kick = false;               // RX dispatch requested
+    
+    // STA ON deferred interrupt timing
+    uint64_t sta_on_deadline_ns = 0;    // When to assert OK bit after SR clear
+    static constexpr uint64_t STA_ON_DELAY_NS = 400000; // 400µs delay
 
-    /*
-     * Receiver startup delay (for OS compatibility)
-     */
-    void start_rx_delay(void);
-    bool rx_ready(void);
+    // Setup/loopback RX delivery timing (400µs delay like real hardware)
+    uint64_t setup_rx_deadline_ns = 0;  // When setup/loopback RX can be delivered
+    static constexpr uint64_t SETUP_RX_DELAY_NS = 400000; // 400µs delay
+    
+    // Interrupt cooldown - don't do DMA immediately after interrupt is cleared
+    // PRU may still be completing IACK cycle
+    uint64_t intr_cooldown_ns = 0;      // Time when DMA can resume after interrupt clear
+    static constexpr uint64_t INTR_COOLDOWN_NS = 100000; // 100µs cooldown after interrupt clear
 
-    /*
-     * Update libpcap BPF filter based on current setup/promisc state
-     */
-    void update_pcap_filter(void);
+    // RX queue protected by queue_mutex
+    std::mutex queue_mutex;
+    std::deque<packet_t> read_queue;
 
-    /*
-     * Register write handling
-     * ------------------------
-     * handle_register_write: Process a single register write
-     * apply_pending_reg_writes: Process all pending writes from atomic queue
-     */
-    void handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access);
-    void apply_pending_reg_writes(void);
+    // Atomic flags
+    std::atomic<bool> reset_in_progress{false};
 
-    // DMA operations are inherited from dec_ether_base_c.
+    // Core functions
+    void reset_controller();
+    void sw_reset();
+    
+    // Register access
+    void on_after_register_access(qunibusdevice_register_t *device_reg,
+                                   uint8_t unibus_control, DATO_ACCESS access) override;
+    void handle_register_write(uint8_t reg_idx, uint16_t value, DATO_ACCESS access);
+    void update_all_registers();  // Pre-populate all register DATI values
+    void csr_set_clr(uint16_t set_bits, uint16_t clr_bits);
+    void update_csr_reg();
+    void update_intr();
 
-    /*
-     * Address calculation
-     * --------------------
-     * Constructs 22-bit physical address from high/low register values,
-     * masking based on current bus address width (16/18/22 bit).
-     */
-    uint32_t make_addr(uint16_t hi, uint16_t lo) const;
+    // DMA helpers
+    bool dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount);
+    bool dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount);
+    uint32_t make_addr(uint16_t hi, uint16_t lo);
 
-    /*
-     * Receive queue management
-     * -------------------------
-     * enqueue_readq: Add a received packet to the queue
-     * process_rbdl: Process RX descriptors, deliver queued packets to host
-     * dispatch_rbdl: Entry point for RX ring processing (clears RL, recalc base)
-     */
-    void enqueue_readq(int type, const uint8_t *data, size_t len, int status);
-    bool process_rbdl(void);
-    bool dispatch_rbdl(void);
+    // TX processing
+    bool dispatch_xbdl();
+    bool process_xbdl();
+    void process_setup();
 
-    /*
-     * Transmit ring processing
-     * -------------------------
-     * process_xbdl: Process TX descriptors, send packets via pcap or loopback
-     * dispatch_xbdl: Entry point for TX ring processing (clears XL, recalc base)
-     * write_callback: Called after pcap send completes, updates descriptor status
-     */
-    bool process_xbdl(void);
-    bool dispatch_xbdl(void);
-    void write_callback(int status);
-
-    /*
-     * Packet filtering
-     * -----------------
-     * accept_packet: Determine if packet should be delivered to emulated NIC
-     */
-    bool accept_packet(const uint8_t *data, size_t len) const;
-
-    /*
-     * Setup packet processing
-     * ------------------------
-     * Parses the 128-byte setup frame to configure receive filters,
-     * promiscuous mode, sanity timer, etc.
-     */
-    void process_setup(void);
-
-    /* Debug helper: Dump RX/TX descriptor rings and CSR for diagnosis */
-    void dump_descriptor_rings(const char *reason);
-
-    /*
-     * Idle RX ring touch (debugging only, no DMA)
-     */
-    void touch_rbdl_if_idle(void);
-
-    /*
-     * Local packet processing (MOP protocols)
-     * ----------------------------------------
-     * process_local: Dispatch received MOP protocol packets
-     * process_loopback: Handle MOP loopback assistant protocol (90-00)
-     * process_remote_console: Handle MOP remote console protocol (02-60)
-     * send_system_id: Transmit MOP system ID message
-     */
-    bool process_local(const uint8_t *data, size_t len);
-    bool process_loopback(const uint8_t *data, size_t len);
-    bool process_remote_console(const uint8_t *data, size_t len);
-    bool send_system_id(const uint8_t *dest, uint16_t receipt_id);
-
-    /*
-     * Timer services
-     * ---------------
-     * reset_sanity_timer: Reset watchdog after successful TX
-     * service_timers: Called periodically to check sanity/ID timers
-     */
-    void reset_sanity_timer(void);
-    void service_timers(void);
-
-    /*
-     * Utility
-     */
-    static bool parse_mac(const std::string &text, uint8_t out[6]);
+    // RX processing  
+    bool dispatch_rbdl();
+    bool process_rbdl();
+    void enqueue_rx(int type, const uint8_t *data, size_t len);
+    
+    // Packet filtering
+    bool accept_packet(const uint8_t *data, size_t len);
+    bool mac_match(const uint8_t *a, const uint8_t *b);
+    bool mac_is_zero(const uint8_t *a);
+    bool mac_is_broadcast(const uint8_t *a);
+    bool mac_is_multicast(const uint8_t *a);
 };
 
-#endif
+#endif // _DEQNA_HPP_

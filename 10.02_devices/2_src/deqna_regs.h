@@ -9,14 +9,23 @@
 #include <stdint.h>
 
 // Register indices (word offsets from CSR base)
-#define DEQNA_REG_STA0        0
-#define DEQNA_REG_STA1        1
-#define DEQNA_REG_RCVLIST_LO  2
-#define DEQNA_REG_RCVLIST_HI  3
-#define DEQNA_REG_XMTLIST_LO  4
-#define DEQNA_REG_XMTLIST_HI  5
-#define DEQNA_REG_VECTOR      6
-#define DEQNA_REG_CSR         7
+// DEQNA has 8 registers: 6 MAC address bytes + VAR + CSR
+// Note: RCVLIST and XMTLIST are accessed via different mechanisms
+#define DEQNA_REG_STA0        0    // MAC byte 0 (low byte) + 0xFF (high byte)
+#define DEQNA_REG_STA1        1    // MAC byte 1
+#define DEQNA_REG_STA2        2    // MAC byte 2  
+#define DEQNA_REG_STA3        3    // MAC byte 3
+#define DEQNA_REG_STA4        4    // MAC byte 4
+#define DEQNA_REG_STA5        5    // MAC byte 5
+#define DEQNA_REG_VECTOR      6    // Vector Address Register
+#define DEQNA_REG_CSR         7    // Control/Status Register
+
+// Alternate names for receive/transmit list registers
+// These overlap with STA2-STA5 for write operations
+#define DEQNA_REG_RCVLIST_LO  2    // Same as STA2
+#define DEQNA_REG_RCVLIST_HI  3    // Same as STA3  
+#define DEQNA_REG_XMTLIST_LO  4    // Same as STA4
+#define DEQNA_REG_XMTLIST_HI  5    // Same as STA5
 
 // CSR bits (DEQNA)
 #define QE_RCV_ENABLE   0x0001
