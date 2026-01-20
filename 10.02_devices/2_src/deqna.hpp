@@ -398,7 +398,7 @@ private:
     enum class tx_state_enum {
         idle,
         active,
-        wait_valid
+        wait_valid  // Polling V=0 descriptor, waiting for driver to set V=1
     };
     bool deqna_lock = false;
     bool rx_delay_active = false;
@@ -408,10 +408,8 @@ private:
     tx_state_enum tx_state = tx_state_enum::idle;
     bool tx_kick = false;
     bool xbdl_hi_written = false;
-    uint32_t tx_wait_ba = 0;
-    uint64_t tx_wait_until_ns = 0;
-    unsigned tx_v0_retries = 0;
-    bool tx_invalid_dumped = false;
+    uint32_t tx_wait_ba = 0;           // Address we're polling for V=1
+    uint64_t tx_wait_until_ns = 0;     // Backoff timer for V=0 polling
     uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
     uint64_t intr_pending_since_ns = 0; // Interrupt pending timestamp (for diagnostics)
 

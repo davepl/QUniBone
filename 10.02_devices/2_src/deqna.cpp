@@ -179,7 +179,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v064";  // Fix: don't return after sw_reset, continue applying CSR bits (SIMH-compat)
+static const char *DEQNA_VERSION = "v080";  // Keep polling on V=0, don't treat as end-of-list
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -614,29 +614,43 @@ void deqna_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
     uint16_t saved_csr = csr;
     csr = static_cast<uint16_t>((csr | set_bits) & ~clear_bits);
 
-    // Determine if we need to change interrupt state
+    // Only assert interrupt if: IE set, XIRI pending, not already asserted
     bool should_assert = (csr & QNA_CSR_IE) && (csr & QNA_CSR_XIRI) && !irq;
-    bool should_deassert = irq && (!(csr & QNA_CSR_IE) || !(csr & QNA_CSR_XIRI));
+    
+    // Only deassert when IE is cleared - NOT when RI/XI are W1C cleared!
+    // The bus interrupt stays asserted until CPU fetches vector (service_intr_complete).
+    // This is the critical W1C fix (v074): the driver clears RI/XI during the ISR
+    // while the interrupt is still being acknowledged, and we must NOT deassert
+    // prematurely or the CPU will crash (OD:010704).
+    bool ie_cleared = (saved_csr & QNA_CSR_IE) && !(csr & QNA_CSR_IE);
+    bool should_deassert = irq && ie_cleared;
 
-    // Debug: trace XI/RI interrupt decisions
-    if ((set_bits & QNA_CSR_XIRI) && !should_assert) {
-        DEBUG("DEQNA: XI/RI set but NOT asserting INTR: csr=%06o IE=%d XI=%d RI=%d irq=%d",
-              csr, (csr & QNA_CSR_IE) ? 1 : 0, (csr & QNA_CSR_XI) ? 1 : 0,
-              (csr & QNA_CSR_RI) ? 1 : 0, irq ? 1 : 0);
+    // Log XI/RI transitions to debug interrupt delivery issues
+    bool xi_rising = (set_bits & QNA_CSR_XI) && !(saved_csr & QNA_CSR_XI);
+    bool ri_rising = (set_bits & QNA_CSR_RI) && !(saved_csr & QNA_CSR_RI);
+    bool xi_falling = (clear_bits & QNA_CSR_XI) && (saved_csr & QNA_CSR_XI);
+    bool ri_falling = (clear_bits & QNA_CSR_RI) && (saved_csr & QNA_CSR_RI);
+    if (xi_rising || ri_rising) {
+        DEBUG("DEQNA: %s%s rising: csr=%06o->%06o IE=%d irq=%d should_assert=%d",
+                xi_rising ? "XI" : "", ri_rising ? "RI" : "",
+                saved_csr, csr,
+                (csr & QNA_CSR_IE) ? 1 : 0, irq ? 1 : 0, should_assert ? 1 : 0);
+    }
+    if (xi_falling || ri_falling) {
+        DEBUG("DEQNA: %s%s falling (W1C): csr=%06o->%06o IE=%d irq=%d should_deassert=%d",
+                xi_falling ? "XI" : "", ri_falling ? "RI" : "",
+                saved_csr, csr,
+                (csr & QNA_CSR_IE) ? 1 : 0, irq ? 1 : 0, should_deassert ? 1 : 0);
     }
 
-    if (should_deassert)
+    if (should_deassert) {
         clr_int();
-    else if (should_assert)
+    } else if (should_assert) {
         set_int();
+    }
 
     update_transceiver_bits();
     update_csr_reg();
-
-    if (trace.value && ((saved_csr ^ csr) & (QNA_CSR_RL | QNA_CSR_XL | QNA_CSR_RI | QNA_CSR_XI))) {
-        DEBUG("DEQNA: CSR change prev=%06o now=%06o set=%06o clr=%06o",
-                saved_csr, csr, set_bits, clear_bits);
-    }
 }
 
 void deqna_c::note_xl_set(const char *reason, uint32_t desc_ba, const uint16_t *desc_words,
@@ -677,6 +691,9 @@ void deqna_c::service_intr_complete(void)
     if (!intr_request.complete)
         return;
     intr_request.complete = false;
+
+    DEBUG("DEQNA: IACK (vector fetched) csr=%06o XI=%d RI=%d irq=%d->0",
+            csr, (csr & QNA_CSR_XI) ? 1 : 0, (csr & QNA_CSR_RI) ? 1 : 0, irq ? 1 : 0);
 
     // OpenSIMH-compatible: clear the controller interrupt latch on vector fetch.
     // Note RI/XI bits remain set in CSR until cleared by the guest via W1C.
@@ -959,8 +976,6 @@ void deqna_c::reset_controller(void)
     xbdl_hi_written = false;
     tx_wait_ba = 0;
     tx_wait_until_ns = 0;
-    tx_v0_retries = 0;
-    tx_invalid_dumped = false;
     pending_reg_mask.store(0, std::memory_order_release);
     for (int i = 0; i < 8; ++i) {
         pending_reg_byteflags[i].store(0, std::memory_order_relaxed);
@@ -1013,8 +1028,6 @@ void deqna_c::sw_reset(void)
     tx_kick = false;
     tx_wait_ba = 0;
     tx_wait_until_ns = 0;
-    tx_v0_retries = 0;
-    tx_invalid_dumped = false;
     rbdl_ba = 0;
     xbdl_ba = 0;
     write_buffer.len = 0;
@@ -1033,11 +1046,8 @@ void deqna_c::sw_reset(void)
     intr_request.edge_detect_reset();
     intr_request.set_vector(var & QNA_VEC_IV);  // Ensure vector is valid after reset
 
-    // Set interrupt holdoff to protect the fragile post-reset window.
-    // Holdoff only applies immediately after reset and expires by timeout.
-    intr_holdoff_active = true;
-    intr_holdoff_until_ns = timeout_c::abstime_ns() + 2000000ull;  // 2ms
 
+    
     // Now safe to update MAC checksum and transceiver bits
     // update_transceiver_bits() sets OK directly in csr (no interrupt side effects)
     update_mac_checksum();
@@ -1049,12 +1059,9 @@ void deqna_c::sw_reset(void)
     // Reset dma_in_progress counter to known state (used by DMA helper functions)
     dma_in_progress.store(0, std::memory_order_release);
 
-    // Clear any pending register writes captured during reset.
-    pending_reg_mask.store(0, std::memory_order_release);
-    for (int i = 0; i < 8; ++i) {
-        pending_reg_byteflags[i].store(0, std::memory_order_relaxed);
-        pending_reg_value[i].store(0, std::memory_order_relaxed);
-    }
+    // NOTE: Do NOT clear pending_reg_mask here!
+    // The driver often writes XMTH/RCLH before clearing SR, and we must
+    // honor those writes. They will be processed in the worker loop.
 
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
@@ -1208,11 +1215,29 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         return;
 
     uint16_t val = get_register_dato_value(device_reg);
-    if (device_reg->index == DEQNA_REG_VECTOR || device_reg->index == DEQNA_REG_CSR) {
+    
+    // Process CSR, VAR, XMTH, and RCLH synchronously (like SIMH does).
+    // These are the "important" registers that trigger controller actions.
+    // XMTL and RCLL are just low-address halves that don't trigger anything by themselves.
+    if (device_reg->index == DEQNA_REG_VECTOR || 
+        device_reg->index == DEQNA_REG_CSR ||
+        device_reg->index == DEQNA_REG_XMTLIST_HI ||
+        device_reg->index == DEQNA_REG_RCVLIST_HI) {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         handle_register_write(static_cast<uint8_t>(device_reg->index), val, access);
         return;
     }
+    
+    // For XMTL and RCLL, update the register value directly (synchronously)
+    // but don't trigger any actions - those happen when the HI word is written.
+    if (device_reg->index == DEQNA_REG_XMTLIST_LO || 
+        device_reg->index == DEQNA_REG_RCVLIST_LO) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        handle_register_write(static_cast<uint8_t>(device_reg->index), val, access);
+        return;
+    }
+    
+    // Station address registers go through the pending mechanism (less time-critical)
     if (device_reg->index < 8) {
         const uint16_t byte_mask =
             (access == DATO_WORD) ? 0xffff :
@@ -1223,21 +1248,6 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
 
         if (pending_reg_mask.load(std::memory_order_acquire) & reg_bit) {
             const uint16_t base = pending_reg_value[device_reg->index].load(std::memory_order_relaxed);
-            merged = static_cast<uint16_t>((base & ~byte_mask) | (val & byte_mask));
-        } else if (device_reg->index >= DEQNA_REG_RCVLIST_LO &&
-                   device_reg->index <= DEQNA_REG_XMTLIST_HI) {
-            uint16_t base = 0;
-            {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                if (device_reg->index == DEQNA_REG_RCVLIST_LO)
-                    base = rbdl[0];
-                else if (device_reg->index == DEQNA_REG_RCVLIST_HI)
-                    base = rbdl[1];
-                else if (device_reg->index == DEQNA_REG_XMTLIST_LO)
-                    base = xbdl[0];
-                else if (device_reg->index == DEQNA_REG_XMTLIST_HI)
-                    base = xbdl[1];
-            }
             merged = static_cast<uint16_t>((base & ~byte_mask) | (val & byte_mask));
         }
 
@@ -1260,12 +1270,15 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
 
 void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access)
 {
-    if (trace.value) {
-        static const char *reg_names[] = {
-            "STA0", "STA1", "RCLL", "RCLH", "XMTL", "XMTH", "VAR", "CSR"
-        };
-        const char *rname = (reg_index < 8) ? reg_names[reg_index] : "???";
-        DEBUG("DEQNA: Write %s (reg %d) = %06o access=%d", rname, reg_index, val, access);
+    // Always log register writes to help debug protocol issues
+    static const char *reg_names[] = {
+        "STA0", "STA1", "RCLL", "RCLH", "XMTL", "XMTH", "VAR", "CSR"
+    };
+    const char *rname = (reg_index < 8) ? reg_names[reg_index] : "???";
+    // Log all writes except station address (too frequent/noisy)
+    if (reg_index >= DEQNA_REG_RCVLIST_LO) {
+        WARNING("DEQNA: Reg write %s=%06o access=%d csr=%06o",
+                rname, val, access, csr);
     }
 
     const uint16_t byte_mask =
@@ -1293,9 +1306,6 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         if (access != DATO_BYTEL)
             xbdl_hi_written = true;
         tx_kick = true;
-        tx_v0_retries = 0;
-        tx_wait_until_ns = 0;
-        tx_invalid_dumped = false;
         // Always log TX kicks to track what the driver is sending
         WARNING("DEQNA: TX KICK XMTH=%06o XMTL=%06o addr=%06o csr=%06o IL=%d EL=%d",
                 xbdl[1], xbdl[0], make_addr(xbdl[1], static_cast<uint16_t>(xbdl[0] & ~1u)),
@@ -1342,9 +1352,8 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
 
         // OpenSIMH-compatible: reset controller when SR transitions to cleared.
         // Only applies if the SR bit is actually being written (low byte or full word).
-        // IMPORTANT: Unlike earlier versions, do NOT return after sw_reset.
-        // OpenSIMH continues to apply csr_set_clr() after the reset, which allows
-        // the driver to set IE/RE in the same write that clears SR.
+        // CRITICAL: OpenSIMH RETURNS after sw_reset - does NOT apply remaining bits!
+        // The driver must make a separate CSR write to set IE/RE after the reset.
         if ((byte_mask & QNA_CSR_SR) && (prev & QNA_CSR_SR) && !(data_masked & QNA_CSR_SR)) {
             WARNING("DEQNA: SW reset by driver (qerestart): prev_csr=%06o RI=%d XI=%d RL=%d XL=%d irq=%d vec=%03o",
                     prev,
@@ -1355,13 +1364,9 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
                     irq ? 1 : 0,
                     var & QNA_VEC_IV);
             sw_reset();
-            // Fall through to apply remaining CSR bits (IE, RE, etc.)
-            // Recalculate set/clr bits based on post-reset CSR state
-            prev = csr;  // Update prev to post-reset value
-            set_bits = static_cast<uint16_t>(data_masked & rw_in_access);
-            clr_bits = static_cast<uint16_t>(((data_masked ^ rw_in_access) & rw_in_access) |
-                                              (data_masked & QNA_CSR_W1) |
-                                              ((data_masked & QNA_CSR_XI) ? QNA_CSR_NI : 0));
+            // Match OpenSIMH: RETURN immediately after sw_reset.
+            // The driver's IE/RE/IL/EL bits are IGNORED in this write.
+            return;
         }
 
         csr_set_clr(set_bits, clr_bits);
@@ -1408,9 +1413,10 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
 
 /* apply_pending_reg_writes - Apply pending register writes
  *
- * Processes any pending register writes that were deferred
- * from on_after_register_access. Called from the worker loop
- * to ensure register writes are handled in a thread-safe manner.
+ * Processes any pending station address register writes that were deferred
+ * from on_after_register_access. RCLL/RCLH/XMTL/XMTH/VAR/CSR are now
+ * processed synchronously in on_after_register_access (like SIMH does).
+ * Called from the worker loop to handle station address changes.
  */
 
 void deqna_c::apply_pending_reg_writes(void)
@@ -1419,8 +1425,16 @@ void deqna_c::apply_pending_reg_writes(void)
     if (!mask)
         return;
 
+    // Only station address registers (STA0=0, STA1=1) should be pending now
+    static const char *reg_names[] = {
+        "STA0", "STA1", "RCLL", "RCLH", "XMTL", "XMTH", "VAR", "CSR"
+    };
+    if (mask & ~0x03) {
+        WARNING("DEQNA: Unexpected pending reg mask=%04o (should only be STA0/STA1)", mask);
+    }
+
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
-    for (uint8_t idx = 0; idx < 8; ++idx) {
+    for (uint8_t idx = 0; idx < 2; ++idx) {  // Only check STA0 and STA1
         if (mask & static_cast<uint16_t>(1u << idx)) {
             uint16_t val = pending_reg_value[idx].load(std::memory_order_relaxed);
             uint8_t flags = pending_reg_byteflags[idx].exchange(0, std::memory_order_relaxed);
@@ -1430,6 +1444,8 @@ void deqna_c::apply_pending_reg_writes(void)
             } else if (!(flags & 0x01)) {
                 access = DATO_WORD;
             }
+            DEBUG("DEQNA: Apply pending %s=%06o flags=%02x access=%d",
+                    reg_names[idx], val, flags, access);
             handle_register_write(idx, val, access);
         }
     }
@@ -1598,6 +1614,7 @@ bool deqna_c::process_rbdl(void)
     }
 
     bool ri_pending = false;
+    bool xi_pending = false;  // Set XI when delivering setup/loopback echo
     unsigned processed = 0;
     // Limit RX processing per call to prevent TX starvation during floods.
     // Even if rx_slots.value is 0 (unlimited), impose a reasonable maximum
@@ -1899,8 +1916,7 @@ bool deqna_c::process_rbdl(void)
         const uint16_t rbl_low = static_cast<uint16_t>(report_rbl & 0x00FF);
         words[5] = static_cast<uint16_t>((rbl_low << 8) | rbl_low);
 
-        // Always log RX completion status for DHCP debugging
-        WARNING("DEQNA: RX COMPLETE type=%d pkt_len=%zu rbl_delivered=%zu report_rbl=%u st1=%06o st2=%06o desc=%06o",
+        DEBUG("DEQNA: RX COMPLETE type=%d pkt_len=%zu rbl_delivered=%zu report_rbl=%u st1=%06o st2=%06o desc=%06o",
                 item.type, item.packet.len, rbl, report_rbl, words[4], words[5], cur_ba + 8);
 
         if (trace.value) {
@@ -1922,6 +1938,10 @@ bool deqna_c::process_rbdl(void)
             read_queue.push_front(std::move(item));
         } else {
             ri_pending = true;
+            // For setup/loopback packets (type 0 or 1), we deferred XI from TX completion.
+            // Now that the echo packet is delivered, set XI along with RI.
+            if (item.type < 2)
+                xi_pending = true;
             stop_after_ri = true;
         }
 
@@ -1956,9 +1976,16 @@ bool deqna_c::process_rbdl(void)
         }
     }
 
-    if (ri_pending) {
+    if (ri_pending || xi_pending) {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
-        csr_set_clr(QNA_CSR_RI, 0);
+        // Set both RI and XI together for setup/loopback packets.
+        // This prevents the driver from accidentally W1C clearing XI before IACK.
+        uint16_t set_bits = 0;
+        if (ri_pending)
+            set_bits |= QNA_CSR_RI;
+        if (xi_pending)
+            set_bits |= QNA_CSR_XI;
+        csr_set_clr(set_bits, 0);
         update_csr_reg();
     }
 
@@ -2010,8 +2037,6 @@ bool deqna_c::dispatch_xbdl(void)
         // Always recalculate xbdl_ba from base registers when dispatching
         xbdl_ba = make_addr(xbdl[1], static_cast<uint16_t>(xbdl[0] & ~1u));
         tx_state = tx_state_enum::active;
-        tx_wait_ba = 0;
-        tx_wait_until_ns = 0;
         cur_ba = xbdl_ba;
         csr_snapshot = csr;
 
@@ -2049,9 +2074,9 @@ void deqna_c::write_callback(int status)
         len_snapshot = write_buffer.len;
     }
     const uint16_t TDR = static_cast<uint16_t>(100 + len_snapshot * 8);
-    // TX status word 1: 0x0000 = used, last segment, no errors
+    // TX status word 1: bit 13 is always set on completion (matches DEQNA/SIMH)
     // TX status word 2: TDR (Time Domain Reflectometry) value
-    uint16_t write_success[2] = {0x0000, static_cast<uint16_t>(TDR & 0x03FF)};
+    uint16_t write_success[2] = {0x2000, static_cast<uint16_t>(TDR & 0x03FF)};
     // OpenSIMH-compatible: on failure, status word 1 is set to QNA_DSC_C.
     uint16_t write_failure[2] = {QNA_DSC_C, static_cast<uint16_t>(TDR & 0x03FF)};
 
@@ -2168,9 +2193,6 @@ bool deqna_c::process_xbdl(void)
             note_xl_set("tx_desc_limit", cur_ba, nullptr, 0);
             csr_set_clr(static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_XI), 0);
             tx_state = tx_state_enum::idle;
-            tx_wait_ba = 0;
-            tx_wait_until_ns = 0;
-            tx_v0_retries = 0;
             write_buffer.len = 0;
             write_buffer.used = 0;
             process_deferred_interrupts();
@@ -2184,9 +2206,6 @@ bool deqna_c::process_xbdl(void)
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             nxm_error();
             tx_state = tx_state_enum::idle;
-            tx_wait_ba = 0;
-            tx_wait_until_ns = 0;
-            tx_v0_retries = 0;
             process_deferred_interrupts();
             return false;
         }
@@ -2203,7 +2222,6 @@ bool deqna_c::process_xbdl(void)
                 tx_state = tx_state_enum::idle;
                 tx_wait_ba = 0;
                 tx_wait_until_ns = 0;
-                tx_v0_retries = 0;
                 process_deferred_interrupts();
                 return false;
             }
@@ -2215,57 +2233,33 @@ bool deqna_c::process_xbdl(void)
             continue;
         }
 
-        // Check V (valid) bit - if clear, pause and wait for the driver
+        // Check V (valid) bit - if clear, wait and poll for driver to set it.
+        // The driver may just flip V=1 without writing XMTH, so we must keep polling.
+        // Do NOT set XL here - XL signals an error and causes the driver to reset.
         if (~words[1] & QNA_DSC_V) {
-            bool do_dump = false;
-            bool do_stuck_warn = false;
-            uint16_t xmtl = 0;
-            uint16_t xmth = 0;
-            unsigned prior_retry = 0;
-            const uint64_t v0_retry_delay_us = 1000;
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                if (trace.value && !tx_invalid_dumped) {
-                    tx_invalid_dumped = true;
-                    do_dump = true;
-                    xmtl = xbdl[0];
-                    xmth = xbdl[1];
-                }
-
-                prior_retry = tx_v0_retries;
-                // Defer while the descriptor is still being committed.
-                // Keep retrying until it becomes valid or XMTH is rewritten.
-                if (tx_v0_retries < UINT_MAX)
-                    tx_v0_retries += 1;
-                
-                // Warn if stuck waiting for V=1 for too long (>100ms)
-                if (tx_v0_retries == 100) {
-                    do_stuck_warn = true;
-                    xmtl = xbdl[0];
-                    xmth = xbdl[1];
-                }
-                
+                // Use 1ms backoff to avoid busy-spinning
+                const uint64_t backoff_us = 1000;
                 tx_state = tx_state_enum::wait_valid;
                 tx_wait_ba = cur_ba;
-                tx_wait_until_ns = timeout_c::abstime_ns() + v0_retry_delay_us * 1000ull;
+                tx_wait_until_ns = timeout_c::abstime_ns() + backoff_us * 1000ull;
                 write_buffer.len = 0;
                 write_buffer.used = 0;
             }
-
-            if (do_dump) {
-                DEBUG("DEQNA: TX desc V=0 @%06o XMTH=%06o XMTL=%06o "
-                      "w0=%06o w1=%06o w2=%06o w3=%06o w4=%06o w5=%06o defer=%u",
-                      cur_ba, xmth, xmtl, words[0], words[1], words[2],
-                      words[3], words[4], words[5], prior_retry == 0 ? 1u : 0u);
-            }
-            if (do_stuck_warn) {
-                WARNING("DEQNA: TX STUCK V=0 >100ms @%06o XMTH=%06o XMTL=%06o "
-                        "w0=%06o w1=%06o w2=%06o w3=%06o w4=%06o w5=%06o",
-                        cur_ba, xmth, xmtl, words[0], words[1], words[2],
-                        words[3], words[4], words[5]);
+            if (trace.value) {
+                DEBUG("DEQNA: TX V=0 @%06o - polling (waiting for driver to set V=1)",
+                      cur_ba);
             }
             process_deferred_interrupts();
             return true;
+        }
+
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            // Clear XL now that we have a valid descriptor
+            if (csr & QNA_CSR_XL)
+                csr_set_clr(0, QNA_CSR_XL);
         }
 
         // Mark descriptor processed/in-use by writing 0xFFFF to word[0] once V=1.
@@ -2277,7 +2271,6 @@ bool deqna_c::process_xbdl(void)
             tx_state = tx_state_enum::idle;
             tx_wait_ba = 0;
             tx_wait_until_ns = 0;
-            tx_v0_retries = 0;
             process_deferred_interrupts();
             return false;
         }
@@ -2285,7 +2278,6 @@ bool deqna_c::process_xbdl(void)
         // Calculate buffer address and length
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            tx_v0_retries = 0;
             tx_wait_until_ns = 0;
         }
         const bool setup_packet = (words[1] & QNA_DSC_S) != 0;
@@ -2380,7 +2372,6 @@ bool deqna_c::process_xbdl(void)
                     tx_state = tx_state_enum::idle;
                     tx_wait_ba = 0;
                     tx_wait_until_ns = 0;
-                    tx_v0_retries = 0;
                     process_deferred_interrupts();
                     return false;
                 }
@@ -2390,7 +2381,10 @@ bool deqna_c::process_xbdl(void)
                     write_buffer.len = 0;
                     write_buffer.used = 0;
                     reset_sanity_timer();
-                    csr_set_clr(QNA_CSR_XI, 0);  // Set transmit interrupt (deferred)
+                    // DON'T set XI here for setup/loopback packets!
+                    // The driver may W1C clear XI before IACK if we set it now.
+                    // Instead, XI will be set when the echo packet is delivered
+                    // in process_rbdl(), atomically with RI.
                     xbdl_ba = cur_ba + QE_RING_BYTES; // Advance to next descriptor
                 }
 
@@ -2459,7 +2453,6 @@ bool deqna_c::process_xbdl(void)
                 tx_state = tx_state_enum::idle;
                 tx_wait_ba = 0;
                 tx_wait_until_ns = 0;
-                tx_v0_retries = 0;
                 process_deferred_interrupts();
                 return false;
             }
@@ -2852,13 +2845,12 @@ void deqna_c::worker(unsigned instance)
                 tx_wait_until_ns = 0;
                 do_dispatch = true;
             } else if (tx_state == tx_state_enum::wait_valid) {
-                if (tx_v0_retries != 0) {
-                    const uint64_t now_ns = timeout_c::abstime_ns();
-                    if (tx_wait_until_ns == 0 || now_ns >= tx_wait_until_ns) {
-                        tx_state = tx_state_enum::active;
-                        tx_wait_until_ns = 0;
-                        do_process = true;
-                    }
+                // Polling V=0 descriptor - check if backoff timer expired
+                const uint64_t now_ns = timeout_c::abstime_ns();
+                if (tx_wait_until_ns == 0 || now_ns >= tx_wait_until_ns) {
+                    tx_state = tx_state_enum::active;
+                    tx_wait_until_ns = 0;
+                    do_process = true;
                 }
             } else if (tx_state == tx_state_enum::active) {
                 do_process = true;
@@ -2873,6 +2865,7 @@ void deqna_c::worker(unsigned instance)
         } else if (do_process) {
             if (!process_xbdl()) {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                // Don't go idle if we're polling V=0
                 if (tx_state != tx_state_enum::wait_valid)
                     tx_state = tx_state_enum::idle;
             }
@@ -2926,7 +2919,7 @@ void deqna_c::worker(unsigned instance)
                 }
                 // Log accepted packets
                 if (should_accept) {
-                    WARNING("DEQNA: RX ACCEPT len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x",
+                    DEBUG("DEQNA: RX ACCEPT len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x",
                           len,
                           pkt_buf[0], pkt_buf[1], pkt_buf[2], pkt_buf[3], pkt_buf[4], pkt_buf[5],
                           pkt_buf[6], pkt_buf[7], pkt_buf[8], pkt_buf[9], pkt_buf[10], pkt_buf[11]);
