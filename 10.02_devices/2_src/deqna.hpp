@@ -412,6 +412,11 @@ private:
     uint64_t tx_wait_until_ns = 0;     // Backoff timer for V=0 polling
     uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
     uint64_t intr_pending_since_ns = 0; // Interrupt pending timestamp (for diagnostics)
+    
+    // Deferred interrupt flags - set in bus callback context, processed by worker
+    std::atomic<bool> intr_deferred_set{false};   // Need to call set_int()
+    std::atomic<bool> intr_deferred_clr{false};   // Need to call clr_int()
+    std::atomic<bool> in_bus_callback{false};     // True while in on_after_register_access
 
     int idtmr = 0;
 

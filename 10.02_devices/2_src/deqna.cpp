@@ -614,6 +614,12 @@ void deqna_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
     uint16_t saved_csr = csr;
     csr = static_cast<uint16_t>((csr | set_bits) & ~clear_bits);
 
+    // Debug: Log when RI should be cleared
+    if ((clear_bits & QNA_CSR_RI) && (saved_csr & QNA_CSR_RI)) {
+        WARNING("DEQNA: csr_set_clr RI clear: saved_csr=%06o new_csr=%06o clear_bits=%06o",
+              saved_csr, csr, clear_bits);
+    }
+
     // Only assert interrupt if: IE set, XIRI pending, not already asserted
     bool should_assert = (csr & QNA_CSR_IE) && (csr & QNA_CSR_XIRI) && !irq;
     
@@ -643,10 +649,21 @@ void deqna_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
                 (csr & QNA_CSR_IE) ? 1 : 0, irq ? 1 : 0, should_deassert ? 1 : 0);
     }
 
-    if (should_deassert) {
-        clr_int();
-    } else if (should_assert) {
-        set_int();
+    // If we're in a bus callback, defer the interrupt operation to the worker loop.
+    // We can't safely call INTR() while the bus is busy with our register access.
+    if (in_bus_callback.load(std::memory_order_acquire)) {
+        if (should_deassert) {
+            intr_deferred_clr.store(true, std::memory_order_release);
+        } else if (should_assert) {
+            intr_deferred_set.store(true, std::memory_order_release);
+        }
+    } else {
+        // Safe to call interrupt functions directly
+        if (should_deassert) {
+            clr_int();
+        } else if (should_assert) {
+            set_int();
+        }
     }
 
     update_transceiver_bits();
@@ -773,8 +790,12 @@ void deqna_c::update_intr(void)
             intr_holdoff_active = false;
             DEBUG("DEQNA: Interrupt holdoff expired (timeout)");
         } else if (level) {
-            // Still in holdoff window - don't assert INTR, but log it
-            DEBUG("DEQNA: Interrupt holdoff active, deferring INTR assertion (irq=%d)", level ? 1 : 0);
+            // Still in holdoff window - can't assert INTR yet.
+            // CRITICAL FIX: Clear irq back to false so that csr_set_clr will
+            // see should_assert=true on the next attempt. Without this, irq
+            // stays true forever and no interrupt ever fires!
+            irq = false;
+            DEBUG("DEQNA: Interrupt holdoff active, clearing irq to allow retry (csr=%06o)", csr);
             return;
         }
     }
@@ -844,9 +865,33 @@ void deqna_c::update_intr(void)
 
 void deqna_c::process_deferred_interrupts(void)
 {
-    // SIMPLIFIED: This function is now a no-op. Interrupts are handled directly
-    // in csr_set_clr() when RI/XI bits change. Keeping this function as a stub
-    // to avoid modifying all call sites.
+    // Process any interrupt operations that were deferred from bus callback context.
+    // This is called from the worker loop when it's safe to interact with the bus.
+    
+    bool do_clr = intr_deferred_clr.exchange(false, std::memory_order_acq_rel);
+    bool do_set = intr_deferred_set.exchange(false, std::memory_order_acq_rel);
+    
+    // Clear takes priority over set (if both are somehow set)
+    if (do_clr) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        clr_int();
+    } else if (do_set) {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        // Re-verify the interrupt condition is still valid
+        if ((csr & QNA_CSR_IE) && (csr & QNA_CSR_XIRI) && !irq) {
+            set_int();
+        }
+    } else {
+        // CRITICAL FIX: Also check for interrupts that were blocked by holdoff.
+        // When holdoff is active, update_intr() clears irq and returns without
+        // asserting. We need to retry when holdoff expires.
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        if (!irq && (csr & QNA_CSR_IE) && (csr & QNA_CSR_XIRI)) {
+            // Interrupt condition exists but irq is not set - try to assert it.
+            // This handles the case where holdoff blocked the interrupt earlier.
+            set_int();
+        }
+    }
 }
 
 /*
@@ -981,6 +1026,10 @@ void deqna_c::reset_controller(void)
         pending_reg_byteflags[i].store(0, std::memory_order_relaxed);
         pending_reg_value[i].store(0, std::memory_order_relaxed);
     }
+    
+    // Clear deferred interrupt flags
+    intr_deferred_set.store(false, std::memory_order_release);
+    intr_deferred_clr.store(false, std::memory_order_release);
 
     sanity.enabled = 0;
     sanity.quarter_secs = QNA_HW_SANITY_SECS * 4;
@@ -1046,7 +1095,9 @@ void deqna_c::sw_reset(void)
     intr_request.edge_detect_reset();
     intr_request.set_vector(var & QNA_VEC_IV);  // Ensure vector is valid after reset
 
-
+    // Clear deferred interrupt flags
+    intr_deferred_set.store(false, std::memory_order_release);
+    intr_deferred_clr.store(false, std::memory_order_release);
     
     // Now safe to update MAC checksum and transceiver bits
     // update_transceiver_bits() sets OK directly in csr (no interrupt side effects)
@@ -1214,6 +1265,9 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     if (qunibus_control != QUNIBUS_CYCLE_DATO)
         return;
 
+    // Mark that we're in bus callback context - interrupts must be deferred
+    in_bus_callback.store(true, std::memory_order_release);
+
     uint16_t val = get_register_dato_value(device_reg);
     
     // Process CSR, VAR, XMTH, and RCLH synchronously (like SIMH does).
@@ -1225,6 +1279,7 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         device_reg->index == DEQNA_REG_RCVLIST_HI) {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         handle_register_write(static_cast<uint8_t>(device_reg->index), val, access);
+        in_bus_callback.store(false, std::memory_order_release);
         return;
     }
     
@@ -1234,6 +1289,7 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         device_reg->index == DEQNA_REG_RCVLIST_LO) {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         handle_register_write(static_cast<uint8_t>(device_reg->index), val, access);
+        in_bus_callback.store(false, std::memory_order_release);
         return;
     }
     
@@ -1260,6 +1316,8 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         pending_reg_byteflags[device_reg->index].fetch_or(flag, std::memory_order_relaxed);
         pending_reg_mask.fetch_or(reg_bit, std::memory_order_release);
     }
+    
+    in_bus_callback.store(false, std::memory_order_release);
 }
 
 /* handle_register_write - Process writes to DEQNA registers    
@@ -1349,6 +1407,12 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         uint16_t clr_bits = static_cast<uint16_t>(((data_masked ^ rw_in_access) & rw_in_access) |
                                                   (data_masked & QNA_CSR_W1) |
                                                   ((data_masked & QNA_CSR_XI) ? QNA_CSR_NI : 0));
+
+        // Debug: Log W1C attempts for RI/XI
+        if ((data_masked & QNA_CSR_W1) && (prev & QNA_CSR_W1)) {
+            WARNING("DEQNA: CSR W1C: val=%06o prev=%06o data_masked=%06o W1_in_data=%06o W1_in_prev=%06o clr_bits=%06o",
+                  val, prev, data_masked, data_masked & QNA_CSR_W1, prev & QNA_CSR_W1, clr_bits);
+        }
 
         // OpenSIMH-compatible: reset controller when SR transitions to cleared.
         // Only applies if the SR bit is actually being written (low byte or full word).
