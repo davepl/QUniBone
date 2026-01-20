@@ -179,7 +179,7 @@ static const uint16_t QNA_VEC_RW = QE_VEC_RW;  // Read-write bits mask
 /*
  * Version string - increment on each code change to verify running code freshness
  */
-static const char *DEQNA_VERSION = "v063";  // Add TX STUCK warning when V=0 persists >100ms
+static const char *DEQNA_VERSION = "v064";  // Fix: don't return after sw_reset, continue applying CSR bits (SIMH-compat)
 
 /*
  * Setup packet bit definitions (length field encodes these)
@@ -1342,6 +1342,9 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
 
         // OpenSIMH-compatible: reset controller when SR transitions to cleared.
         // Only applies if the SR bit is actually being written (low byte or full word).
+        // IMPORTANT: Unlike earlier versions, do NOT return after sw_reset.
+        // OpenSIMH continues to apply csr_set_clr() after the reset, which allows
+        // the driver to set IE/RE in the same write that clears SR.
         if ((byte_mask & QNA_CSR_SR) && (prev & QNA_CSR_SR) && !(data_masked & QNA_CSR_SR)) {
             WARNING("DEQNA: SW reset by driver (qerestart): prev_csr=%06o RI=%d XI=%d RL=%d XL=%d irq=%d vec=%03o",
                     prev,
@@ -1352,7 +1355,13 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
                     irq ? 1 : 0,
                     var & QNA_VEC_IV);
             sw_reset();
-            return;
+            // Fall through to apply remaining CSR bits (IE, RE, etc.)
+            // Recalculate set/clr bits based on post-reset CSR state
+            prev = csr;  // Update prev to post-reset value
+            set_bits = static_cast<uint16_t>(data_masked & rw_in_access);
+            clr_bits = static_cast<uint16_t>(((data_masked ^ rw_in_access) & rw_in_access) |
+                                              (data_masked & QNA_CSR_W1) |
+                                              ((data_masked & QNA_CSR_XI) ? QNA_CSR_NI : 0));
         }
 
         csr_set_clr(set_bits, clr_bits);
