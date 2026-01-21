@@ -182,6 +182,7 @@ public:
     bool on_param_changed(parameter_c *param) override;
     bool on_before_install(void) override;
     void on_after_install(void) override;
+    void on_before_uninstall(void) override;
     void on_after_uninstall(void) override;
 
     void on_power_changed(signal_edge_enum aclo_edge, signal_edge_enum dclo_edge) override;
