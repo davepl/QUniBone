@@ -1245,11 +1245,9 @@ bool deqna_c::process_xbdl(void)
         }
 
         if (~words[1] & QNA_DSC_V) {
-            const uint64_t backoff_us = 1000;
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             tx_state = tx_state_enum::wait_valid;
             tx_wait_ba = cur_ba;
-            tx_wait_until_ns = timeout_c::abstime_ns() + backoff_us * 1000ull;
             write_buffer.len = 0;
             write_buffer.used = 0;
             process_deferred_interrupts();
@@ -1528,12 +1526,7 @@ void deqna_c::worker(unsigned instance)
                 tx_wait_until_ns = 0;
                 do_dispatch = true;
             } else if (tx_state == tx_state_enum::wait_valid) {
-                const uint64_t now_ns = timeout_c::abstime_ns();
-                if (tx_wait_until_ns == 0 || now_ns >= tx_wait_until_ns) {
-                    tx_state = tx_state_enum::active;
-                    tx_wait_until_ns = 0;
-                    do_process = true;
-                }
+                do_process = true;
             } else if (tx_state == tx_state_enum::active) {
                 do_process = true;
             }
