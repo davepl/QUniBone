@@ -1,22 +1,22 @@
-/*
- * DEQNA Ethernet Controller Emulation for QUniBone
- * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
- * Contributed under the BSD License
- *
- * This implementation is derived from DEC DEQNA documentation and the
- * OpenSIMH PDP-11 xq (DEQNA) emulator. OpenSIMH attribution:
- *
- *   Copyright (c) 1993-2008, Robert M Supnik
- *   Permission is hereby granted, free of charge, to any person obtaining a
- *   copy of this software and associated documentation files (the "Software"),
- *   to deal in the Software without restriction, including without limitation
- *   the rights to use, copy, modify, merge, publish, distribute, sublicense,
- *   and/or sell copies of the Software, and to permit persons to whom the
- *   Software is furnished to do so, subject to the following conditions:
- *
- *   The above copyright notice and this permission notice shall be included in
- *   all copies or substantial portions of the Software.
- */
+//
+// DEQNA Ethernet Controller Emulation for QUniBone
+// (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
+// Contributed under the BSD License
+//
+// This implementation is derived from DEC DEQNA documentation and the
+// OpenSIMH PDP-11 xq (DEQNA) emulator. OpenSIMH attribution:
+//
+//   Copyright (c) 1993-2008, Robert M Supnik
+//   Permission is hereby granted, free of charge, to any person obtaining a
+//   copy of this software and associated documentation files (the "Software"),
+//   to deal in the Software without restriction, including without limitation
+//   the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//   and/or sell copies of the Software, and to permit persons to whom the
+//   Software is furnished to do so, subject to the following conditions:
+//
+//   The above copyright notice and this permission notice shall be included in
+//   all copies or substantial portions of the Software.
+//
 
 #include <string.h>
 #include <stdio.h>
@@ -34,90 +34,6 @@
 #if !defined(QBUS)
 #error "DEQNA is a QBUS-only device"
 #endif
-
-static const size_t ETH_MIN_PACKET = 60;    // Minimum Ethernet frame (no CRC)
-static const size_t ETH_MAX_PACKET = 1514;  // Maximum Ethernet frame (no CRC)
-static const size_t ETH_FRAME_SIZE = 1518;  // Frame + CRC space
-
-static const unsigned QNA_QUE_MAX = 64;
-static const unsigned QNA_SERVICE_INTERVAL = 100; // Timer service rate (Hz)
-static const unsigned QNA_HW_SANITY_SECS = 240;
-
-static const uint16_t QNA_DSC_V = QE_RING_VALID;
-static const uint16_t QNA_DSC_C = QE_RING_CHAIN;
-static const uint16_t QNA_DSC_E = QE_RING_EOMSG;
-static const uint16_t QNA_DSC_S = QE_RING_SETUP;
-static const uint16_t QNA_DSC_L = QE_RING_ODD_END;
-static const uint16_t QNA_DSC_H = QE_RING_ODD_BEGIN;
-
-static const uint16_t QNA_CSR_RI = QE_RCV_INT;
-static const uint16_t QNA_CSR_PE = QE_PARITY;
-static const uint16_t QNA_CSR_CA = QE_CARRIER;
-static const uint16_t QNA_CSR_OK = QE_OK;
-static const uint16_t QNA_CSR_SE = QE_STIM_ENABLE;
-static const uint16_t QNA_CSR_EL = QE_ELOOP;
-static const uint16_t QNA_CSR_IL = QE_ILOOP;
-static const uint16_t QNA_CSR_XI = QE_XMIT_INT;
-static const uint16_t QNA_CSR_IE = QE_INT_ENABLE;
-static const uint16_t QNA_CSR_RL = QE_RL_INVALID;
-static const uint16_t QNA_CSR_XL = QE_XL_INVALID;
-static const uint16_t QNA_CSR_NI = QE_NEX_MEM_INT;
-static const uint16_t QNA_CSR_SR = QE_RESET;
-static const uint16_t QNA_CSR_RE = QE_RCV_ENABLE;
-
-static const uint16_t QNA_CSR_RO = QE_CSR_RO;
-static const uint16_t QNA_CSR_RW = QE_CSR_RW;
-static const uint16_t QNA_CSR_W1 = QE_CSR_W1;
-static const uint16_t QNA_CSR_BP = QE_CSR_BP;
-static const uint16_t QNA_CSR_XIRI = (QNA_CSR_XI | QNA_CSR_RI);
-
-static const uint16_t QNA_VEC_MS = QE_VEC_MS;
-static const uint16_t QNA_VEC_OS = QE_VEC_OS;
-static const uint16_t QNA_VEC_RS = QE_VEC_RS;
-static const uint16_t QNA_VEC_ST = QE_VEC_ST;
-static const uint16_t QNA_VEC_IV = QE_VEC_IV;
-static const uint16_t QNA_VEC_ID = QE_VEC_ID;
-static const uint16_t QNA_VEC_RO = QE_VEC_RO;
-static const uint16_t QNA_VEC_RW = QE_VEC_RW;
-
-static const char *DEQNA_VERSION = "v090";  // Simplified refactor, OpenSIMH-aligned
-
-static const uint16_t QNA_SETUP_MC = 0x0001;  // Accept all multicast
-static const uint16_t QNA_SETUP_PM = 0x0002;  // Promiscuous mode
-static const uint16_t QNA_SETUP_LD = 0x000C;  // LED control bits
-static const uint16_t QNA_SETUP_ST = 0x0070;  // Sanity timer setting
-
-static bool mac_is_zero(const uint8_t *mac)
-{
-    return mac[0] == 0 && mac[1] == 0 && mac[2] == 0 &&
-           mac[3] == 0 && mac[4] == 0 && mac[5] == 0;
-}
-
-static bool mac_is_broadcast(const uint8_t *mac)
-{
-    return mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff &&
-           mac[3] == 0xff && mac[4] == 0xff && mac[5] == 0xff;
-}
-
-static bool mac_is_multicast(const uint8_t *mac)
-{
-    return (mac[0] & 0x01) != 0;
-}
-
-static bool mac_equal(const uint8_t *a, const uint8_t *b)
-{
-    return memcmp(a, b, 6) == 0;
-}
-
-static uint8_t word_low(uint16_t w)
-{
-    return static_cast<uint8_t>(w & 0xff);
-}
-
-static uint8_t word_high(uint16_t w)
-{
-    return static_cast<uint8_t>((w >> 8) & 0xff);
-}
 
 deqna_c::deqna_c() : dec_ether_base_c()
 {
@@ -224,6 +140,10 @@ deqna_c::~deqna_c()
 #endif
 }
 
+// Parse MAC address string in format "aa:bb:cc:dd:ee:ff" into byte array.
+// Called by on_param_changed when user sets the mac parameter.
+// Returns true on success, false if format is invalid.
+
 bool deqna_c::parse_mac(const std::string &text, uint8_t out[6])
 {
     unsigned values[6];
@@ -240,6 +160,8 @@ bool deqna_c::parse_mac(const std::string &text, uint8_t out[6])
     }
     return true;
 }
+
+// Called when a Quniboine paramter, like interurupt level or slot number, is changed
 
 bool deqna_c::on_param_changed(parameter_c *param)
 {
@@ -278,6 +200,10 @@ bool deqna_c::on_param_changed(parameter_c *param)
     return qunibusdevice_c::on_param_changed(param);
 }
 
+// Called before installing the device into the QBUS system.
+// Opens the pcap interface and validates configuration.
+// Returns true on success, false on failure.
+
 bool deqna_c::on_before_install(void)
 {
 #ifndef HAVE_PCAP
@@ -312,6 +238,9 @@ bool deqna_c::on_before_install(void)
 #endif
 }
 
+// Called after installing the device into the QBUS system.
+// Resets the controller to initial state.
+
 void deqna_c::on_after_install(void)
 {
     reset_controller();
@@ -326,8 +255,8 @@ void deqna_c::on_before_uninstall(void)
     const uint64_t wait_ns = 200000000ull; // 200ms
     while (timeout_c::abstime_ns() - start_ns < wait_ns) {
         bool any_running = false;
-        for (const auto &worker : workers) {
-            if (worker.running) {
+        for (const auto &w : workers) {
+            if (w.running) {
                 any_running = true;
                 break;
             }
@@ -336,9 +265,7 @@ void deqna_c::on_before_uninstall(void)
             return;
         timeout.wait_ms(1);
     }
-
-    WARNING("DEQNA: on_before_uninstall: worker still running after 200ms, "
-            "continuing shutdown");
+    WARNING("DEQNA: on_before_uninstall: worker still running after 200ms, continuing shutdown");
 }
 
 void deqna_c::on_after_uninstall(void)
@@ -371,6 +298,9 @@ void deqna_c::on_init_changed(void)
         reset_controller();
 }
 
+// Compute checksum of MAC address for external loopback mode.
+// In EL mode, station address registers return the checksum instead of the MAC.
+// Called by reset_controller, sw_reset, and on_param_changed when MAC changes.
 void deqna_c::update_mac_checksum(void)
 {
     uint32_t checksum = 0;
@@ -391,6 +321,9 @@ void deqna_c::update_mac_checksum(void)
     mac_checksum[1] = static_cast<uint8_t>(checksum >> 8);
 }
 
+// Update the DATI (read) values of station address registers 0-5.
+// Returns MAC address bytes in normal mode, checksum bytes in EL mode.
+// Called whenever MAC changes or loopback mode changes.
 void deqna_c::update_station_regs(void)
 {
     if (!handle)
@@ -408,6 +341,8 @@ void deqna_c::update_station_regs(void)
     }
 }
 
+// Update the DATI (read) value of the vector register.
+// Called after reset or when VAR is modified.
 void deqna_c::update_vector_reg(void)
 {
     if (!handle)
@@ -415,6 +350,8 @@ void deqna_c::update_vector_reg(void)
     set_register_dati_value(reg_vector, var, "update_vector_reg");
 }
 
+// Update the DATI (read) value of the CSR register.
+// Called after any CSR bit changes via csr_set_clr.
 void deqna_c::update_csr_reg(void)
 {
     if (!handle)
@@ -422,6 +359,9 @@ void deqna_c::update_csr_reg(void)
     set_register_dati_value(reg_csr, csr, "update_csr_reg");
 }
 
+// Update CSR transceiver status bits (OK = link up, CA = carrier).
+// OK bit reflects whether pcap is open and operational.
+// Called after pcap open/close or CSR changes.
 void deqna_c::update_transceiver_bits(void)
 {
     if (pcap.is_open())
@@ -432,6 +372,9 @@ void deqna_c::update_transceiver_bits(void)
     csr &= ~QNA_CSR_CA;
 }
 
+// Assert interrupt request to the PRU/QBUS.
+// Sets internal irq flag and calls update_intr() to propagate to hardware.
+// Called when RI or XI bits set in CSR with IE enabled.
 void deqna_c::set_int(void)
 {
     irq = true;
@@ -445,6 +388,12 @@ void deqna_c::clr_int(void)
     update_intr();
 }
 
+// Evaluate interrupt request and propagate to PRU.
+// Gates interrupt signal based on:
+// - irq flag (internal request)
+// - dma_in_progress (defer interrupt during DMA to prevent deadlock)
+// - intr_holdoff_active (post-reset protection window)
+// Called by set_int, clr_int, on_dma_quiet, and after holdoff expires.
 void deqna_c::update_intr(void)
 {
     bool level = irq && (dma_in_progress.load(std::memory_order_relaxed) == 0);
@@ -478,12 +427,19 @@ void deqna_c::update_intr(void)
     }
 }
 
+// Called by base class when DMA operations complete (dma_in_progress drops to 0).
+// Re-evaluates interrupt state now that DMA is idle and interrupt can be safely asserted.
+// This prevents DMA/interrupt deadlock where PRU waits for bus grant while CPU polls CSR.
 void deqna_c::on_dma_quiet(void)
 {
     // DMA just went idle; re-evaluate interrupt level.
     update_intr();
 }
 
+// Process deferred interrupt assertions/deassertions.
+// When in bus callback context (on_after_register_access), interrupt changes are deferred
+// to avoid recursion. Worker thread calls this after processing descriptors.
+// Checks atomic flags intr_deferred_set/clr and applies the interrupt state change.
 void deqna_c::process_deferred_interrupts(void)
 {
     bool do_clr = intr_deferred_clr.exchange(false, std::memory_order_acq_rel);
@@ -500,6 +456,11 @@ void deqna_c::process_deferred_interrupts(void)
     }
 }
 
+// Atomically set and clear CSR bits, managing interrupt side effects.
+// Called throughout the code to modify CSR status bits (RI, XI, RL, XL, etc.).
+// Handles interrupt assertion/deassertion via deferred flags if in bus callback context,
+// or directly if in worker context.
+// Always updates CSR register DATI value and transceiver bits.
 void deqna_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
 {
     uint16_t saved_csr = csr;
@@ -525,15 +486,6 @@ void deqna_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
     update_csr_reg();
 }
 
-void deqna_c::note_xl_set(const char *reason, uint32_t desc_ba, const uint16_t *desc_words,
-        size_t desc_word_count)
-{
-    UNUSED(reason);
-    UNUSED(desc_ba);
-    UNUSED(desc_words);
-    UNUSED(desc_word_count);
-}
-
 void deqna_c::service_intr_complete(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -548,6 +500,9 @@ bool deqna_c::wait_for_interrupt_ack(void)
     return false;
 }
 
+// Report non-existent memory (NXM) error for both RX and TX.
+// Sets RL, XL, and NI bits in CSR and increments TX error counter.
+// Legacy function kept for compatibility but prefer rx_nxm_error/tx_nxm_error.
 void deqna_c::nxm_error(void)
 {
     const uint16_t set_bits = QNA_CSR_XI | QNA_CSR_XL | QNA_CSR_RL | QNA_CSR_NI;
@@ -556,6 +511,29 @@ void deqna_c::nxm_error(void)
     stat_tx_errors.value = stats.fail;
 }
 
+// Report RX-specific NXM (non-existent memory) DMA error.
+// Sets RL and NI bits in CSR. Does not increment error counters (rx_errors tracked separately).
+// Called when RX descriptor or packet data DMA fails.
+void deqna_c::rx_nxm_error(void)
+{
+    const uint16_t set_bits = QNA_CSR_RL | QNA_CSR_NI;
+    csr_set_clr(set_bits, 0);
+}
+
+// Report TX-specific NXM (non-existent memory) DMA error.
+// Sets XL, XI, and NI bits in CSR and increments TX error counter.
+// Called when TX descriptor or packet data DMA fails.
+void deqna_c::tx_nxm_error(void)
+{
+    const uint16_t set_bits = QNA_CSR_XI | QNA_CSR_XL | QNA_CSR_NI;
+    csr_set_clr(set_bits, 0);
+    stats.fail++;
+    stat_tx_errors.value = stats.fail;
+}
+
+// Check if receiver is ready to accept packets.
+// Returns true if RE (receive enable) is set and RL (receive list invalid) is clear.
+// Called by worker thread before enqueuing received packets.
 bool deqna_c::rx_ready(void)
 {
     if (!(csr & QNA_CSR_RE))
@@ -570,6 +548,9 @@ void deqna_c::start_rx_delay(void)
     rx_delay_active = false;
 }
 
+// Reset the sanity watchdog timer.
+// Called after successful TX completion to prevent sanity timeout.
+// If timer expires without TX activity, controller resets (safety mechanism).
 void deqna_c::reset_sanity_timer(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -578,6 +559,10 @@ void deqna_c::reset_sanity_timer(void)
     sanity.timer = sanity.max;
 }
 
+// Service periodic timers (sanity watchdog).
+// Called by worker thread each iteration to decrement timer counters.
+// If sanity timer expires, triggers reset_controller().
+// Uses fixed tick rate of QNA_SERVICE_INTERVAL Hz.
 void deqna_c::service_timers(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -604,6 +589,11 @@ void deqna_c::service_timers(void)
     }
 }
 
+// Full hardware reset of DEQNA controller.
+// Resets all state: CSR, VAR, descriptor pointers, queues, setup, timers.
+// Cancels any pending PRU interrupt requests to clear hardware state.
+// Called by: power-on, DCLO, BINIT, sanity timeout.
+// More thorough than sw_reset() which preserves some operational state.
 void deqna_c::reset_controller(void)
 {
     reset_in_progress.store(true, std::memory_order_release);
@@ -674,6 +664,11 @@ void deqna_c::reset_controller(void)
     reset_in_progress.store(false, std::memory_order_release);
 }
 
+// Software reset triggered by SR bit in CSR.
+// Lighter than full hardware reset - preserves setup packet configuration.
+// Clears descriptor rings, queues, and resets state machine but keeps network config.
+// Cancels PRU interrupts and logs detailed state for diagnostics.
+// Called when driver writes SR=1 to CSR.
 void deqna_c::sw_reset(void)
 {
     reset_in_progress.store(true, std::memory_order_release);
@@ -748,6 +743,15 @@ void deqna_c::sw_reset(void)
     reset_in_progress.store(false, std::memory_order_release);
 }
 
+// Update libpcap BPF filter to match current receive configuration.
+// Constructs filter string based on:
+// - Promiscuous mode (accept all)
+// - Device MAC address
+// - Setup packet filter MACs (up to 14 addresses)
+// - Multicast all mode
+// Called after setup packet processing, MAC changes, or promisc mode changes.
+// Filters packets at kernel level to reduce unnecessary processing.
+
 void deqna_c::update_pcap_filter(void)
 {
 #ifdef HAVE_PCAP
@@ -783,6 +787,16 @@ void deqna_c::update_pcap_filter(void)
 #endif
 }
 
+// Determine if received packet should be accepted by emulated NIC.
+// Checks destination MAC against:
+// - Promiscuous mode (accept all)
+// - Device MAC address
+// - Broadcast address
+// - Multicast (if multicast mode enabled)
+// - Setup filter MACs (up to 14 addresses)
+// Called by worker thread for each received packet.
+// Returns true if packet should be delivered to driver.
+
 bool deqna_c::accept_packet(const uint8_t *data, size_t len) const
 {
     if (!data || len < 6)
@@ -809,6 +823,11 @@ bool deqna_c::accept_packet(const uint8_t *data, size_t len) const
     return false;
 }
 
+// Construct 22-bit physical address from descriptor high/low words.
+// Masks address bits based on bus width (16/18/22 bit addressing).
+// Called when reading descriptor chain pointers or buffer addresses.
+// Returns combined address suitable for DMA operations.
+
 uint32_t deqna_c::make_addr(uint16_t hi, uint16_t lo) const
 {
     uint16_t mask = QE_RING_ADDR_HI_MASK;
@@ -820,6 +839,12 @@ uint32_t deqna_c::make_addr(uint16_t hi, uint16_t lo) const
     }
     return (static_cast<uint32_t>(hi & mask) << 16) | lo;
 }
+
+// QUniBone framework callback after CPU writes to device register.
+// Called in bus cycle context (cannot block or do DMA).
+// Sets in_bus_callback flag to defer interrupt changes.
+// Delegates to handle_register_write() for actual processing.
+// Only processes DATO (write) cycles, not DATI (read).
 
 void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
         DATO_ACCESS access)
@@ -838,17 +863,30 @@ void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     in_bus_callback.store(false, std::memory_order_release);
 }
 
+// Process write to a DEQNA register.
+// Handles byte and word writes with proper merging.
+// Key behaviors:
+// - RCLL/RCLH writes trigger RX ring dispatch
+// - XMTL/XMTH writes trigger TX ring dispatch
+// - VAR write clears interrupt holdoff
+// - CSR write handles SR (reset), IE, RE, loopback modes
+// Called by on_after_register_access() in bus callback context.
+
 void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access)
 {
-    const uint16_t byte_mask =
-        (access == DATO_WORD) ? 0xffff :
-        (access == DATO_BYTEH) ? 0xff00 :
-        0x00ff;
+    // Determine byte mask based on access type: word, high byte, or low byte.
+
+    const uint16_t byte_mask = (access == DATO_WORD) ? 0xffff : (access == DATO_BYTEH) ? 0xff00 : 0x00ff;
 
     switch (reg_index) {
+    
+    // Handle writes to receive descriptor list pointer low part
     case DEQNA_REG_RCVLIST_LO:
         rbdl[0] = static_cast<uint16_t>((rbdl[0] & ~byte_mask) | (val & byte_mask));
         break;
+
+    // Handle writes to receive descriptor list pointer high part
+
     case DEQNA_REG_RCVLIST_HI:
         rbdl[1] = static_cast<uint16_t>((rbdl[1] & ~byte_mask) | (val & byte_mask));
         if (access == DATO_WORD) {
@@ -871,9 +909,15 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
             }
         }
         break;
+
+    // Handle writes to transmit descriptor list pointer low part
+
     case DEQNA_REG_XMTLIST_LO:
         xbdl[0] = static_cast<uint16_t>((xbdl[0] & ~byte_mask) | (val & byte_mask));
         break;
+
+    // Handle writes to transmit descriptor list pointer high part
+
     case DEQNA_REG_XMTLIST_HI:
         xbdl[1] = static_cast<uint16_t>((xbdl[1] & ~byte_mask) | (val & byte_mask));
         if (access == DATO_WORD) {
@@ -896,6 +940,9 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
             }
         }
         break;
+
+    // Set the VAR (vector) register, merging bytes as needed.
+
     case DEQNA_REG_VECTOR: {
         uint16_t merged = var;
         if (access == DATO_WORD)
@@ -918,6 +965,9 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
             intr_holdoff_active = false;
         break;
     }
+
+    // Set the CSR register with proper handling of special bits.
+
     case DEQNA_REG_CSR: {
         uint16_t prev = csr;
         const uint16_t data_masked = static_cast<uint16_t>(val & byte_mask);
@@ -928,14 +978,14 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
 
         uint16_t set_bits = static_cast<uint16_t>(w1c_only ? 0 : (data_masked & rw_in_access));
         uint16_t clr_bits = 0;
-        if (w1c_only) {
-            clr_bits = static_cast<uint16_t>(w1_in_data |
-                                             ((w1_in_data & QNA_CSR_XI) ? QNA_CSR_NI : 0));
-        } else {
-            clr_bits = static_cast<uint16_t>(((data_masked ^ rw_in_access) & rw_in_access) |
-                                             w1_in_data |
-                                             ((data_masked & QNA_CSR_XI) ? QNA_CSR_NI : 0));
-        }
+        
+        if (w1c_only) 
+            clr_bits = static_cast<uint16_t>(w1_in_data | ((w1_in_data & QNA_CSR_XI) ? QNA_CSR_NI : 0));
+         else
+            clr_bits = static_cast<uint16_t>(((data_masked ^ rw_in_access) & rw_in_access) | w1_in_data | ((data_masked & QNA_CSR_XI) ? QNA_CSR_NI : 0));
+        
+
+        // Handle software reset (SR) bit separately.  Edge-triggered on 1->0 transition.
 
         if ((byte_mask & QNA_CSR_SR) && (prev & QNA_CSR_SR) && !(data_masked & QNA_CSR_SR)) {
             sw_reset();
@@ -962,9 +1012,11 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
     }
 }
 
-void deqna_c::apply_pending_reg_writes(void)
-{
-}
+// Add received packet to the read queue.
+// Queues packet for delivery to driver via RX descriptor ring.
+// Types: 0=setup, 1=loopback, 2=normal receive.
+// If queue full (QNA_QUE_MAX), drops oldest packet and increments read_queue_loss.
+// Called by worker thread when packet arrives from pcap or loopback.
 
 void deqna_c::enqueue_readq(int type, const uint8_t *data, size_t len, int status)
 {
@@ -986,6 +1038,10 @@ void deqna_c::enqueue_readq(int type, const uint8_t *data, size_t len, int statu
     read_queue.push_back(std::move(item));
 }
 
+// Dispatch receive descriptor list processing.
+// Called when driver writes RCLH (high word of receive descriptor base).
+// Clears RL bit, recalculates rbdl_ba from register values, and calls process_rbdl().
+// Returns true if processing started successfully.
 bool deqna_c::dispatch_rbdl(void)
 {
     uint32_t cur_ba = 0;
@@ -1001,6 +1057,16 @@ bool deqna_c::dispatch_rbdl(void)
     return process_rbdl();
 }
 
+// Process receive descriptor ring, delivering queued packets to host memory.
+// Main RX DMA engine:
+// - Walks descriptor chain (V=valid, C=chain bits)
+// - Dequeues packets from read_queue
+// - DMAs packet data to descriptor buffers
+// - Handles fragmentation across multiple descriptors
+// - Sets RI (receive interrupt) bit on completion
+// - Throttles to max 8 packets per call to prevent TX starvation during floods
+// Called by dispatch_rbdl() and worker thread main loop.
+// Returns false if RL set (no descriptors available).
 bool deqna_c::process_rbdl(void)
 {
     {
@@ -1050,7 +1116,7 @@ bool deqna_c::process_rbdl(void)
         uint16_t words[QE_RING_WORDS] = {0};
         if (!desc_read_words(cur_ba, words, 4)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
+            rx_nxm_error();
             process_deferred_interrupts();
             return false;
         }
@@ -1058,7 +1124,7 @@ bool deqna_c::process_rbdl(void)
         const uint16_t flag_word = 0xFFFF;
         if (!desc_write_words(cur_ba, &flag_word, 1)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
+            rx_nxm_error();
             process_deferred_interrupts();
             return false;
         }
@@ -1133,6 +1199,8 @@ bool deqna_c::process_rbdl(void)
             dma_failed = true;
             rbl = 0;
             item.packet.used = item.packet.len;
+            stats.recv++;  // Count as received even if DMA failed
+            stat_rx_frames.value = stats.recv;
         }
 
         uint16_t status1 = 0;
@@ -1161,10 +1229,16 @@ bool deqna_c::process_rbdl(void)
 
         if (dma_failed) {
             status1 |= QE_RST_LASTERR | QE_DISCARD;
+            stat_rx_errors.value++;
         } else if (overflow) {
             status1 |= QE_RST_LASTERR | QE_OVF | QE_DISCARD;
+            stat_rx_errors.value++;
         } else if (item.packet.used < item.packet.len) {
             status1 |= QE_RST_LASTNOT;
+        } else {
+            // Successfully received complete packet
+            stats.recv++;
+            stat_rx_frames.value = stats.recv;
         }
 
         bool loss = false;
@@ -1184,7 +1258,8 @@ bool deqna_c::process_rbdl(void)
 
         if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
+            rx_nxm_error();
+            stat_rx_errors.value++;
             process_deferred_interrupts();
             return false;
         }
@@ -1220,10 +1295,11 @@ bool deqna_c::process_rbdl(void)
     return true;
 }
 
-void deqna_c::touch_rbdl_if_idle(void)
-{
-}
-
+// Dispatch transmit descriptor list processing.
+// Called when driver writes XMTH (high word of transmit descriptor base).
+// Clears XL bit, recalculates xbdl_ba from register values, and calls process_xbdl().
+// Sets tx_state to active and resets write buffer.
+// Returns true if processing started successfully.
 bool deqna_c::dispatch_xbdl(void)
 {
     uint32_t cur_ba = 0;
@@ -1247,6 +1323,16 @@ void deqna_c::write_callback(int status)
     UNUSED(status);
 }
 
+// Process transmit descriptor ring, sending packets to network.
+// Main TX DMA engine:
+// - Walks descriptor chain (V=valid, C=chain, E=end of message, S=setup)
+// - DMAs packet data from descriptor buffers into write_buffer
+// - Handles fragmentation - accumulates multi-descriptor packets
+// - Sends complete packets via pcap or processes loopback/setup
+// - Handles V=0 (wait_valid state) by backing off and retrying
+// - Sets XI (transmit interrupt) bit on completion
+// Called by dispatch_xbdl() and worker thread when tx_kick flag set.
+// Returns false on error, true on success or waiting for valid descriptor.
 bool deqna_c::process_xbdl(void)
 {
     const uint16_t implicit_chain_status[2] = {static_cast<uint16_t>(QNA_DSC_V | QNA_DSC_C), 1};
@@ -1285,7 +1371,7 @@ bool deqna_c::process_xbdl(void)
         uint16_t words[QE_RING_WORDS] = {0};
         if (!desc_read_words(cur_ba, words, QE_RING_WORDS)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
+            tx_nxm_error();
             tx_state = tx_state_enum::idle;
             process_deferred_interrupts();
             return false;
@@ -1295,7 +1381,7 @@ bool deqna_c::process_xbdl(void)
             const uint16_t flag_word = 0xFFFF;
             if (!desc_write_words(cur_ba, &flag_word, 1)) {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                nxm_error();
+                tx_nxm_error();
                 tx_state = tx_state_enum::idle;
                 process_deferred_interrupts();
                 return false;
@@ -1358,7 +1444,8 @@ bool deqna_c::process_xbdl(void)
 
         if (!dma_read_bytes(address, &write_buffer.msg[buf_offset], b_length)) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
+            tx_nxm_error();
+            tx_state = tx_state_enum::idle;
             process_deferred_interrupts();
             return false;
         }
@@ -1423,7 +1510,7 @@ bool deqna_c::process_xbdl(void)
 #endif
                 if (!desc_write_words(cur_ba + 8, ok ? write_success : write_failure, 2)) {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                    nxm_error();
+                    tx_nxm_error();
                     tx_state = tx_state_enum::idle;
                     process_deferred_interrupts();
                     return false;
@@ -1449,7 +1536,7 @@ bool deqna_c::process_xbdl(void)
         } else {
             if (!desc_write_words(cur_ba + 8, implicit_chain_status, 2)) {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                nxm_error();
+                tx_nxm_error();
                 tx_state = tx_state_enum::idle;
                 process_deferred_interrupts();
                 return false;
@@ -1469,6 +1556,15 @@ bool deqna_c::process_xbdl(void)
     return true;
 }
 
+// Process setup packet (S bit set in TX descriptor).
+// Setup packet configures device receive filter:
+// - Up to 14 additional MAC addresses to accept
+// - Promiscuous mode flag (PM bit)
+// - Multicast all flag (MC bit)
+// - Sanity timer configuration (ST bits)
+// - LED control (LD bits - ignored)
+// Called by process_xbdl() when S flag detected.
+// Updates setup state and calls update_pcap_filter().
 void deqna_c::process_setup(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1520,39 +1616,15 @@ void deqna_c::process_setup(void)
     update_pcap_filter();
 }
 
-void deqna_c::dump_descriptor_rings(const char *reason)
-{
-    UNUSED(reason);
-}
-
-bool deqna_c::process_local(const uint8_t *data, size_t len)
-{
-    UNUSED(data);
-    UNUSED(len);
-    return false;
-}
-
-bool deqna_c::process_loopback(const uint8_t *data, size_t len)
-{
-    UNUSED(data);
-    UNUSED(len);
-    return false;
-}
-
-bool deqna_c::process_remote_console(const uint8_t *data, size_t len)
-{
-    UNUSED(data);
-    UNUSED(len);
-    return false;
-}
-
-bool deqna_c::send_system_id(const uint8_t *dest, uint16_t receipt_id)
-{
-    UNUSED(dest);
-    UNUSED(receipt_id);
-    return false;
-}
-
+// Main worker thread - deterministic state machine for RX/TX processing.
+// Single thread handles all device operations in fixed sequence:
+// 1. Capture packets from pcap (non-blocking)
+// 2. Process RX descriptor ring (dispatch_rbdl if pending)
+// 3. Process TX descriptor ring (dispatch_xbdl if tx_kick)
+// 4. Service timers (sanity watchdog)
+// 5. Process deferred interrupts
+// Runs until workers_terminate flag set.
+// Uses realtime priority for deterministic latency.
 void deqna_c::worker(unsigned instance)
 {
     UNUSED(instance);
