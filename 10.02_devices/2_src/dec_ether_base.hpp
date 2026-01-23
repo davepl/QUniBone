@@ -64,6 +64,8 @@ protected:
 
     // Device-specific interrupt update
     virtual void update_intr(void) = 0;
+    // Optional hook when DMA transitions to idle (dma_in_progress -> 0)
+    virtual void on_dma_quiet(void) {}
 
     // DMA tracking guard (for diagnostic output)
     struct dma_inflight_guard {
@@ -74,7 +76,8 @@ protected:
         }
         ~dma_inflight_guard()
         {
-            dev.dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+            if (dev.dma_in_progress.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                dev.on_dma_quiet();
         }
     };
 
@@ -112,6 +115,8 @@ protected:
     {
         if (wordcount == 0)
             return true;
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
@@ -134,6 +139,7 @@ protected:
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         holdoff_dma_if_intr_pending();
         dma_inflight_guard guard(*this);
+        update_intr(); // gate bus-level INTR while DMA is active
         const int max_attempts = 3;
         for (int attempt = 0; attempt < max_attempts; ++attempt) {
             qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
@@ -149,6 +155,8 @@ protected:
     {
         if (wordcount == 0)
             return true;
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
@@ -171,6 +179,7 @@ protected:
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         holdoff_dma_if_intr_pending();
         dma_inflight_guard guard(*this);
+        update_intr(); // gate bus-level INTR while DMA is active
         const int max_attempts = 3;
         for (int attempt = 0; attempt < max_attempts; ++attempt) {
             qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
@@ -187,6 +196,8 @@ protected:
     {
         if (wordcount == 0)
             return true;
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
@@ -209,6 +220,7 @@ protected:
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         holdoff_dma_if_intr_pending();
         dma_inflight_guard guard(*this);
+        update_intr(); // gate bus-level INTR while DMA is active
         const int max_attempts = 3;
         for (int attempt = 0; attempt < max_attempts; ++attempt) {
             qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
@@ -224,6 +236,8 @@ protected:
     {
         if (wordcount == 0)
             return true;
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
@@ -246,6 +260,7 @@ protected:
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         holdoff_dma_if_intr_pending();
         dma_inflight_guard guard(*this);
+        update_intr(); // gate bus-level INTR while DMA is active
         const int max_attempts = 3;
         for (int attempt = 0; attempt < max_attempts; ++attempt) {
             qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,

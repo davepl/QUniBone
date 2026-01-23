@@ -447,7 +447,7 @@ void deqna_c::clr_int(void)
 
 void deqna_c::update_intr(void)
 {
-    bool level = irq;
+    bool level = irq && (dma_in_progress.load(std::memory_order_relaxed) == 0);
 
     if (intr_holdoff_active) {
         uint64_t now = timeout_c::abstime_ns();
@@ -476,6 +476,12 @@ void deqna_c::update_intr(void)
     default:
         break;
     }
+}
+
+void deqna_c::on_dma_quiet(void)
+{
+    // DMA just went idle; re-evaluate interrupt level.
+    update_intr();
 }
 
 void deqna_c::process_deferred_interrupts(void)
@@ -611,6 +617,10 @@ void deqna_c::reset_controller(void)
     var = static_cast<uint16_t>(intr_vector.value & QNA_VEC_IV);
     csr = static_cast<uint16_t>(QNA_CSR_RL | QNA_CSR_XL);
 
+    // Cancel any pending interrupt request in the PRU before resetting state.
+    // This prevents stale interrupt requests from blocking DMA arbitration.
+    // Always call cancel_INTR - it's safe even if no request is pending.
+    qunibusadapter->cancel_INTR(intr_request);
     irq = false;
     intr_request.edge_detect_reset();
     intr_request.set_vector(var & QNA_VEC_IV);
@@ -641,8 +651,12 @@ void deqna_c::reset_controller(void)
     memset(setup.macs, 0, sizeof(setup.macs));
 
     rbdl_pending = false;
+    rbdl_hi_written = false;
+    rbdl_lo_written = false;
     tx_state = tx_state_enum::idle;
     tx_kick = false;
+    xbdl_hi_written = false;
+    xbdl_lo_written = false;
     tx_wait_ba = 0;
     tx_wait_until_ns = 0;
 
@@ -681,8 +695,12 @@ void deqna_c::sw_reset(void)
             queue_depth);
 
     rbdl_pending = false;
+    rbdl_hi_written = false;
+    rbdl_lo_written = false;
     tx_state = tx_state_enum::idle;
     tx_kick = false;
+    xbdl_hi_written = false;
+    xbdl_lo_written = false;
     tx_wait_ba = 0;
     tx_wait_until_ns = 0;
     rbdl_ba = 0;
@@ -692,6 +710,10 @@ void deqna_c::sw_reset(void)
 
     csr = static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_RL);
 
+    // Cancel any pending interrupt request in the PRU before resetting state.
+    // This prevents stale interrupt requests from blocking DMA arbitration.
+    // Always call cancel_INTR - it's safe even if no request is pending.
+    qunibusadapter->cancel_INTR(intr_request);
     irq = false;
     intr_request.edge_detect_reset();
     intr_request.set_vector(var & QNA_VEC_IV);
@@ -829,16 +851,50 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         break;
     case DEQNA_REG_RCVLIST_HI:
         rbdl[1] = static_cast<uint16_t>((rbdl[1] & ~byte_mask) | (val & byte_mask));
-        if (access != DATO_BYTEL)
+        if (access == DATO_WORD) {
             rbdl_pending = true;
+            rbdl_hi_written = false;
+            rbdl_lo_written = false;
+        } else if (access == DATO_BYTEH) {
+            rbdl_hi_written = true;
+            if (rbdl_lo_written) {
+                rbdl_pending = true;
+                rbdl_hi_written = false;
+                rbdl_lo_written = false;
+            }
+        } else { // DATO_BYTEL
+            rbdl_lo_written = true;
+            if (rbdl_hi_written) {
+                rbdl_pending = true;
+                rbdl_hi_written = false;
+                rbdl_lo_written = false;
+            }
+        }
         break;
     case DEQNA_REG_XMTLIST_LO:
         xbdl[0] = static_cast<uint16_t>((xbdl[0] & ~byte_mask) | (val & byte_mask));
         break;
     case DEQNA_REG_XMTLIST_HI:
         xbdl[1] = static_cast<uint16_t>((xbdl[1] & ~byte_mask) | (val & byte_mask));
-        if (access != DATO_BYTEL)
+        if (access == DATO_WORD) {
             tx_kick = true;
+            xbdl_hi_written = false;
+            xbdl_lo_written = false;
+        } else if (access == DATO_BYTEH) {
+            xbdl_hi_written = true;
+            if (xbdl_lo_written) {
+                tx_kick = true;
+                xbdl_hi_written = false;
+                xbdl_lo_written = false;
+            }
+        } else { // DATO_BYTEL
+            xbdl_lo_written = true;
+            if (xbdl_hi_written) {
+                tx_kick = true;
+                xbdl_hi_written = false;
+                xbdl_lo_written = false;
+            }
+        }
         break;
     case DEQNA_REG_VECTOR: {
         uint16_t merged = var;
@@ -956,6 +1012,10 @@ bool deqna_c::process_rbdl(void)
     bool ri_pending = false;
     bool xi_pending = false;
     unsigned desc_count = 0;
+    unsigned processed = 0;
+    // Limit RX processing per call to prevent TX starvation during floods.
+    // If rx_slots is configured, use that; otherwise default to 8 packets max.
+    const unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 8;
     uint32_t start_rbdl_ba = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1142,6 +1202,10 @@ bool deqna_c::process_rbdl(void)
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             rbdl_ba = cur_ba + QE_RING_BYTES;
         }
+
+        // Throttle RX processing to prevent TX starvation during floods
+        if (++processed >= limit)
+            break;
     }
 
     if (ri_pending) {
@@ -1255,12 +1319,6 @@ bool deqna_c::process_xbdl(void)
         }
 
         // Clear XL now that we have a valid descriptor
-        {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            if (csr & QNA_CSR_XL)
-                csr_set_clr(0, QNA_CSR_XL);
-        }
-
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             if (csr & QNA_CSR_XL)

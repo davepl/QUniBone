@@ -141,9 +141,9 @@ public:
     parameter_bool_c promisc = parameter_bool_c(this, "promisc", "pr", false,
             "Enable libpcap promiscuous capture");
     parameter_unsigned_c rx_slots = parameter_unsigned_c(this, "rx_slots", "rx", false, "",
-            "%d", "RX ring scan limit (0 = no limit)", 0, 10);
+            "%d", "RX ring scan limit (0 = 8 default)", 0, 10);
     parameter_unsigned_c tx_slots = parameter_unsigned_c(this, "tx_slots", "tx", false, "",
-            "%d", "TX ring scan limit (0 = no limit)", 0, 10);
+            "%d", "TX ring scan limit (0 = 8 default)", 0, 10);
     parameter_unsigned_c rx_start_delay_ms = parameter_unsigned_c(this, "rx_start_delay_ms", "rxd", false, "",
             "%d", "Receiver start delay in ms", 16, 10);
     parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
@@ -406,9 +406,11 @@ private:
     uint64_t rx_enable_deadline_ns = 0;
     bool rbdl_pending = false;
     bool rbdl_hi_written = false;
+    bool rbdl_lo_written = false;
     tx_state_enum tx_state = tx_state_enum::idle;
     bool tx_kick = false;
     bool xbdl_hi_written = false;
+    bool xbdl_lo_written = false;
     uint32_t tx_wait_ba = 0;           // Address we're polling for V=1
     uint64_t tx_wait_until_ns = 0;     // Backoff timer for V=0 polling
     uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
@@ -449,6 +451,7 @@ private:
     void update_csr_reg(void);
     void update_transceiver_bits(void);
     void update_intr(void) override;
+    void on_dma_quiet(void) override;
     void service_intr_complete(void);
 
     /*
