@@ -1,7 +1,7 @@
 /*
  * DEQNA Ethernet Controller Emulation for QUniBone
  * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
- * Contributed under the GPL2 License
+ * Contributed under the BSD License
  *
  * This implementation is derived from DEC DEQNA documentation and the
  * OpenSIMH PDP-11 xq (DEQNA) emulator. OpenSIMH attribution:

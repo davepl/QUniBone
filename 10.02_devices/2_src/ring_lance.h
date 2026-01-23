@@ -1,7 +1,7 @@
 /*
  * Author: Dave Plummer (davepl@davepl.com)
  * (c) 2025 Plummer's Software LLC
- * Contributed under the GPL2 License
+ * Contributed under the BSD License
  */
 #ifndef _RING_LANCE_H_
 #define _RING_LANCE_H_

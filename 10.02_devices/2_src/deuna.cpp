@@ -1,7 +1,7 @@
 /*
  * DEUNA Ethernet Controller Emulation for QUniBone
  * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
- * Contributed under the GPL2 License
+ * Contributed under the BSD License
  *
  * This is implementation based on:
  *   - DEC DEUNA User's Guide (EK-DEUNA-UG)

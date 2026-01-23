@@ -1,7 +1,7 @@
 /*
  * Author: Dave Plummer (davepl@davepl.com)
  * (c) 2026 Plummer's Software LLC
- * Contributed under the GPL2 License
+ * Contributed under the BSD License
  *
  * DEUNA Ethernet Controller Emulation for QUniBone
  * ================================================

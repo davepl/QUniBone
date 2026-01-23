@@ -1,12 +1,24 @@
 /*
  * Author: Dave Plummer (davepl@davepl.com)
  * (c) 2026 Plummer's Software LLC
- * Contributed under the GPL2 License
+ * Contributed under the BSD License
  *
  * DEQNA Ethernet Controller Emulation for QUniBone
  * ================================================
  *
  * This module emulates the DEC DEQNA (M7504) Q-bus Ethernet controller.
+ * 
+ * This file is part of the QUniBone project, licensed under the BSD License.
+ *
+ *   May be based in part on the DEQNA implementation in the OpenSIMH project:
+ * 
+ *   Copyright (c) 1993-2008, Robert M Supnik
+ *   Permission is hereby granted, free of charge, to any person obtaining a
+ *   copy of this software and associated documentation files (the "Software"),
+ *   to deal in the Software without restriction, including without limitation
+ *   the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ *   and/or sell copies of the Software, and to permit persons to whom the
+ *   Software is furnished to do so, subject to the following conditions:* 
  *
  * HARDWARE OVERVIEW:
  * ------------------
