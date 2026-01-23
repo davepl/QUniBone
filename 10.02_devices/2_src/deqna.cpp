@@ -35,6 +35,32 @@
 #error "DEQNA is a QBUS-only device"
 #endif
 
+namespace {
+// Descriptor length helpers shared by RX/TX paths.
+static inline uint16_t desc_word_length(uint16_t word3)
+{
+    return static_cast<uint16_t>(~word3 + 1);
+}
+
+static inline uint16_t desc_byte_length(uint16_t word3)
+{
+    return static_cast<uint16_t>(desc_word_length(word3) * 2);
+}
+
+static inline void apply_odd_adjust(uint16_t word1, uint32_t &addr, uint16_t &byte_len)
+{
+    if (word1 & QNA_DSC_H) {
+        addr += 1;
+        if (byte_len)
+            byte_len -= 1;
+    }
+    if (word1 & QNA_DSC_L) {
+        if (byte_len)
+            byte_len -= 1;
+    }
+}
+} // namespace
+
 deqna_c::deqna_c() : dec_ether_base_c()
 {
     set_workers_count(1);
@@ -117,7 +143,6 @@ deqna_c::deqna_c() : dec_ether_base_c()
     promisc.value = true;
     rx_slots.value = 0;
     tx_slots.value = 0;
-    rx_start_delay_ms.value = 0;
     trace.value = false;
     version.value = DEQNA_VERSION;
 
@@ -146,19 +171,7 @@ deqna_c::~deqna_c()
 
 bool deqna_c::parse_mac(const std::string &text, uint8_t out[6])
 {
-    unsigned values[6];
-    if (text.empty())
-        return false;
-    if (sscanf(text.c_str(), "%x:%x:%x:%x:%x:%x", &values[0], &values[1], &values[2],
-               &values[3], &values[4], &values[5]) != 6)
-        return false;
-
-    for (int i = 0; i < 6; ++i) {
-        if (values[i] > 0xff)
-            return false;
-        out[i] = static_cast<uint8_t>(values[i]);
-    }
-    return true;
+    return dec_ether_base_c::parse_mac(text, out);
 }
 
 // Called when a Quniboine paramter, like interurupt level or slot number, is changed
@@ -228,7 +241,6 @@ bool deqna_c::on_before_install(void)
     promisc.readonly = true;
     rx_slots.readonly = true;
     tx_slots.readonly = true;
-    rx_start_delay_ms.readonly = true;
 
     update_transceiver_bits();
     update_csr_reg();
@@ -279,7 +291,6 @@ void deqna_c::on_after_uninstall(void)
     promisc.readonly = false;
     rx_slots.readonly = false;
     tx_slots.readonly = false;
-    rx_start_delay_ms.readonly = false;
 
     update_transceiver_bits();
     update_csr_reg();
@@ -532,22 +543,6 @@ void deqna_c::tx_nxm_error(void)
 }
 
 // Check if receiver is ready to accept packets.
-// Returns true if RE (receive enable) is set and RL (receive list invalid) is clear.
-// Called by worker thread before enqueuing received packets.
-bool deqna_c::rx_ready(void)
-{
-    if (!(csr & QNA_CSR_RE))
-        return false;
-    if (csr & QNA_CSR_RL)
-        return false;
-    return true;
-}
-
-void deqna_c::start_rx_delay(void)
-{
-    rx_delay_active = false;
-}
-
 // Reset the sanity watchdog timer.
 // Called after successful TX completion to prevent sanity timeout.
 // If timer expires without TX activity, controller resets (safety mechanism).
@@ -1075,6 +1070,13 @@ bool deqna_c::process_rbdl(void)
             return false;
     }
 
+    auto rx_dma_fail = [&]() {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        rx_nxm_error();
+        process_deferred_interrupts();
+        return false;
+    };
+
     bool ri_pending = false;
     bool xi_pending = false;
     unsigned desc_count = 0;
@@ -1114,20 +1116,12 @@ bool deqna_c::process_rbdl(void)
         }
 
         uint16_t words[QE_RING_WORDS] = {0};
-        if (!desc_read_words(cur_ba, words, 4)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            rx_nxm_error();
-            process_deferred_interrupts();
-            return false;
-        }
+        if (!desc_read_words(cur_ba, words, 4))
+            return rx_dma_fail();
 
         const uint16_t flag_word = 0xFFFF;
-        if (!desc_write_words(cur_ba, &flag_word, 1)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            rx_nxm_error();
-            process_deferred_interrupts();
-            return false;
-        }
+        if (!desc_write_words(cur_ba, &flag_word, 1))
+            return rx_dma_fail();
 
         if (~words[1] & QNA_DSC_V) {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1153,17 +1147,8 @@ bool deqna_c::process_rbdl(void)
         }
 
         uint32_t address = make_addr(words[1], words[2]);
-        uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
-        uint16_t b_length = static_cast<uint16_t>(w_length * 2);
-        if (words[1] & QNA_DSC_H) {
-            address += 1;
-            if (b_length)
-                b_length -= 1;
-        }
-        if (words[1] & QNA_DSC_L) {
-            if (b_length)
-                b_length -= 1;
-        }
+        uint16_t b_length = desc_byte_length(words[3]);
+        apply_odd_adjust(words[1], address, b_length);
 
         size_t rbl = item.packet.len;
         if (item.packet.used) {
@@ -1318,11 +1303,6 @@ bool deqna_c::dispatch_xbdl(void)
     return process_xbdl();
 }
 
-void deqna_c::write_callback(int status)
-{
-    UNUSED(status);
-}
-
 // Process transmit descriptor ring, sending packets to network.
 // Main TX DMA engine:
 // - Walks descriptor chain (V=valid, C=chain, E=end of message, S=setup)
@@ -1345,6 +1325,22 @@ bool deqna_c::process_xbdl(void)
 
     bool waiting_for_valid = false;
     unsigned desc_count = 0;
+
+    auto tx_fail_nxm = [&]() {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        tx_nxm_error();
+        tx_state = tx_state_enum::idle;
+        process_deferred_interrupts();
+        return false;
+    };
+
+    auto tx_fail_generic = [&]() {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        nxm_error();
+        tx_state = tx_state_enum::idle;
+        process_deferred_interrupts();
+        return false;
+    };
 
     while (true) {
         if (reset_in_progress.load(std::memory_order_acquire))
@@ -1369,23 +1365,13 @@ bool deqna_c::process_xbdl(void)
         }
 
         uint16_t words[QE_RING_WORDS] = {0};
-        if (!desc_read_words(cur_ba, words, QE_RING_WORDS)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            tx_nxm_error();
-            tx_state = tx_state_enum::idle;
-            process_deferred_interrupts();
-            return false;
-        }
+        if (!desc_read_words(cur_ba, words, QE_RING_WORDS))
+            return tx_fail_nxm();
 
         if (words[1] & QNA_DSC_C) {
             const uint16_t flag_word = 0xFFFF;
-            if (!desc_write_words(cur_ba, &flag_word, 1)) {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                tx_nxm_error();
-                tx_state = tx_state_enum::idle;
-                process_deferred_interrupts();
-                return false;
-            }
+            if (!desc_write_words(cur_ba, &flag_word, 1))
+                return tx_fail_nxm();
             uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
             {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1412,27 +1398,13 @@ bool deqna_c::process_xbdl(void)
         }
 
         const uint16_t flag_word = 0xFFFF;
-        if (!desc_write_words(cur_ba, &flag_word, 1)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            nxm_error();
-            tx_state = tx_state_enum::idle;
-            process_deferred_interrupts();
-            return false;
-        }
+        if (!desc_write_words(cur_ba, &flag_word, 1))
+            return tx_fail_generic();
 
         const bool setup_packet = (words[1] & QNA_DSC_S) != 0;
         uint32_t address = make_addr(words[1], words[2]);
-        uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
-        uint16_t b_length = static_cast<uint16_t>(w_length * 2);
-        if (words[1] & QNA_DSC_H) {
-            address += 1;
-            if (b_length)
-                b_length -= 1;
-        }
-        if (words[1] & QNA_DSC_L) {
-            if (b_length)
-                b_length -= 1;
-        }
+        uint16_t b_length = desc_byte_length(words[3]);
+        apply_odd_adjust(words[1], address, b_length);
 
         size_t buf_offset = 0;
         {
@@ -1442,13 +1414,8 @@ bool deqna_c::process_xbdl(void)
                 b_length = static_cast<uint16_t>(write_buffer.msg.size() - buf_offset);
         }
 
-        if (!dma_read_bytes(address, &write_buffer.msg[buf_offset], b_length)) {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            tx_nxm_error();
-            tx_state = tx_state_enum::idle;
-            process_deferred_interrupts();
-            return false;
-        }
+        if (!dma_read_bytes(address, &write_buffer.msg[buf_offset], b_length))
+            return tx_fail_nxm();
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             write_buffer.len += b_length;
@@ -1482,13 +1449,8 @@ bool deqna_c::process_xbdl(void)
                     enqueue_readq(1, write_buffer.msg.data(), write_buffer.len, 0);
                     write_success[0] = 0x2100;
                 }
-                if (!desc_write_words(cur_ba + 8, write_success, 2)) {
-                    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                    nxm_error();
-                    tx_state = tx_state_enum::idle;
-                    process_deferred_interrupts();
-                    return false;
-                }
+                if (!desc_write_words(cur_ba + 8, write_success, 2))
+                    return tx_fail_generic();
 
                 {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1508,13 +1470,8 @@ bool deqna_c::process_xbdl(void)
 #ifdef HAVE_PCAP
                 ok = pcap.send(write_buffer.msg.data(), write_buffer.len);
 #endif
-                if (!desc_write_words(cur_ba + 8, ok ? write_success : write_failure, 2)) {
-                    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                    tx_nxm_error();
-                    tx_state = tx_state_enum::idle;
-                    process_deferred_interrupts();
-                    return false;
-                }
+                if (!desc_write_words(cur_ba + 8, ok ? write_success : write_failure, 2))
+                    return tx_fail_nxm();
 
                 {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1534,13 +1491,8 @@ bool deqna_c::process_xbdl(void)
                 process_deferred_interrupts();
             }
         } else {
-            if (!desc_write_words(cur_ba + 8, implicit_chain_status, 2)) {
-                std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                tx_nxm_error();
-                tx_state = tx_state_enum::idle;
-                process_deferred_interrupts();
-                return false;
-            }
+            if (!desc_write_words(cur_ba + 8, implicit_chain_status, 2))
+                return tx_fail_nxm();
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             xbdl_ba = cur_ba + QE_RING_BYTES;
         }
@@ -1571,43 +1523,56 @@ void deqna_c::process_setup(void)
     const uint8_t *msg = write_buffer.msg.data();
     size_t len = write_buffer.len;
 
-    memset(setup.macs, 0, sizeof(setup.macs));
-    for (int i = 0; i < 7; i++) {
-        for (int j = 0; j < 6; j++) {
-            size_t idx1 = static_cast<size_t>((i + 1) + (j * 8));
-            if (idx1 < len)
-                setup.macs[i][j] = msg[idx1];
-            size_t idx2 = static_cast<size_t>((i + 0x41) + (j * 8));
-            if (idx2 < len)
-                setup.macs[i + 7][j] = msg[idx2];
-        }
-    }
-
-    setup.promiscuous = false;
-    setup.multicast = false;
-
-    if (len > 128) {
-        const uint16_t len16 = static_cast<uint16_t>(len & 0xffff);
-        setup.multicast = (0 != (len16 & QNA_SETUP_MC));
-        setup.promiscuous = (0 != (len16 & QNA_SETUP_PM));
-
-        uint16_t san = static_cast<uint16_t>((len16 & QNA_SETUP_ST) >> 4);
-        if (san) {
-            float secs = 0.25f;
-            switch (san) {
-            case 0: secs = 0.25f; break;
-            case 1: secs = 1.0f; break;
-            case 2: secs = 4.0f; break;
-            case 3: secs = 16.0f; break;
-            case 4: secs = 60.0f; break;
-            case 5: secs = 4.0f * 60.0f; break;
-            case 6: secs = 16.0f * 60.0f; break;
-            case 7: secs = 64.0f * 60.0f; break;
+    auto extract_setup_macs = [&]() {
+        memset(setup.macs, 0, sizeof(setup.macs));
+        for (int i = 0; i < 7; i++) {
+            for (int j = 0; j < 6; j++) {
+                size_t idx1 = static_cast<size_t>((i + 1) + (j * 8));
+                if (idx1 < len)
+                    setup.macs[i][j] = msg[idx1];
+                size_t idx2 = static_cast<size_t>((i + 0x41) + (j * 8));
+                if (idx2 < len)
+                    setup.macs[i + 7][j] = msg[idx2];
             }
-            sanity.quarter_secs = static_cast<int>(secs * 4.0f);
-            sanity.max = static_cast<int>(secs * QNA_SERVICE_INTERVAL);
         }
-    }
+    };
+
+    auto sanity_seconds_from_code = [](uint16_t san) -> float {
+        switch (san) {
+        case 0: return 0.25f;
+        case 1: return 1.0f;
+        case 2: return 4.0f;
+        case 3: return 16.0f;
+        case 4: return 60.0f;
+        case 5: return 4.0f * 60.0f;
+        case 6: return 16.0f * 60.0f;
+        case 7: return 64.0f * 60.0f;
+        default: return 0.0f;
+        }
+    };
+
+    auto apply_setup_flags = [&]() {
+        setup.promiscuous = false;
+        setup.multicast = false;
+
+        if (len > 128) {
+            const uint16_t len16 = static_cast<uint16_t>(len & 0xffff);
+            setup.multicast = (0 != (len16 & QNA_SETUP_MC));
+            setup.promiscuous = (0 != (len16 & QNA_SETUP_PM));
+
+            uint16_t san = static_cast<uint16_t>((len16 & QNA_SETUP_ST) >> 4);
+            if (san) {
+                float secs = sanity_seconds_from_code(san);
+                if (secs > 0.0f) {
+                    sanity.quarter_secs = static_cast<int>(secs * 4.0f);
+                    sanity.max = static_cast<int>(secs * QNA_SERVICE_INTERVAL);
+                }
+            }
+        }
+    };
+
+    extract_setup_macs();
+    apply_setup_flags();
 
     sanity.timer = sanity.max;
     sanity.enabled = (csr & QNA_CSR_SE) ? 1 : 0;

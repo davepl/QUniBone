@@ -58,6 +58,7 @@
 #include <condition_variable>
 
 #include "deuna_bootrom.h"
+#include "dec_ether_base.hpp"
 #include "logger.hpp"
 #include "utils.hpp"
 #include "timeout.hpp"
@@ -250,8 +251,7 @@ static const char *DEUNA_VERSION = "v002";  // Only poll pcap when STATE_RUNNING
  */
 static bool mac_is_zero(const uint8_t *mac)
 {
-    return mac[0] == 0 && mac[1] == 0 && mac[2] == 0 &&
-           mac[3] == 0 && mac[4] == 0 && mac[5] == 0;
+    return dec_ether_base_c::mac_is_zero(mac);
 }
 
 /*
@@ -262,8 +262,7 @@ static bool mac_is_zero(const uint8_t *mac)
  */
 static bool mac_is_broadcast(const uint8_t *mac)
 {
-    return mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff &&
-           mac[3] == 0xff && mac[4] == 0xff && mac[5] == 0xff;
+    return dec_ether_base_c::mac_is_broadcast(mac);
 }
 
 /*
@@ -274,7 +273,7 @@ static bool mac_is_broadcast(const uint8_t *mac)
  */
 static bool mac_is_multicast(const uint8_t *mac)
 {
-    return (mac[0] & 0x01) != 0;
+    return dec_ether_base_c::mac_is_multicast(mac);
 }
 
 /*
@@ -285,7 +284,7 @@ static bool mac_is_multicast(const uint8_t *mac)
  */
 static bool mac_equal(const uint8_t *a, const uint8_t *b)
 {
-    return memcmp(a, b, 6) == 0;
+    return dec_ether_base_c::mac_equal(a, b);
 }
 
 /*
@@ -387,20 +386,7 @@ deuna_c::~deuna_c()
  */
 bool deuna_c::parse_mac(const std::string &text, uint8_t out[6])
 {
-    if (text.empty())
-        return false;
-
-    unsigned b[6] = {0};
-    if (sscanf(text.c_str(), "%x:%x:%x:%x:%x:%x",
-               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
-        return false;
-
-    for (int i = 0; i < 6; ++i) {
-        if (b[i] > 0xff)
-            return false;
-        out[i] = static_cast<uint8_t>(b[i]);
-    }
-    return true;
+    return dec_ether_base_c::parse_mac(text, out);
 }
 
 /*

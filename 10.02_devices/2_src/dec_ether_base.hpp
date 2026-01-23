@@ -25,7 +25,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "logger.hpp"
@@ -47,6 +50,46 @@ public:
     {}
 
     ~dec_ether_base_c() override = default;
+
+    // Common Ethernet helper functions (shared by DEQNA/DEUNA).
+    static inline bool mac_is_zero(const uint8_t *mac)
+    {
+        return mac[0] == 0 && mac[1] == 0 && mac[2] == 0 &&
+               mac[3] == 0 && mac[4] == 0 && mac[5] == 0;
+    }
+
+    static inline bool mac_is_broadcast(const uint8_t *mac)
+    {
+        return mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff &&
+               mac[3] == 0xff && mac[4] == 0xff && mac[5] == 0xff;
+    }
+
+    static inline bool mac_is_multicast(const uint8_t *mac)
+    {
+        return (mac[0] & 0x01) != 0;
+    }
+
+    static inline bool mac_equal(const uint8_t *a, const uint8_t *b)
+    {
+        return std::memcmp(a, b, 6) == 0;
+    }
+
+    static inline bool parse_mac(const std::string &text, uint8_t out[6])
+    {
+        unsigned values[6];
+        if (text.empty())
+            return false;
+        if (std::sscanf(text.c_str(), "%x:%x:%x:%x:%x:%x",
+                        &values[0], &values[1], &values[2],
+                        &values[3], &values[4], &values[5]) != 6)
+            return false;
+        for (int i = 0; i < 6; ++i) {
+            if (values[i] > 0xff)
+                return false;
+            out[i] = static_cast<uint8_t>(values[i]);
+        }
+        return true;
+    }
 
 protected:
     // Bus requests for interrupts and DMA (common to both devices)

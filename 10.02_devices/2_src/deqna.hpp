@@ -196,24 +196,22 @@ static const char *DEQNA_VERSION = "v090";  // Simplified refactor, OpenSIMH-ali
 
 static inline bool mac_is_zero(const uint8_t *mac)
 {
-    return mac[0] == 0 && mac[1] == 0 && mac[2] == 0 &&
-           mac[3] == 0 && mac[4] == 0 && mac[5] == 0;
+    return dec_ether_base_c::mac_is_zero(mac);
 }
 
 static inline bool mac_is_broadcast(const uint8_t *mac)
 {
-    return mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff &&
-           mac[3] == 0xff && mac[4] == 0xff && mac[5] == 0xff;
+    return dec_ether_base_c::mac_is_broadcast(mac);
 }
 
 static inline bool mac_is_multicast(const uint8_t *mac)
 {
-    return (mac[0] & 0x01) != 0;
+    return dec_ether_base_c::mac_is_multicast(mac);
 }
 
 static inline bool mac_equal(const uint8_t *a, const uint8_t *b)
 {
-    return memcmp(a, b, 6) == 0;
+    return dec_ether_base_c::mac_equal(a, b);
 }
 
 static inline uint8_t word_low(uint16_t w)
@@ -248,8 +246,6 @@ public:
             "%d", "RX packets per loop (0 = default 8)", 8, 10);
     parameter_unsigned_c tx_slots = parameter_unsigned_c(this, "tx_slots", "tx", false, "",
             "%d", "TX packets per loop (0 = default 8)", 8, 10);
-    parameter_unsigned_c rx_start_delay_ms = parameter_unsigned_c(this, "rx_start_delay_ms", "rxd", false, "",
-            "%d", "Receiver start delay in ms", 16, 10);
     parameter_bool_c trace = parameter_bool_c(this, "trace", "tr", false,
             "Trace CSR/ring events to log");
 
@@ -461,10 +457,6 @@ private:
 
     uint32_t rbdl_ba = 0;
     uint32_t xbdl_ba = 0;
-    // Remember the last RX ring start we saw when packets remained queued.
-    // Used to avoid lapping a circular ring across process_rbdl() calls.
-    uint32_t last_rbdl_start = 0;
-    bool rbdl_wrap_guard = false;
 
     /*
      * MAC address state
@@ -480,13 +472,9 @@ private:
     /*
      * Device operational flags
      * -------------------------
-     * deqna_lock: DEQNA compatibility mode locked (MS bit cleared)
-     * rx_delay_active: Artificial RX delay in effect (for timing compat)
-     * rx_enable_deadline_ns: Absolute time when RX delay expires
      * rbdl_pending: RX list needs dispatching (RCLH written)
      * tx_state: TX state machine (idle/active/wait_valid)
      * tx_kick: TX list written event (XMTH write)
-     * idtmr: System ID timer countdown (sends MOP system ID periodically)
      *
      * Interrupt holdoff (post-reset protection)
      * ------------------------------------------
@@ -505,9 +493,6 @@ private:
         active,
         wait_valid  // Polling V=0 descriptor, waiting for driver to set V=1
     };
-    bool deqna_lock = false;
-    bool rx_delay_active = false;
-    uint64_t rx_enable_deadline_ns = 0;
     bool rbdl_pending = false;
     bool rbdl_hi_written = false;
     bool rbdl_lo_written = false;
@@ -518,14 +503,11 @@ private:
     uint32_t tx_wait_ba = 0;           // Address we're polling for V=1
     uint64_t tx_wait_until_ns = 0;     // Backoff timer for V=0 polling
     uint64_t timers_last_service_ns = 0; // service_timers() tick baseline
-    uint64_t intr_pending_since_ns = 0; // Interrupt pending timestamp (for diagnostics)
-    
-    // Deferred interrupt flags - set in bus callback context, processed by worker
-    std::atomic<bool> intr_deferred_set{false};   // Need to call set_int()
-    std::atomic<bool> intr_deferred_clr{false};   // Need to call clr_int()
-    std::atomic<bool> in_bus_callback{false};     // True while in on_after_register_access
 
-    int idtmr = 0;
+    // Deferred interrupt flags - set in bus callback context, processed by worker.
+    std::atomic<bool> intr_deferred_set{false};
+    std::atomic<bool> intr_deferred_clr{false};
+    std::atomic<bool> in_bus_callback{false};
 
     /*
      * Controller reset/initialization
@@ -570,18 +552,12 @@ private:
      */
     void set_int(void);
     void clr_int(void);
-    void process_deferred_interrupts(void);  // Now a no-op stub
+    void process_deferred_interrupts(void);
     bool wait_for_interrupt_ack(void);  // Now returns false immediately
     void csr_set_clr(uint16_t set_bits, uint16_t clear_bits);
     void nxm_error(void);
     void rx_nxm_error(void);
     void tx_nxm_error(void);
-
-    /*
-     * Receiver startup delay (for OS compatibility)
-     */
-    void start_rx_delay(void);
-    bool rx_ready(void);
 
     /*
      * Update libpcap BPF filter based on current setup/promisc state
@@ -621,11 +597,9 @@ private:
      * -------------------------
      * process_xbdl: Process TX descriptors, send packets via pcap or loopback
      * dispatch_xbdl: Entry point for TX ring processing (clears XL, recalc base)
-     * write_callback: Called after pcap send completes, updates descriptor status
      */
     bool process_xbdl(void);
     bool dispatch_xbdl(void);
-    void write_callback(int status);
 
     /*
      * Packet filtering
