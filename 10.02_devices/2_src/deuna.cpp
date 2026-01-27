@@ -10,7 +10,7 @@
  *  * This file is part of the QUniBone project, licensed under the BSD License.
  *
  *   May be based in part on the DEQNA implementation in the OpenSIMH project:
- * 
+ *
  *   Copyright (c) 1993-2008, Robert M Supnik
  *   Permission is hereby granted, free of charge, to any person obtaining a
  *   copy of this software and associated documentation files (the "Software"),
@@ -74,9 +74,9 @@
 /*
  * Ethernet framing constants
  */
-static const size_t ETH_MIN_PACKET = 60;    // Minimum Ethernet frame (no CRC)
-static const size_t ETH_MAX_PACKET = 1514;  // Maximum Ethernet frame (no CRC)
-static const size_t ETH_FRAME_SIZE = 1518;  // Frame + CRC space
+static const size_t ETH_MIN_PACKET = 60;   // Minimum Ethernet frame (no CRC)
+static const size_t ETH_MAX_PACKET = 1514; // Maximum Ethernet frame (no CRC)
+static const size_t ETH_FRAME_SIZE = 1518; // Frame + CRC space
 static const size_t UNA_MAX_RCV_PACKET = 1600;
 
 /*
@@ -98,55 +98,55 @@ static const uint8_t DEUNA_DEFAULT_MAC[6] = {0x08, 0x00, 0x2b, 0xcc, 0xdd, 0xee}
 /*
  * PCSR0 register definitions
  */
-static const uint16_t PCSR0_SERI = 0100000;  // Status Error Interrupt
-static const uint16_t PCSR0_PCEI = 0040000;  // Port Command Error Interrupt
-static const uint16_t PCSR0_RXI  = 0020000;  // Receive Interrupt
-static const uint16_t PCSR0_TXI  = 0010000;  // Transmit Interrupt
-static const uint16_t PCSR0_DNI  = 0004000;  // Done Interrupt
-static const uint16_t PCSR0_RCBI = 0002000;  // Receive Buffer Unavailable
-static const uint16_t PCSR0_FATL = 0001000;  // Fatal Internal Error
-static const uint16_t PCSR0_USCI = 0000400;  // Unsolicited State Change Interrupt
-static const uint16_t PCSR0_INTR = 0000200;  // Interrupt Summary
-static const uint16_t PCSR0_INTE = 0000100;  // Interrupt Enable
-static const uint16_t PCSR0_RSET = 0000040;  // Reset
-static const uint16_t PCSR0_PCMD = 0000017;  // Port Command field
+static const uint16_t PCSR0_SERI = 0100000;     // Status Error Interrupt
+static const uint16_t PCSR0_PCEI = 0040000;     // Port Command Error Interrupt
+static const uint16_t PCSR0_RXI = 0020000;      // Receive Interrupt
+static const uint16_t PCSR0_TXI = 0010000;      // Transmit Interrupt
+static const uint16_t PCSR0_DNI = 0004000;      // Done Interrupt
+static const uint16_t PCSR0_RCBI = 0002000;     // Receive Buffer Unavailable
+static const uint16_t PCSR0_FATL = 0001000;     // Fatal Internal Error
+static const uint16_t PCSR0_USCI = 0000400;     // Unsolicited State Change Interrupt
+static const uint16_t PCSR0_INTR = 0000200;     // Interrupt Summary
+static const uint16_t PCSR0_INTE = 0000100;     // Interrupt Enable
+static const uint16_t PCSR0_RSET = 0000040;     // Reset
+static const uint16_t PCSR0_PCMD = 0000017;     // Port Command field
 static const uint16_t PCSR0_W1C_MASK = 0177400; // Write-1-to-clear bits
 
 /*
  * PCSR0 Port Commands
  */
-static const uint16_t CMD_NOOP     = 000;
-static const uint16_t CMD_GETPCBB  = 001;
-static const uint16_t CMD_GETCMD   = 002;
+static const uint16_t CMD_NOOP = 000;
+static const uint16_t CMD_GETPCBB = 001;
+static const uint16_t CMD_GETCMD = 002;
 static const uint16_t CMD_SELFTEST = 003;
-static const uint16_t CMD_START    = 004;
-static const uint16_t CMD_BOOT     = 005;
-static const uint16_t CMD_PDMD     = 010;
-static const uint16_t CMD_HALT     = 016;
-static const uint16_t CMD_STOP     = 017;
+static const uint16_t CMD_START = 004;
+static const uint16_t CMD_BOOT = 005;
+static const uint16_t CMD_PDMD = 010;
+static const uint16_t CMD_HALT = 016;
+static const uint16_t CMD_STOP = 017;
 
 /*
  * PCSR1 register definitions
  */
-static const uint16_t PCSR1_XPWR  = 0100000;  // Transceiver power failure
-static const uint16_t PCSR1_ICAB  = 0040000;  // Port/Link cable failure
-static const uint16_t PCSR1_ECOD  = 0037400;  // Self-test error code
-static const uint16_t PCSR1_PCTO  = 0000200;  // Port Command Timeout
-static const uint16_t PCSR1_TYPE  = 0000160;  // Interface type
-static const uint16_t PCSR1_STATE = 0000017;  // State
+static const uint16_t PCSR1_XPWR = 0100000;  // Transceiver power failure
+static const uint16_t PCSR1_ICAB = 0040000;  // Port/Link cable failure
+static const uint16_t PCSR1_ECOD = 0037400;  // Self-test error code
+static const uint16_t PCSR1_PCTO = 0000200;  // Port Command Timeout
+static const uint16_t PCSR1_TYPE = 0000160;  // Interface type
+static const uint16_t PCSR1_STATE = 0000017; // State
 
 static const uint16_t TYPE_DEUNA = (0 << 4);
 static const uint16_t TYPE_DELUA = (1 << 4);
 
-static const uint16_t STATE_RESET   = 000;
-static const uint16_t STATE_PLOAD   = 001;
-static const uint16_t STATE_READY   = 002;
+static const uint16_t STATE_RESET = 000;
+static const uint16_t STATE_PLOAD = 001;
+static const uint16_t STATE_READY = 002;
 static const uint16_t STATE_RUNNING = 003;
-static const uint16_t STATE_UHALT   = 005;
-static const uint16_t STATE_NHALT   = 006;
-static const uint16_t STATE_NUHALT  = 007;
-static const uint16_t STATE_HALT    = 010;
-static const uint16_t STATE_SLOAD   = 017;
+static const uint16_t STATE_UHALT = 005;
+static const uint16_t STATE_NHALT = 006;
+static const uint16_t STATE_NUHALT = 007;
+static const uint16_t STATE_HALT = 010;
+static const uint16_t STATE_SLOAD = 017;
 
 /*
  * Status register definitions
@@ -169,7 +169,7 @@ static const uint16_t MODE_PROM = 0100000; // Promiscuous mode
 static const uint16_t MODE_ENAL = 0040000; // Enable all multicast
 static const uint16_t MODE_DRDC = 0020000; // Disable data chaining
 static const uint16_t MODE_TPAD = 0010000; // Transmit pad enable
-static const uint16_t MODE_ECT  = 0004000; // Enable collision test
+static const uint16_t MODE_ECT = 0004000;  // Enable collision test
 static const uint16_t MODE_DMNT = 0001000; // Disable maintenance message
 static const uint16_t MODE_INTL = 0000200; // Internal loopback enable
 static const uint16_t MODE_DTCR = 0000010; // Disable transmit CRC
@@ -179,39 +179,39 @@ static const uint16_t MODE_HDPX = 0000001; // Half duplex
 /*
  * Function Code definitions
  */
-static const uint16_t FC_NOOP     = 0000000;
-static const uint16_t FC_LSM      = 0000001;
-static const uint16_t FC_RDPA     = 0000002;
-static const uint16_t FC_RPA      = 0000004;
-static const uint16_t FC_WPA      = 0000005;
-static const uint16_t FC_RMAL     = 0000006;
-static const uint16_t FC_WMAL     = 0000007;
-static const uint16_t FC_RRF      = 0000010;
-static const uint16_t FC_WRF      = 0000011;
-static const uint16_t FC_RDCTR    = 0000012;
-static const uint16_t FC_RDCLCTR  = 0000013;
-static const uint16_t FC_RMODE    = 0000014;
-static const uint16_t FC_WMODE    = 0000015;
-static const uint16_t FC_RSTAT    = 0000016;
-static const uint16_t FC_RCSTAT   = 0000017;
-static const uint16_t FC_DIM      = 0000020;
-static const uint16_t FC_LIM      = 0000021;
-static const uint16_t FC_RSID     = 0000022;
-static const uint16_t FC_WSID     = 0000023;
-static const uint16_t FC_RLSA     = 0000024;
-static const uint16_t FC_WLSA     = 0000025;
+static const uint16_t FC_NOOP = 0000000;
+static const uint16_t FC_LSM = 0000001;
+static const uint16_t FC_RDPA = 0000002;
+static const uint16_t FC_RPA = 0000004;
+static const uint16_t FC_WPA = 0000005;
+static const uint16_t FC_RMAL = 0000006;
+static const uint16_t FC_WMAL = 0000007;
+static const uint16_t FC_RRF = 0000010;
+static const uint16_t FC_WRF = 0000011;
+static const uint16_t FC_RDCTR = 0000012;
+static const uint16_t FC_RDCLCTR = 0000013;
+static const uint16_t FC_RMODE = 0000014;
+static const uint16_t FC_WMODE = 0000015;
+static const uint16_t FC_RSTAT = 0000016;
+static const uint16_t FC_RCSTAT = 0000017;
+static const uint16_t FC_DIM = 0000020;
+static const uint16_t FC_LIM = 0000021;
+static const uint16_t FC_RSID = 0000022;
+static const uint16_t FC_WSID = 0000023;
+static const uint16_t FC_RLSA = 0000024;
+static const uint16_t FC_WLSA = 0000025;
 
 /*
  * Transmitter Ring definitions
  */
-static const uint16_t TXR_OWN  = 0100000;
+static const uint16_t TXR_OWN = 0100000;
 static const uint16_t TXR_ERRS = 0040000;
 static const uint16_t TXR_MTCH = 0020000;
 static const uint16_t TXR_MORE = 0010000;
-static const uint16_t TXR_ONE  = 0004000;
-static const uint16_t TXR_DEF  = 0002000;
-static const uint16_t TXR_STF  = 0001000;
-static const uint16_t TXR_ENF  = 0000400;
+static const uint16_t TXR_ONE = 0004000;
+static const uint16_t TXR_DEF = 0002000;
+static const uint16_t TXR_STF = 0001000;
+static const uint16_t TXR_ENF = 0000400;
 
 static const uint16_t TXR_BUFL = 0100000;
 static const uint16_t TXR_UBTO = 0040000;
@@ -219,18 +219,18 @@ static const uint16_t TXR_UFLO = 0020000;
 static const uint16_t TXR_LCOL = 0010000;
 static const uint16_t TXR_LCAR = 0004000;
 static const uint16_t TXR_RTRY = 0002000;
-static const uint16_t TXR_TDR  = 0001777;
+static const uint16_t TXR_TDR = 0001777;
 
 /*
  * Receiver Ring definitions
  */
-static const uint16_t RXR_OWN  = 0100000;
+static const uint16_t RXR_OWN = 0100000;
 static const uint16_t RXR_ERRS = 0040000;
 static const uint16_t RXR_FRAM = 0020000;
 static const uint16_t RXR_OFLO = 0010000;
-static const uint16_t RXR_CRC  = 0004000;
-static const uint16_t RXR_STF  = 0001000;
-static const uint16_t RXR_ENF  = 0000400;
+static const uint16_t RXR_CRC = 0004000;
+static const uint16_t RXR_STF = 0001000;
+static const uint16_t RXR_ENF = 0000400;
 
 static const uint16_t RXR_BUFL = 0100000;
 static const uint16_t RXR_UBTO = 0040000;
@@ -241,7 +241,7 @@ static const uint16_t RXR_MLEN = 0007777;
 /*
  * Version string
  */
-static const char *DEUNA_VERSION = "v002";  // Only poll pcap when STATE_RUNNING
+static const char *DEUNA_VERSION = "v002"; // Only poll pcap when STATE_RUNNING
 
 /*
  * mac_is_zero
@@ -298,7 +298,7 @@ static bool mac_equal(const uint8_t *a, const uint8_t *b)
  */
 deuna_c::deuna_c() : qunibusdevice_c()
 {
-    set_workers_count(2);  // Instance 0 = RX, Instance 1 = TX
+    set_workers_count(2); // Instance 0 = RX, Instance 1 = TX
 
     name.value = "deuna";
     type_name.value = "DEUNA";
@@ -332,7 +332,7 @@ deuna_c::deuna_c() : qunibusdevice_c()
     reg_pcsr1->active_on_dati = false;
     reg_pcsr1->active_on_dato = false;
     reg_pcsr1->reset_value = 0;
-    reg_pcsr1->writable_bits = 0x0000;  // Read-only
+    reg_pcsr1->writable_bits = 0x0000; // Read-only
 
     reg_pcsr2 = &(this->registers[2]);
     static_strcpy(reg_pcsr2->name, "PCSR2");
@@ -399,21 +399,32 @@ bool deuna_c::on_param_changed(parameter_c *param)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
-    if (param == &priority_slot) {
+    if (param == &priority_slot)
+    {
         dma_request.set_priority_slot(priority_slot.new_value);
         dma_desc_request.set_priority_slot(priority_slot.new_value);
         intr_request.set_priority_slot(priority_slot.new_value);
-    } else if (param == &intr_level) {
+    }
+    else if (param == &intr_level)
+    {
         intr_request.set_level(intr_level.new_value);
-    } else if (param == &intr_vector) {
+    }
+    else if (param == &intr_vector)
+    {
         intr_request.set_vector(intr_vector.new_value);
-    } else if (param == &ifname) {
-        if (handle) {
+    }
+    else if (param == &ifname)
+    {
+        if (handle)
+        {
             WARNING("DEUNA: ifname cannot be changed while device is installed");
             return false;
         }
-    } else if (param == &mac) {
-        if (mac.new_value.empty()) {
+    }
+    else if (param == &mac)
+    {
+        if (mac.new_value.empty())
+        {
             mac_override = false;
             memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
             memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
@@ -421,9 +432,12 @@ bool deuna_c::on_param_changed(parameter_c *param)
             if (setup.mac_count < 2)
                 setup.mac_count = 2;
             update_pcap_filter();
-        } else {
+        }
+        else
+        {
             uint8_t parsed[6] = {0};
-            if (!parse_mac(mac.new_value, parsed)) {
+            if (!parse_mac(mac.new_value, parsed))
+            {
                 ERROR("DEUNA: invalid MAC format '%s'", mac.new_value.c_str());
                 return false;
             }
@@ -433,7 +447,9 @@ bool deuna_c::on_param_changed(parameter_c *param)
             setup.valid = true;
             update_pcap_filter();
         }
-    } else if (param == &promisc) {
+    }
+    else if (param == &promisc)
+    {
         update_pcap_filter();
     }
 
@@ -453,12 +469,14 @@ bool deuna_c::on_before_install(void)
     return false;
 #else
 
-    if (ifname.value.empty()) {
+    if (ifname.value.empty())
+    {
         ERROR("DEUNA: ifname must be set");
         return false;
     }
 
-    if (!pcap.open(ifname.value, promisc.value, 2048, 1)) {
+    if (!pcap.open(ifname.value, promisc.value, 2048, 1))
+    {
         ERROR("DEUNA: failed to open pcap on %s: %s", ifname.value.c_str(),
               pcap.last_error().c_str());
         return false;
@@ -546,19 +564,23 @@ void deuna_c::on_init_changed(void)
  */
 void deuna_c::update_pcsr_regs(void)
 {
-    if (reg_pcsr0) {
+    if (reg_pcsr0)
+    {
         reg_pcsr0->active_dati_flipflops = pcsr0;
         reg_pcsr0->active_dato_flipflops = pcsr0;
     }
-    if (reg_pcsr1) {
+    if (reg_pcsr1)
+    {
         reg_pcsr1->active_dati_flipflops = pcsr1;
         reg_pcsr1->active_dato_flipflops = pcsr1;
     }
-    if (reg_pcsr2) {
+    if (reg_pcsr2)
+    {
         reg_pcsr2->active_dati_flipflops = pcsr2;
         reg_pcsr2->active_dato_flipflops = pcsr2;
     }
-    if (reg_pcsr3) {
+    if (reg_pcsr3)
+    {
         reg_pcsr3->active_dati_flipflops = pcsr3;
         reg_pcsr3->active_dato_flipflops = pcsr3;
     }
@@ -609,10 +631,12 @@ void deuna_c::update_intr(void)
         return;
 
     const bool inte = (pcsr0 & PCSR0_INTE) != 0;
-    if (!inte) {
+    if (!inte)
+    {
         if (trace.value && any)
             DEBUG("DEUNA: INTR suppressed (INTE=0) pcsr0=%06o", pcsr0);
-        if (irq) {
+        if (irq)
+        {
             qunibusadapter->cancel_INTR(intr_request);
             irq = false;
             if (trace.value)
@@ -622,12 +646,14 @@ void deuna_c::update_intr(void)
     }
 
     // Force a deassert/assert cycle to re-arm level-sensitive interrupt delivery
-    if (irq) {
+    if (irq)
+    {
         qunibusadapter->cancel_INTR(intr_request);
         irq = false;
     }
 
-    if (any) {
+    if (any)
+    {
         qunibusadapter->INTR(intr_request, reg_pcsr0, pcsr0);
         irq = true;
         if (trace.value)
@@ -643,13 +669,13 @@ void deuna_c::update_intr(void)
  */
 void deuna_c::reset_controller(void)
 {
-    reset_in_progress.store(true, std::memory_order_release);  // Fix: Signal reset start
+    reset_in_progress.store(true, std::memory_order_release); // Fix: Signal reset start
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
     if (trace.value)
         DEBUG("DEUNA: reset_controller called");
 
-    pcsr0 = PCSR0_DNI;  // Done on reset
+    pcsr0 = PCSR0_DNI; // Done on reset
     pcsr1 = TYPE_DEUNA | STATE_READY;
     update_transceiver_bits();
 
@@ -691,7 +717,7 @@ void deuna_c::reset_controller(void)
 
     update_pcap_filter();
     update_intr();
-    reset_in_progress.store(false, std::memory_order_release);  // Fix: Signal reset end
+    reset_in_progress.store(false, std::memory_order_release); // Fix: Signal reset end
 }
 
 void deuna_c::init_internal_memory(void)
@@ -707,7 +733,7 @@ void deuna_c::init_internal_memory(void)
  * Notes: must be fast to not block the UNIBUS callback path.
  */
 void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
-        DATO_ACCESS access)
+                                       DATO_ACCESS access)
 {
     if (qunibus_control != QUNIBUS_CYCLE_DATO)
         return;
@@ -722,13 +748,15 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     uint16_t val = device_reg->active_dato_flipflops;
     uint16_t w1c_snapshot = 0;
 
-    if (reg_index == DEUNA_REG_PCSR0) {
+    if (reg_index == DEUNA_REG_PCSR0)
+    {
         uint16_t w1c_mask = 0;
         if (access == DATO_WORD || access == DATO_BYTEH)
             w1c_mask = static_cast<uint16_t>(val & PCSR0_W1C_MASK);
-        if (w1c_mask) {
+        if (w1c_mask)
+        {
             uint16_t before = __atomic_fetch_and(&pcsr0,
-                static_cast<uint16_t>(~w1c_mask), __ATOMIC_RELAXED);
+                                                 static_cast<uint16_t>(~w1c_mask), __ATOMIC_RELAXED);
             uint16_t cleared = static_cast<uint16_t>(before & w1c_mask);
             if (trace.value && cleared)
                 DEBUG("DEUNA: W1C immediate clear bits=%06o (was pcsr0=%06o)", cleared, before);
@@ -736,17 +764,23 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         }
     }
 
-    if (trace.value) {
+    if (trace.value)
+    {
         const char *rname = "?";
-        if (reg_index == DEUNA_REG_PCSR0) rname = "PCSR0";
-        else if (reg_index == DEUNA_REG_PCSR1) rname = "PCSR1";
-        else if (reg_index == DEUNA_REG_PCSR2) rname = "PCSR2";
-        else if (reg_index == DEUNA_REG_PCSR3) rname = "PCSR3";
+        if (reg_index == DEUNA_REG_PCSR0)
+            rname = "PCSR0";
+        else if (reg_index == DEUNA_REG_PCSR1)
+            rname = "PCSR1";
+        else if (reg_index == DEUNA_REG_PCSR2)
+            rname = "PCSR2";
+        else if (reg_index == DEUNA_REG_PCSR3)
+            rname = "PCSR3";
         DEBUG("DEUNA: on_after_register_access %s = %06o (access=%d)", rname, val, access);
     }
 
     // PCSR2/3 are safe to apply immediately; diagnostics read back right away.
-    if (reg_index == DEUNA_REG_PCSR2 || reg_index == DEUNA_REG_PCSR3) {
+    if (reg_index == DEUNA_REG_PCSR2 || reg_index == DEUNA_REG_PCSR3)
+    {
         handle_register_write(reg_index, val, access, w1c_snapshot);
         return;
     }
@@ -763,7 +797,7 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         write.w1c_snapshot = w1c_snapshot;
         pending_reg_queue.push_back(write);
     }
-    
+
     // Signal the worker thread to wake up immediately
     pending_cmd_cv.notify_one();
 }
@@ -775,22 +809,30 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
  * Notes: pcbb/cmd sequencing depends on write order; keep W1C rules intact.
  */
 void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access,
-        uint16_t w1c_snapshot)
+                                    uint16_t w1c_snapshot)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
-    if (trace.value) {
+    if (trace.value)
+    {
         const char *rname = "?";
-        if (reg_index == DEUNA_REG_PCSR0) rname = "PCSR0";
-        else if (reg_index == DEUNA_REG_PCSR1) rname = "PCSR1";
-        else if (reg_index == DEUNA_REG_PCSR2) rname = "PCSR2";
-        else if (reg_index == DEUNA_REG_PCSR3) rname = "PCSR3";
+        if (reg_index == DEUNA_REG_PCSR0)
+            rname = "PCSR0";
+        else if (reg_index == DEUNA_REG_PCSR1)
+            rname = "PCSR1";
+        else if (reg_index == DEUNA_REG_PCSR2)
+            rname = "PCSR2";
+        else if (reg_index == DEUNA_REG_PCSR3)
+            rname = "PCSR3";
         DEBUG("DEUNA: Write %s (reg %d) = %06o", rname, reg_index, val);
     }
 
-    switch (reg_index) {
-    case DEUNA_REG_PCSR0: {
-        if (access == DATO_BYTEH) {
+    switch (reg_index)
+    {
+    case DEUNA_REG_PCSR0:
+    {
+        if (access == DATO_BYTEH)
+        {
             uint16_t cleared = w1c_snapshot;
             if (trace.value && cleared)
                 DEBUG("DEUNA: W1C BYTEH clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
@@ -803,46 +845,57 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         if (access == DATO_BYTEL)
             data = static_cast<uint16_t>((pcsr0 & 0xff00) | (val & 0x00ff));
 
-        if (access == DATO_WORD) {
+        if (access == DATO_WORD)
+        {
             uint16_t cleared = w1c_snapshot;
             if (trace.value && cleared)
                 DEBUG("DEUNA: W1C WORD clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
             pcsr0 &= static_cast<uint16_t>(~w1c_snapshot);
         }
 
-        if (data & PCSR0_RSET) {
+        if (data & PCSR0_RSET)
+        {
             reset_controller();
             return;
         }
 
         // Handle INTE interlock: if INTE toggles, no port command is executed.
-        if ((pcsr0 ^ data) & PCSR0_INTE) {
+        if ((pcsr0 ^ data) & PCSR0_INTE)
+        {
             pcsr0 ^= PCSR0_INTE;
             pcsr0 |= PCSR0_DNI;
-        } else {
+        }
+        else
+        {
             pcsr0 &= ~PCSR0_PCMD;
             pcsr0 |= (data & PCSR0_PCMD);
             uint16_t cmd = pcsr0 & PCSR0_PCMD;
-            if (cmd != CMD_NOOP) {
+            if (cmd != CMD_NOOP)
+            {
                 if (trace.value)
                     DEBUG("DEUNA: PCSR0 write cmd=%03o, pcsr0=%06o", cmd, pcsr0);
-                
+
                 // Commands that require DMA must be queued for worker thread.
                 // Commands that don't need DMA can be processed immediately.
                 bool needs_dma = (cmd == CMD_GETCMD || cmd == CMD_PDMD || cmd == CMD_BOOT);
-                if (needs_dma) {
+                if (needs_dma)
+                {
                     // Queue for worker thread - it will call port_command
                     std::lock_guard<std::mutex> cmdlock(pending_cmd_mutex);
                     pending_cmd = cmd;
                     if (trace.value)
                         DEBUG("DEUNA: Queued command %03o for worker", cmd);
-                } else {
+                }
+                else
+                {
                     // Safe to execute immediately (no DMA needed)
                     port_command(cmd);
                     if (trace.value)
                         DEBUG("DEUNA: PCSR0 after command, pcsr0=%06o", pcsr0);
                 }
-            } else if (trace.value) {
+            }
+            else if (trace.value)
+            {
                 DEBUG("DEUNA: PCSR0 write with NOOP, pcsr0=%06o", pcsr0);
             }
         }
@@ -854,7 +907,7 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         // read-only
         break;
     case DEUNA_REG_PCSR2:
-        pcsr2 = val & 0177776;  // MBZ LSB
+        pcsr2 = val & 0177776; // MBZ LSB
         update_pcsr_regs();
         break;
     case DEUNA_REG_PCSR3:
@@ -882,9 +935,10 @@ void deuna_c::apply_pending_reg_writes(void)
         writes.swap(pending_reg_queue);
     }
 
-    for (const auto &write : writes) {
+    for (const auto &write : writes)
+    {
         handle_register_write(write.reg_index, write.value,
-            static_cast<DATO_ACCESS>(write.access), write.w1c_snapshot);
+                              static_cast<DATO_ACCESS>(write.access), write.w1c_snapshot);
     }
 }
 
@@ -903,13 +957,14 @@ void deuna_c::process_pending_command(void)
         pending_cmd = 0;
     }
 
-    if (cmd != 0) {
+    if (cmd != 0)
+    {
         if (trace.value)
             DEBUG("DEUNA: Worker processing queued command %03o", cmd);
-        
+
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         port_command(cmd);
-        
+
         if (trace.value)
             DEBUG("DEUNA: Worker command done, pcsr0=%06o", pcsr0);
     }
@@ -934,9 +989,12 @@ bool deuna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 
     if (ddrmem && ddrmem->enabled &&
         addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i])) {
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr)
+    {
+        for (size_t i = 0; i < wordcount; ++i)
+        {
+            if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
+            {
                 WARNING("DEUNA: DDR exam failed");
                 return false;
             }
@@ -968,9 +1026,12 @@ bool deuna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
 
     if (ddrmem && ddrmem->enabled &&
         addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
-            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i])) {
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr)
+    {
+        for (size_t i = 0; i < wordcount; ++i)
+        {
+            if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
+            {
                 WARNING("DEUNA: DDR deposit failed");
                 return false;
             }
@@ -980,7 +1041,7 @@ bool deuna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
 
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
     qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
-                        const_cast<uint16_t*>(buffer), wordcount);
+                        const_cast<uint16_t *>(buffer), wordcount);
     return dma_request.success;
 }
 
@@ -1003,8 +1064,10 @@ bool deuna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 
     if (ddrmem && ddrmem->enabled &&
         addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr)
+    {
+        for (size_t i = 0; i < wordcount; ++i)
+        {
             if (!ddrmem->exam(addr + static_cast<uint32_t>(i * 2), &buffer[i]))
                 return false;
         }
@@ -1035,8 +1098,10 @@ bool deuna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
 
     if (ddrmem && ddrmem->enabled &&
         addr64 >= ddrmem->qunibus_startaddr &&
-        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr) {
-        for (size_t i = 0; i < wordcount; ++i) {
+        (addr64 + byte_count - 2) <= ddrmem->qunibus_endaddr)
+    {
+        for (size_t i = 0; i < wordcount; ++i)
+        {
             if (!ddrmem->deposit(addr + static_cast<uint32_t>(i * 2), buffer[i]))
                 return false;
         }
@@ -1045,7 +1110,7 @@ bool deuna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
 
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
     qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,
-                        const_cast<uint16_t*>(buffer), wordcount);
+                        const_cast<uint16_t *>(buffer), wordcount);
     return dma_desc_request.success;
 }
 
@@ -1066,11 +1131,13 @@ bool deuna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
     if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
-    if ((addr & 1) == 0 && (len & 1) == 0) {
+    if ((addr & 1) == 0 && (len & 1) == 0)
+    {
         std::vector<uint16_t> tmp(len / 2, 0);
         if (!dma_read_words(addr, tmp.data(), tmp.size()))
             return false;
-        for (size_t i = 0; i < len; ++i) {
+        for (size_t i = 0; i < len; ++i)
+        {
             size_t word_index = i / 2;
             bool high = (i & 1) != 0;
             uint16_t w = tmp[word_index];
@@ -1085,7 +1152,8 @@ bool deuna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
         return false;
 
     size_t offset = addr & 1u;
-    for (size_t i = 0; i < len; ++i) {
+    for (size_t i = 0; i < len; ++i)
+    {
         size_t word_index = (i + offset) / 2;
         bool high = ((i + offset) & 1) != 0;
         uint16_t w = tmp[word_index];
@@ -1111,9 +1179,11 @@ bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     if (max == 0 || addr64 >= max || byte_count > max - addr64)
         return false;
 
-    if ((addr & 1) == 0 && (len & 1) == 0) {
+    if ((addr & 1) == 0 && (len & 1) == 0)
+    {
         std::vector<uint16_t> tmp(len / 2, 0);
-        for (size_t i = 0; i < len; ++i) {
+        for (size_t i = 0; i < len; ++i)
+        {
             size_t word_index = i / 2;
             bool high = (i & 1) != 0;
             uint16_t w = tmp[word_index];
@@ -1133,7 +1203,8 @@ bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     if (!dma_read_words(aligned, tmp.data(), wordcount))
         return false;
 
-    for (size_t i = 0; i < len; ++i) {
+    for (size_t i = 0; i < len; ++i)
+    {
         size_t word_index = (i + (addr & 1u)) / 2;
         bool high = ((i + (addr & 1u)) & 1) != 0;
         uint16_t w = tmp[word_index];
@@ -1165,7 +1236,8 @@ bool deuna_c::cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
         return false;
 
     std::lock_guard<std::recursive_mutex> lock(dma_mutex);
-    for (size_t i = 0; i < wordcount; ++i) {
+    for (size_t i = 0; i < wordcount; ++i)
+    {
         uint16_t word = 0;
         qunibusadapter->cpu_DATA_transfer(*qunibus->dma_request, QUNIBUS_CYCLE_DATI,
                                           addr + static_cast<uint32_t>(i * 2), &word);
@@ -1200,7 +1272,8 @@ bool deuna_c::cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
         return false;
 
     size_t offset = addr & 1u;
-    for (size_t i = 0; i < len; ++i) {
+    for (size_t i = 0; i < len; ++i)
+    {
         size_t word_index = (i + offset) / 2;
         bool high = ((i + offset) & 1) != 0;
         uint16_t w = tmp[word_index];
@@ -1222,12 +1295,14 @@ bool deuna_c::process_bootrom(uint32_t dst_addr)
         return false;
 
     const size_t chunk_bytes = 512;
-    for (size_t offset = 0; offset < deuna_bootrom_size; offset += chunk_bytes) {
+    for (size_t offset = 0; offset < deuna_bootrom_size; offset += chunk_bytes)
+    {
         size_t len = deuna_bootrom_size - offset;
         if (len > chunk_bytes)
             len = chunk_bytes;
         if (!dma_write_bytes(dst_addr + static_cast<uint32_t>(offset),
-                             &deuna_bootrom[offset], len)) {
+                             &deuna_bootrom[offset], len))
+        {
             return false;
         }
     }
@@ -1237,7 +1312,8 @@ bool deuna_c::process_bootrom(uint32_t dst_addr)
 
 bool deuna_c::load_system_microcode(uint32_t udbb)
 {
-    if (udbb != 0) {
+    if (udbb != 0)
+    {
         if (transfer_internal_memory(udbb, true))
             return true;
     }
@@ -1246,7 +1322,8 @@ bool deuna_c::load_system_microcode(uint32_t udbb)
     size_t limit = word_count;
     if (limit > wcs_mem.size())
         limit = wcs_mem.size();
-    for (size_t i = 0; i < limit; ++i) {
+    for (size_t i = 0; i < limit; ++i)
+    {
         uint16_t word = static_cast<uint16_t>(deuna_bootrom[i * 2] |
                                               (static_cast<uint16_t>(deuna_bootrom[i * 2 + 1]) << 8));
         wcs_mem[i] = word;
@@ -1269,7 +1346,8 @@ bool deuna_c::transfer_internal_memory(uint32_t udbb, bool to_internal)
     uint32_t host_addr = make_addr(static_cast<uint16_t>(hdr[3] & 0x0003),
                                    static_cast<uint16_t>(hdr[2] & 0177776));
 
-    if (trace.value) {
+    if (trace.value)
+    {
         WARNING("DEUNA: %s internal mem addr=%06o words=%u host=%08o",
                 to_internal ? "LIM" : "DIM",
                 mem_addr, wordcount, host_addr);
@@ -1284,13 +1362,16 @@ bool deuna_c::transfer_internal_memory(uint32_t udbb, bool to_internal)
     if (offset + wordcount > mem->size())
         return false;
 
-    if (to_internal) {
+    if (to_internal)
+    {
         std::vector<uint16_t> tmp(wordcount, 0);
         if (!dma_read_words(host_addr, tmp.data(), wordcount))
             return false;
         for (size_t i = 0; i < wordcount; ++i)
             (*mem)[offset + i] = tmp[i];
-    } else {
+    }
+    else
+    {
         std::vector<uint16_t> tmp(wordcount, 0);
         for (size_t i = 0; i < wordcount; ++i)
             tmp[i] = (*mem)[offset + i];
@@ -1335,11 +1416,13 @@ void deuna_c::log_pcbb_snapshot(const char *tag, uint32_t addr)
 
     if (ok_dma && ok_cpu &&
         (dma_words[0] != cpu_words[0] || dma_words[1] != cpu_words[1] ||
-         dma_words[2] != cpu_words[2] || dma_words[3] != cpu_words[3])) {
+         dma_words[2] != cpu_words[2] || dma_words[3] != cpu_words[3]))
+    {
         WARNING("DEUNA: %s PCBB mismatch (DMA vs CPU)", tag);
     }
     if (ok_dma_mac && ok_cpu_mac &&
-        memcmp(dma_mac, cpu_mac, sizeof(dma_mac)) != 0) {
+        memcmp(dma_mac, cpu_mac, sizeof(dma_mac)) != 0)
+    {
         WARNING("DEUNA: %s MAC mismatch (DMA vs CPU)", tag);
     }
 }
@@ -1352,8 +1435,9 @@ void deuna_c::log_pcbb_snapshot(const char *tag, uint32_t addr)
  */
 uint32_t deuna_c::make_addr(uint16_t hi, uint16_t lo) const
 {
-    uint16_t mask = 0x0003;  // DEUNA uses 18-bit addressing (2 high bits)
-    if (qunibus) {
+    uint16_t mask = 0x0003; // DEUNA uses 18-bit addressing (2 high bits)
+    if (qunibus)
+    {
         if (qunibus->addr_width <= 16)
             mask = 0x0000;
         else if (qunibus->addr_width <= 18)
@@ -1372,29 +1456,51 @@ void deuna_c::port_command(uint16_t cmd)
 {
     uint16_t state = pcsr1 & PCSR1_STATE;
 
-    if (trace.value) {
+    if (trace.value)
+    {
         const char *cmdname = "?";
-        switch (cmd) {
-        case CMD_NOOP: cmdname = "NOOP"; break;
-        case CMD_GETPCBB: cmdname = "GETPCBB"; break;
-        case CMD_GETCMD: cmdname = "GETCMD"; break;
-        case CMD_SELFTEST: cmdname = "SELFTEST"; break;
-        case CMD_START: cmdname = "START"; break;
-        case CMD_BOOT: cmdname = "BOOT"; break;
-        case CMD_PDMD: cmdname = "PDMD"; break;
-        case CMD_HALT: cmdname = "HALT"; break;
-        case CMD_STOP: cmdname = "STOP"; break;
+        switch (cmd)
+        {
+        case CMD_NOOP:
+            cmdname = "NOOP";
+            break;
+        case CMD_GETPCBB:
+            cmdname = "GETPCBB";
+            break;
+        case CMD_GETCMD:
+            cmdname = "GETCMD";
+            break;
+        case CMD_SELFTEST:
+            cmdname = "SELFTEST";
+            break;
+        case CMD_START:
+            cmdname = "START";
+            break;
+        case CMD_BOOT:
+            cmdname = "BOOT";
+            break;
+        case CMD_PDMD:
+            cmdname = "PDMD";
+            break;
+        case CMD_HALT:
+            cmdname = "HALT";
+            break;
+        case CMD_STOP:
+            cmdname = "STOP";
+            break;
         }
         DEBUG("DEUNA: port_command(%s/%03o) state=%03o pcsr0=%06o", cmdname, cmd, state, pcsr0);
     }
 
-    switch (cmd) {
+    switch (cmd)
+    {
     case CMD_PDMD:
-        if (trace.value) {
+        if (trace.value)
+        {
             DEBUG("DEUNA: PDMD tdrb=%08o telen=%u trlen=%u txnext=%u",
-                    tdrb, telen, trlen, txnext);
+                  tdrb, telen, trlen, txnext);
         }
-        process_transmit(1);  // Process only one descriptor for PDMD
+        process_transmit(1); // Process only one descriptor for PDMD
         pcsr0 |= PCSR0_DNI;
         break;
     case CMD_GETCMD:
@@ -1417,56 +1523,68 @@ void deuna_c::port_command(uint16_t cmd)
         pcsr1 |= STATE_READY;
         break;
     case CMD_START:
-        if (state == STATE_READY) {
+        if (state == STATE_READY)
+        {
             pcsr1 &= ~PCSR1_STATE;
             pcsr1 |= STATE_RUNNING;
             pcsr0 |= PCSR0_DNI;
             rxnext = 0;
             txnext = 0;
             // For diagnostic compatibility, set OWN on receive descriptors
-            if (rrlen > 0 && relen > 0) {
-                for (unsigned i = 0; i < rrlen; ++i) {
+            if (rrlen > 0 && relen > 0)
+            {
+                for (unsigned i = 0; i < rrlen; ++i)
+                {
                     uint32_t desc_addr = rdrb + (relen * 2) * i;
                     std::vector<uint16_t> desc(relen, 0);
-                    if (desc_read_words(desc_addr, desc.data(), relen)) {
+                    if (desc_read_words(desc_addr, desc.data(), relen))
+                    {
                         desc[2] |= RXR_OWN;
                         desc_write_words(desc_addr, desc.data(), relen);
                     }
                 }
             }
-        } else {
+        }
+        else
+        {
             pcsr0 |= PCSR0_PCEI;
         }
         break;
     case CMD_HALT:
-        if (state == STATE_READY || state == STATE_RUNNING) {
+        if (state == STATE_READY || state == STATE_RUNNING)
+        {
             pcsr1 &= ~PCSR1_STATE;
             pcsr1 |= STATE_HALT;
             pcsr0 |= PCSR0_DNI;
-        } else {
+        }
+        else
+        {
             pcsr0 |= PCSR0_PCEI;
         }
         break;
     case CMD_STOP:
-        if (state == STATE_RUNNING) {
+        if (state == STATE_RUNNING)
+        {
             pcsr1 &= ~PCSR1_STATE;
             pcsr1 |= STATE_READY;
             pcsr0 |= PCSR0_DNI;
-        } else {
+        }
+        else
+        {
             pcsr0 |= PCSR0_PCEI;
         }
         break;
     case CMD_BOOT:
-        {
-            uint32_t boot_addr = (static_cast<uint32_t>(pcsr3) << 16) | (pcsr2 & 0177776);
-            if (trace.value)
-                WARNING("DEUNA: BOOT requested, dest=%08o size=%u", boot_addr, deuna_bootrom_size);
-            if (boot_addr == 0 || !process_bootrom(boot_addr))
-                pcsr0 |= PCSR0_PCEI;
-            else
-                pcsr0 |= PCSR0_DNI;
-        }
-        break;
+    {
+        uint32_t boot_addr = (static_cast<uint32_t>(pcsr3) << 16) | (pcsr2 & 0177776);
+        if (trace.value)
+            WARNING("DEUNA: BOOT requested, dest=%08o size=%u", boot_addr, deuna_bootrom_size);
+        if (boot_addr == 0 || !process_bootrom(boot_addr))
+            pcsr0 |= PCSR0_PCEI;
+        else
+            pcsr0 |= PCSR0_DNI;
+    }
+    break;
     case CMD_NOOP:
         break;
     default:
@@ -1491,44 +1609,51 @@ void deuna_c::port_command(uint16_t cmd)
  */
 bool deuna_c::execute_command(void)
 {
-    if (!dma_read_words(pcbb, pcb, 4)) {
+    if (!dma_read_words(pcbb, pcb, 4))
+    {
         WARNING("DEUNA: PCB read failed pcbb=%08o", pcbb);
         return false;
     }
 
-    if (pcb[0] & 0177400) {
+    if (pcb[0] & 0177400)
+    {
         WARNING("DEUNA: PCB invalid pcbb0=%06o pcbb=%08o", pcb[0], pcbb);
         return false;
     }
 
-    if (trace.value) {
+    if (trace.value)
+    {
         WARNING("DEUNA: PCB %06o %06o %06o %06o", pcb[0], pcb[1], pcb[2], pcb[3]);
         log_pcbb_snapshot("pre-cmd", pcbb);
     }
 
     uint16_t fnc = pcb[0] & 0377;
     uint32_t udbb = 0;
-    auto get_udb_addr = [&](uint32_t &out) -> bool {
+    auto get_udb_addr = [&](uint32_t &out) -> bool
+    {
         if ((pcb[1] & 1) || (pcb[2] & 0374))
             return false;
         out = make_addr(pcb[2] & 0x0003, pcb[1] & 0177776);
         return true;
     };
 
-    switch (fnc) {
+    switch (fnc)
+    {
     case FC_NOOP:
         break;
     case FC_RDPA:
         if (!mac_override && mac_is_zero(mac_addr))
             memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
-        if (trace.value) {
+        if (trace.value)
+        {
             WARNING("DEUNA: FC_RDPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
                     mac_addr[0], mac_addr[1], mac_addr[2],
                     mac_addr[3], mac_addr[4], mac_addr[5]);
         }
         if (!dma_write_bytes(pcbb + 2, mac_addr, 6))
             return false;
-        if (get_udb_addr(udbb) && udbb != pcbb + 2) {
+        if (get_udb_addr(udbb) && udbb != pcbb + 2)
+        {
             if (!dma_write_bytes(udbb, mac_addr, 6))
                 return false;
         }
@@ -1536,20 +1661,24 @@ bool deuna_c::execute_command(void)
             log_pcbb_snapshot("post-rdpa", pcbb);
         break;
     case FC_RPA:
-        if (trace.value) {
+        if (trace.value)
+        {
             WARNING("DEUNA: FC_RPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
                     setup.macs[0][0], setup.macs[0][1], setup.macs[0][2],
                     setup.macs[0][3], setup.macs[0][4], setup.macs[0][5]);
         }
         if (!dma_write_bytes(pcbb + 2, setup.macs[0], 6))
             return false;
-        if (get_udb_addr(udbb) && udbb != pcbb + 2) {
+        if (get_udb_addr(udbb) && udbb != pcbb + 2)
+        {
             if (!dma_write_bytes(udbb, setup.macs[0], 6))
                 return false;
         }
-        if (trace.value) {
+        if (trace.value)
+        {
             uint8_t verify[6] = {0};
-            if (dma_read_bytes(pcbb + 2, verify, 6)) {
+            if (dma_read_bytes(pcbb + 2, verify, 6))
+            {
                 WARNING("DEUNA: FC_RPA verify mem=%02x:%02x:%02x:%02x:%02x:%02x",
                         verify[0], verify[1], verify[2],
                         verify[3], verify[4], verify[5]);
@@ -1558,38 +1687,44 @@ bool deuna_c::execute_command(void)
         }
         break;
     case FC_WPA:
+    {
+        uint8_t tmp[6] = {0};
+        if (!dma_read_bytes(pcbb + 2, tmp, 6))
+            return false;
+        if (trace.value)
         {
-            uint8_t tmp[6] = {0};
-            if (!dma_read_bytes(pcbb + 2, tmp, 6))
-                return false;
-            if (trace.value) {
-                WARNING("DEUNA: FC_WPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
-                        tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5]);
-            }
-            if (mac_is_zero(tmp)) {
-                memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
-            } else {
-                memcpy(setup.macs[0], tmp, sizeof(tmp));
-            }
-            setup.valid = true;
-            if (setup.mac_count < 2)
-                setup.mac_count = 2;
-            update_pcap_filter();
-            if (trace.value)
-                log_pcbb_snapshot("post-wpa", pcbb);
+            WARNING("DEUNA: FC_WPA mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                    tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5]);
         }
-        break;
-    case FC_RMAL: {
+        if (mac_is_zero(tmp))
+        {
+            memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
+        }
+        else
+        {
+            memcpy(setup.macs[0], tmp, sizeof(tmp));
+        }
+        setup.valid = true;
+        if (setup.mac_count < 2)
+            setup.mac_count = 2;
+        update_pcap_filter();
+        if (trace.value)
+            log_pcbb_snapshot("post-wpa", pcbb);
+    }
+    break;
+    case FC_RMAL:
+    {
         int mtlen = (pcb[2] & 0xFF00) >> 8;
         if (!get_udb_addr(udbb))
             return false;
         if (mtlen < 0 || mtlen > 10)
             return false;
-        if (!dma_write_bytes(udbb, reinterpret_cast<const uint8_t*>(&setup.macs[2]), mtlen * 6))
+        if (!dma_write_bytes(udbb, reinterpret_cast<const uint8_t *>(&setup.macs[2]), mtlen * 6))
             return false;
         break;
     }
-    case FC_WMAL: {
+    case FC_WMAL:
+    {
         int mtlen = (pcb[2] & 0xFF00) >> 8;
         if (mtlen < 0 || mtlen > 10)
             return false;
@@ -1597,7 +1732,7 @@ bool deuna_c::execute_command(void)
             return false;
         for (int i = 2; i < DEUNA_FILTER_MAX; ++i)
             memset(setup.macs[i], 0, 6);
-        if (!dma_read_bytes(udbb, reinterpret_cast<uint8_t*>(&setup.macs[2]), mtlen * 6))
+        if (!dma_read_bytes(udbb, reinterpret_cast<uint8_t *>(&setup.macs[2]), mtlen * 6))
             return false;
         setup.valid = true;
         setup.mac_count = mtlen + 2;
@@ -1637,24 +1772,26 @@ bool deuna_c::execute_command(void)
         rrlen = udb[5];
         rxnext = 0;
         txnext = 0;
-        if (trace.value) {
+        if (trace.value)
+        {
             WARNING("DEUNA: FC_WRF tx tdrb=%08o telen=%u trlen=%u", tdrb, telen, trlen);
             WARNING("DEUNA: FC_WRF rx rdrb=%08o relen=%u rrlen=%u", rdrb, relen, rrlen);
         }
         break;
     case FC_RDCTR:
-    case FC_RDCLCTR: {
+    case FC_RDCLCTR:
+    {
         memset(udb, 0, sizeof(udb));
-        udb[0]  = 68;
-        udb[1]  = stats.secs;
-        udb[2]  = stats.frecv & 0xffff;
-        udb[3]  = stats.frecv >> 16;
-        udb[4]  = stats.mfrecv & 0xffff;
-        udb[5]  = stats.mfrecv >> 16;
-        udb[6]  = stats.rxerf;
-        udb[7]  = stats.frecve;
-        udb[8]  = stats.rbytes & 0xffff;
-        udb[9]  = stats.rbytes >> 16;
+        udb[0] = 68;
+        udb[1] = stats.secs;
+        udb[2] = stats.frecv & 0xffff;
+        udb[3] = stats.frecv >> 16;
+        udb[4] = stats.mfrecv & 0xffff;
+        udb[5] = stats.mfrecv >> 16;
+        udb[6] = stats.rxerf;
+        udb[7] = stats.frecve;
+        udb[8] = stats.rbytes & 0xffff;
+        udb[9] = stats.rbytes >> 16;
         udb[10] = stats.mrbytes & 0xffff;
         udb[11] = stats.mrbytes >> 16;
         udb[12] = stats.rlossi;
@@ -1683,19 +1820,22 @@ bool deuna_c::execute_command(void)
             return false;
         if (!dma_write_words(udbb, udb, 68))
             return false;
-        if (fnc == FC_RDCLCTR) {
+        if (fnc == FC_RDCLCTR)
+        {
             stats = stats_state();
             stats.last_update_ns = timeout_c::abstime_ns();
         }
         break;
     }
-    case FC_RMODE: {
+    case FC_RMODE:
+    {
         uint16_t value = static_cast<uint16_t>(mode);
         if (!dma_write_words(pcbb + 2, &value, 1))
             return false;
         break;
     }
-    case FC_WMODE: {
+    case FC_WMODE:
+    {
         uint16_t prev = static_cast<uint16_t>(mode);
         mode = pcb[1];
         setup.promiscuous = (mode & MODE_PROM) != 0;
@@ -1705,7 +1845,8 @@ bool deuna_c::execute_command(void)
         break;
     }
     case FC_RSTAT:
-    case FC_RCSTAT: {
+    case FC_RCSTAT:
+    {
         uint16_t vals[3] = {stat, 10, 32};
         if (!dma_write_words(pcbb + 2, vals, 3))
             return false;
@@ -1713,7 +1854,8 @@ bool deuna_c::execute_command(void)
             stat &= 0377;
         break;
     }
-    case FC_RSID: {
+    case FC_RSID:
+    {
         memset(udb, 0, sizeof(udb));
         uint16_t mac_w[3] = {0};
         mac_w[0] = static_cast<uint16_t>(mac_addr[0] | (mac_addr[1] << 8));
@@ -1741,7 +1883,8 @@ bool deuna_c::execute_command(void)
             return false;
         break;
     }
-    case FC_WSID: {
+    case FC_WSID:
+    {
         uint16_t pltlen = pcb[3];
         if (!get_udb_addr(udbb))
             return false;
@@ -1751,7 +1894,8 @@ bool deuna_c::execute_command(void)
             return false;
         break;
     }
-    case FC_RLSA: {
+    case FC_RLSA:
+    {
         static const uint8_t mcast_load_server[6] = {0xAB, 0x00, 0x00, 0x01, 0x00, 0x00};
         const uint8_t *src = mac_is_zero(load_server) ? mcast_load_server : load_server;
         if (!dma_write_bytes(pcbb + 2, src, 6))
@@ -1763,10 +1907,13 @@ bool deuna_c::execute_command(void)
             return false;
         break;
     case FC_LSM:
-        if (get_udb_addr(udbb)) {
+        if (get_udb_addr(udbb))
+        {
             if (!load_system_microcode(udbb))
                 return false;
-        } else {
+        }
+        else
+        {
             if (!load_system_microcode(0))
                 return false;
         }
@@ -1800,7 +1947,7 @@ void deuna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
 {
     bool dropped = false;
     {
-        std::lock_guard<std::mutex> lock(queue_mutex);  // Fix: Serialize queue access
+        std::lock_guard<std::mutex> lock(queue_mutex); // Fix: Serialize queue access
 
         if (!data || len == 0)
             return;
@@ -1819,14 +1966,16 @@ void deuna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
             item.packet.msg.resize(item.packet.crc_len, 0);
         read_queue.push_back(item);
 
-        if (read_queue.size() > UNA_QUE_MAX) {
+        if (read_queue.size() > UNA_QUE_MAX)
+        {
             read_queue.pop_front();
             read_queue_loss++;
             dropped = true;
         }
     }
 
-    if (dropped) {
+    if (dropped)
+    {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         stats.rlossl++;
         stat_rx_errors.value = stats.rlossl;
@@ -1847,7 +1996,8 @@ bool deuna_c::accept_packet(const uint8_t *data, size_t len) const
     // Filter out packets from our own source MAC. libpcap can deliver our own
     // transmitted frames back to us (outgoing packets), but real Ethernet
     // hardware doesn't receive its own transmitted frames unless loopback is active.
-    if (len >= 12) {
+    if (len >= 12)
+    {
         const uint8_t *src = data + 6;
         if (!mac_is_zero(mac_addr) && mac_equal(src, mac_addr))
             return false;
@@ -1866,7 +2016,8 @@ bool deuna_c::accept_packet(const uint8_t *data, size_t len) const
     if (mac_is_multicast(dst) && setup.multicast)
         return true;
 
-    for (int i = 0; i < setup.mac_count; ++i) {
+    for (int i = 0; i < setup.mac_count; ++i)
+    {
         if (!mac_is_zero(setup.macs[i]) && mac_equal(dst, setup.macs[i]))
             return true;
     }
@@ -1889,15 +2040,18 @@ void deuna_c::update_pcap_filter(void)
     // Build a filter to exclude packets from our own source MAC.
     // libpcap can deliver outgoing packets back to us; we want to reject them.
     char srcbuf[64] = {0};
-    if (!mac_is_zero(mac_addr)) {
+    if (!mac_is_zero(mac_addr))
+    {
         snprintf(srcbuf, arraysize(srcbuf), "not ether src %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
     }
     const bool have_src_excl = srcbuf[0] != '\0';
 
-    if (setup.promiscuous) {
+    if (setup.promiscuous)
+    {
         std::string filter = "ip or not ip";
-        if (have_src_excl) {
+        if (have_src_excl)
+        {
             filter = std::string(srcbuf) + " and (" + filter + ")";
         }
         if (!pcap.set_filter(filter))
@@ -1906,12 +2060,14 @@ void deuna_c::update_pcap_filter(void)
     }
 
     std::string filter;
-    auto append_term = [&](const std::string &term) {
+    auto append_term = [&](const std::string &term)
+    {
         if (!filter.empty())
             filter += " or ";
         filter += term;
     };
-    auto add_mac = [&](const uint8_t *mac_bytes) {
+    auto add_mac = [&](const uint8_t *mac_bytes)
+    {
         char buf[64];
         snprintf(buf, arraysize(buf), "ether dst %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]);
@@ -1923,8 +2079,10 @@ void deuna_c::update_pcap_filter(void)
         append_term("ether multicast");
 
     add_mac(mac_addr);
-    if (setup.valid) {
-        for (int i = 0; i < setup.mac_count; ++i) {
+    if (setup.valid)
+    {
+        for (int i = 0; i < setup.mac_count; ++i)
+        {
             if (!mac_is_zero(setup.macs[i]) && !mac_equal(setup.macs[i], mac_addr))
                 add_mac(setup.macs[i]);
         }
@@ -1934,7 +2092,8 @@ void deuna_c::update_pcap_filter(void)
         filter = "ip or not ip";
 
     // Exclude packets from our own source MAC
-    if (have_src_excl) {
+    if (have_src_excl)
+    {
         filter = "(" + filter + ") and " + srcbuf;
     }
 
@@ -1964,7 +2123,8 @@ bool deuna_c::process_receive(void)
 
     if (rrlen == 0 || relen == 0)
         return false;
-    if (relen < 4) {
+    if (relen < 4)
+    {
         stat |= STAT_ERRS | STAT_RRNG;
         pcsr0 |= PCSR0_SERI;
         return false;
@@ -1975,16 +2135,19 @@ bool deuna_c::process_receive(void)
     std::unique_ptr<queue_item> current_item;
     bool buffers_unavailable = false;
 
-    while (true) {
+    while (true)
+    {
         bool can_continue = false;
         {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
             can_continue = (!read_queue.empty() || current_item) && (limit == 0 || processed < limit);
         }
-        if (!can_continue) break;
+        if (!can_continue)
+            break;
         uint32_t desc_addr = rdrb + (relen * 2) * rxnext;
         std::vector<uint16_t> desc(relen, 0);
-        if (!desc_read_words(desc_addr, desc.data(), relen)) {
+        if (!desc_read_words(desc_addr, desc.data(), relen))
+        {
             stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_RRNG;
             pcsr0 |= PCSR0_SERI;
             break;
@@ -1994,12 +2157,14 @@ bool deuna_c::process_receive(void)
         rxhdr[2] = desc[2];
         rxhdr[3] = desc[3];
 
-        if (!(rxhdr[2] & RXR_OWN)) {
+        if (!(rxhdr[2] & RXR_OWN))
+        {
             buffers_unavailable = true;
             break;
         }
 
-        if (!current_item) {
+        if (!current_item)
+        {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
             if (read_queue.empty())
                 break;
@@ -2019,8 +2184,10 @@ bool deuna_c::process_receive(void)
         size_t remaining = current_item->packet.crc_len - current_item->packet.used;
         size_t wlen = std::min(static_cast<size_t>(slen), remaining);
 
-        if (wlen > 0) {
-            if (!dma_write_bytes(segb, &current_item->packet.msg[current_item->packet.used], wlen)) {
+        if (wlen > 0)
+        {
+            if (!dma_write_bytes(segb, &current_item->packet.msg[current_item->packet.used], wlen))
+            {
                 stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_RRNG;
                 pcsr0 |= PCSR0_SERI;
                 break;
@@ -2030,17 +2197,20 @@ bool deuna_c::process_receive(void)
         current_item->packet.used += wlen;
 
         bool end_of_frame = (current_item->packet.used >= current_item->packet.crc_len) || (mode & MODE_DRDC);
-        if (end_of_frame) {
+        if (end_of_frame)
+        {
             rxhdr[2] |= RXR_ENF;
 
             // For loopback frames, set ERRS and CRC to indicate valid loopback receive
-            if (current_item->loopback) {
+            if (current_item->loopback)
+            {
                 rxhdr[2] |= RXR_ERRS | RXR_CRC;
             }
 
             // Set message length in word 3
             rxhdr[3] |= static_cast<uint16_t>(current_item->packet.crc_len & RXR_MLEN);
-            if ((mode & MODE_DRDC) && current_item->packet.used < current_item->packet.crc_len) {
+            if ((mode & MODE_DRDC) && current_item->packet.used < current_item->packet.crc_len)
+            {
                 rxhdr[3] |= RXR_NCHN;
                 rxhdr[2] |= RXR_ERRS;
                 stats.frecve++;
@@ -2048,7 +2218,8 @@ bool deuna_c::process_receive(void)
 
             stats.frecv++;
             stats.rbytes += static_cast<uint32_t>(current_item->packet.len > 14 ? current_item->packet.len - 14 : 0);
-            if (mac_is_multicast(current_item->packet.msg.data())) {
+            if (mac_is_multicast(current_item->packet.msg.data()))
+            {
                 stats.mfrecv++;
                 stats.mrbytes += static_cast<uint32_t>(current_item->packet.len > 14 ? current_item->packet.len - 14 : 0);
             }
@@ -2065,7 +2236,8 @@ bool deuna_c::process_receive(void)
         desc[1] = rxhdr[1];
         desc[2] = rxhdr[2];
         desc[3] = rxhdr[3];
-        if (!desc_write_words(desc_addr, desc.data(), relen)) {
+        if (!desc_write_words(desc_addr, desc.data(), relen))
+        {
             pcsr0 |= PCSR0_PCEI;
             break;
         }
@@ -2078,19 +2250,22 @@ bool deuna_c::process_receive(void)
     }
 
     // If we were in the middle of a multi-segment frame, push remaining back
-    if (current_item) {
+    if (current_item)
+    {
         std::lock_guard<std::mutex> queue_lock(queue_mutex);
         read_queue.push_front(std::move(*current_item));
     }
 
     // Set RCBI if buffers were unavailable but packets are waiting
-    if (buffers_unavailable) {
+    if (buffers_unavailable)
+    {
         bool has_packets = false;
         {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
             has_packets = !read_queue.empty() || current_item;
         }
-        if (has_packets) {
+        if (has_packets)
+        {
             pcsr0 |= PCSR0_RCBI;
         }
     }
@@ -2114,7 +2289,8 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
 
     if (trlen == 0 || telen == 0)
         return false;
-    if (telen < 4) {
+    if (telen < 4)
+    {
         stat |= STAT_ERRS | STAT_TRNG;
         pcsr0 |= PCSR0_SERI;
         return false;
@@ -2129,30 +2305,36 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
 
     static unsigned tx_not_owned_squelch = 0;
     static unsigned tx_ring_dump_squelch = 0;
-    auto find_owned_desc = [&](unsigned &owned_index) -> bool {
+    auto find_owned_desc = [&](unsigned &owned_index) -> bool
+    {
         if (trlen == 0)
             return false;
-        for (unsigned i = 0; i < trlen; ++i) {
+        for (unsigned i = 0; i < trlen; ++i)
+        {
             uint32_t probe_addr = tdrb + (telen * 2) * i;
             uint16_t probe[4] = {0};
             if (!desc_read_words(probe_addr, probe, 4))
                 continue;
-            if (probe[2] & TXR_OWN) {
+            if (probe[2] & TXR_OWN)
+            {
                 owned_index = i;
                 return true;
             }
         }
         return false;
     };
-    if (trace.value && tx_not_owned_squelch < 4) {
+    if (trace.value && tx_not_owned_squelch < 4)
+    {
         DEBUG("DEUNA: TX start tdrb=%08o telen=%u trlen=%u txnext=%u limit=%u",
-                tdrb, telen, trlen, txnext, limit);
+              tdrb, telen, trlen, txnext, limit);
     }
 
-    while (limit == 0 || processed < limit) {
+    while (limit == 0 || processed < limit)
+    {
         uint32_t desc_addr = tdrb + (telen * 2) * txnext;
         std::vector<uint16_t> desc(telen, 0);
-        if (!desc_read_words(desc_addr, desc.data(), telen)) {
+        if (!desc_read_words(desc_addr, desc.data(), telen))
+        {
             stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_TRNG;
             pcsr0 |= PCSR0_SERI;
             break;
@@ -2162,31 +2344,37 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         txhdr[2] = desc[2];
         txhdr[3] = desc[3];
 
-        if (!(txhdr[2] & TXR_OWN)) {
+        if (!(txhdr[2] & TXR_OWN))
+        {
             unsigned owned_index = 0;
-            if (find_owned_desc(owned_index)) {
-                if (trace.value && tx_not_owned_squelch < 4) {
+            if (find_owned_desc(owned_index))
+            {
+                if (trace.value && tx_not_owned_squelch < 4)
+                {
                     DEBUG("DEUNA: TX desc not owned at txnext=%u, jumping to owned=%u",
-                            txnext, owned_index);
+                          txnext, owned_index);
                 }
                 txnext = owned_index;
                 tx_not_owned_squelch = 0;
                 continue;
             }
-            if (trace.value && tx_ring_dump_squelch < 2) {
+            if (trace.value && tx_ring_dump_squelch < 2)
+            {
                 DEBUG("DEUNA: TX ring has no owned descriptors, dumping ring");
                 dump_tx_ring(8);
                 tx_ring_dump_squelch++;
             }
-            if (trace.value && tx_not_owned_squelch < 4) {
+            if (trace.value && tx_not_owned_squelch < 4)
+            {
                 DEBUG("DEUNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
-                        desc_addr, txhdr[0], txhdr[1], txhdr[2], txhdr[3]);
+                      desc_addr, txhdr[0], txhdr[1], txhdr[2], txhdr[3]);
                 WARNING("DEUNA: TX desc not owned, stopping at txnext=%u", txnext);
                 tx_not_owned_squelch++;
             }
             break;
         }
-        if (trace.value) {
+        if (trace.value)
+        {
             WARNING("DEUNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
                     desc_addr, txhdr[0], txhdr[1], txhdr[2], txhdr[3]);
         }
@@ -2198,7 +2386,8 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         txhdr[2] &= static_cast<uint16_t>(~(TXR_ERRS | TXR_MTCH | TXR_MORE | TXR_ONE | TXR_DEF));
         txhdr[3] &= static_cast<uint16_t>(~(TXR_BUFL | TXR_UBTO | TXR_UFLO | TXR_LCOL | TXR_LCAR | TXR_RTRY | TXR_TDR));
 
-        if (txhdr[2] & TXR_STF) {
+        if (txhdr[2] & TXR_STF)
+        {
             write_buffer.msg.assign(ETH_FRAME_SIZE, 0);
             write_buffer.len = 0;
             write_buffer.used = 0;
@@ -2206,16 +2395,21 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
             runt = false;
         }
 
-        if (write_buffer.len >= ETH_MAX_PACKET) {
+        if (write_buffer.len >= ETH_MAX_PACKET)
+        {
             wlen = 0;
             giant = true;
-        } else if (write_buffer.len + wlen > ETH_MAX_PACKET) {
+        }
+        else if (write_buffer.len + wlen > ETH_MAX_PACKET)
+        {
             wlen = ETH_MAX_PACKET - write_buffer.len;
             giant = true;
         }
 
-        if (wlen > 0) {
-            if (!dma_read_bytes(segb, write_buffer.msg.data() + write_buffer.len, wlen)) {
+        if (wlen > 0)
+        {
+            if (!dma_read_bytes(segb, write_buffer.msg.data() + write_buffer.len, wlen))
+            {
                 stat |= STAT_ERRS | STAT_MERR | STAT_TMOT | STAT_TRNG;
                 pcsr0 |= PCSR0_SERI;
                 break;
@@ -2224,24 +2418,34 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
 
         write_buffer.len += wlen;
 
-        if (txhdr[2] & TXR_ENF) {
-            if (write_buffer.len < ETH_MIN_PACKET) {
+        if (txhdr[2] & TXR_ENF)
+        {
+            if (write_buffer.len < ETH_MIN_PACKET)
+            {
                 write_buffer.len = ETH_MIN_PACKET;
                 if ((mode & MODE_TPAD) == 0)
                     runt = true;
             }
 
-            if (write_buffer.len >= 12 && !mac_is_zero(setup.macs[0])) {
+            if (write_buffer.len >= 12 && !mac_is_zero(setup.macs[0]))
+            {
                 memcpy(write_buffer.msg.data() + 6, setup.macs[0], 6);
             }
 
-            if ((mode & MODE_LOOP) && (mode & MODE_INTL)) {
+            if ((mode & MODE_LOOP) && (mode & MODE_INTL))
+            {
                 enqueue_readq(write_buffer.msg.data(), write_buffer.len, true);
-            } else {
-                if (!pcap.is_open() || !pcap.send(write_buffer.msg.data(), write_buffer.len)) {
-                    if (!pcap.is_open()) {
+            }
+            else
+            {
+                if (!pcap.is_open() || !pcap.send(write_buffer.msg.data(), write_buffer.len))
+                {
+                    if (!pcap.is_open())
+                    {
                         WARNING("DEUNA: TX pcap not open");
-                    } else {
+                    }
+                    else
+                    {
                         WARNING("DEUNA: TX pcap send failed: %s", pcap.last_error().c_str());
                     }
                     txhdr[3] |= TXR_RTRY;
@@ -2250,7 +2454,8 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
                 }
             }
 
-            if (giant || runt) {
+            if (giant || runt)
+            {
                 txhdr[3] |= TXR_BUFL;
                 txhdr[2] |= TXR_ERRS;
                 stats.txerf |= 0x0010;
@@ -2262,8 +2467,10 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
 
             // Set TXR_MTCH if destination address matches one of our MACs (for loopback)
             bool mac_matched = false;
-            for (int i = 0; i < setup.mac_count; ++i) {
-                if (mac_equal(write_buffer.msg.data(), setup.macs[i])) {
+            for (int i = 0; i < setup.mac_count; ++i)
+            {
+                if (mac_equal(write_buffer.msg.data(), setup.macs[i]))
+                {
                     txhdr[2] |= TXR_MTCH;
                     mac_matched = true;
                     break;
@@ -2271,16 +2478,18 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
             }
 
             // Set ERRS and success bit in word 3 for successful non-matching transmissions
-            if (!mac_matched && (txhdr[2] & TXR_ERRS) == 0) {
+            if (!mac_matched && (txhdr[2] & TXR_ERRS) == 0)
+            {
                 txhdr[2] |= TXR_ERRS;
-                txhdr[3] |= 0100000;  // Success bit
+                txhdr[3] |= 0100000; // Success bit
             }
 
             pcsr0 |= PCSR0_TXI;
             txi_set = true;
             stats.ftrans++;
             stats.tbytes += static_cast<uint32_t>(write_buffer.len > 14 ? write_buffer.len - 14 : 0);
-            if (mac_is_multicast(write_buffer.msg.data())) {
+            if (mac_is_multicast(write_buffer.msg.data()))
+            {
                 stats.mftrans++;
                 stats.mtbytes += static_cast<uint32_t>(write_buffer.len > 14 ? write_buffer.len - 14 : 0);
             }
@@ -2294,13 +2503,15 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         desc[1] = txhdr[1];
         desc[2] = txhdr[2];
         desc[3] = txhdr[3];
-        if (!desc_write_words(desc_addr, desc.data(), telen)) {
+        if (!desc_write_words(desc_addr, desc.data(), telen))
+        {
             pcsr0 |= PCSR0_PCEI;
             stats.ftransa++;
             break;
         }
 
-        if (trace.value) {
+        if (trace.value)
+        {
             WARNING("DEUNA: TX desc writeback addr=%08o w2=%06o w3=%06o",
                     desc_addr, txhdr[2], txhdr[3]);
         }
@@ -2312,7 +2523,8 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         processed++;
     }
 
-    if (processed > 0 && !txi_set) {
+    if (processed > 0 && !txi_set)
+    {
         pcsr0 |= PCSR0_TXI;
     }
 
@@ -2328,16 +2540,19 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
  */
 void deuna_c::dump_tx_ring(unsigned max_entries)
 {
-    if (trlen == 0 || telen < 4) {
+    if (trlen == 0 || telen < 4)
+    {
         WARNING("DEUNA: TX ring dump skipped (trlen=%u telen=%u)", trlen, telen);
         return;
     }
 
     unsigned count = std::min(max_entries, trlen);
-    for (unsigned i = 0; i < count; ++i) {
+    for (unsigned i = 0; i < count; ++i)
+    {
         uint32_t desc_addr = tdrb + (telen * 2) * i;
         uint16_t words[4] = {0};
-        if (!desc_read_words(desc_addr, words, 4)) {
+        if (!desc_read_words(desc_addr, words, 4))
+        {
             WARNING("DEUNA: TX ring[%u] addr=%08o read failed", i, desc_addr);
             continue;
         }
@@ -2360,7 +2575,8 @@ void deuna_c::service_timers(void)
         stats.last_update_ns = now;
 
     uint64_t elapsed_ns = now - stats.last_update_ns;
-    if (elapsed_ns >= 1000000000ULL) {
+    if (elapsed_ns >= 1000000000ULL)
+    {
         stats.secs += static_cast<uint32_t>(elapsed_ns / 1000000000ULL);
         stats.last_update_ns = now;
     }
@@ -2393,14 +2609,17 @@ void deuna_c::worker_rx(void)
     worker_init_realtime_priority(rt_device);
 
     uint8_t pkt_buf[2048];
-    while (!workers_terminate) {
-        if (reset_in_progress.load(std::memory_order_acquire)) {  // Fix: Abort if resetting
+    while (!workers_terminate)
+    {
+        if (reset_in_progress.load(std::memory_order_acquire))
+        { // Fix: Abort if resetting
             timeout_c::wait_ms(1);
             continue;
         }
         service_timers();
 
-        if (init_asserted) {
+        if (init_asserted)
+        {
             timeout_c::wait_ms(1);
             continue;
         }
@@ -2413,13 +2632,16 @@ void deuna_c::worker_rx(void)
         }
 
         size_t len = 0;
-        if (pcap.is_open() && is_running) {
-            if (!pcap.poll(pkt_buf, sizeof(pkt_buf), &len)) {
+        if (pcap.is_open() && is_running)
+        {
+            if (!pcap.poll(pkt_buf, sizeof(pkt_buf), &len))
+            {
                 WARNING("DEUNA: pcap poll error: %s", pcap.last_error().c_str());
                 timeout_c::wait_ms(10);
                 continue;
             }
-            if (len > 0) {
+            if (len > 0)
+            {
                 bool should_accept = false;
                 {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -2445,8 +2667,10 @@ void deuna_c::worker_tx(void)
 {
     worker_init_realtime_priority(rt_device);
 
-    while (!workers_terminate) {
-        if (reset_in_progress.load(std::memory_order_acquire)) {  // Fix: Abort if resetting
+    while (!workers_terminate)
+    {
+        if (reset_in_progress.load(std::memory_order_acquire))
+        { // Fix: Abort if resetting
             timeout_c::wait_ms(1);
             continue;
         }
@@ -2456,14 +2680,15 @@ void deuna_c::worker_tx(void)
             pending_cmd_cv.wait_for(lock, std::chrono::microseconds(100));
         }
 
-        if (init_asserted) {
+        if (init_asserted)
+        {
             timeout_c::wait_ms(1);
             continue;
         }
 
         // Process any queued register writes first (maintains PCSR2/3 -> PCSR0 ordering)
         apply_pending_reg_writes();
-        
+
         // Process any pending DMA-requiring command
         process_pending_command();
 

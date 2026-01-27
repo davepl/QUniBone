@@ -35,30 +35,33 @@
 #error "DEQNA is a QBUS-only device"
 #endif
 
-namespace {
-// Descriptor length helpers shared by RX/TX paths.
-static inline uint16_t desc_word_length(uint16_t word3)
+namespace
 {
-    return static_cast<uint16_t>(~word3 + 1);
-}
-
-static inline uint16_t desc_byte_length(uint16_t word3)
-{
-    return static_cast<uint16_t>(desc_word_length(word3) * 2);
-}
-
-static inline void apply_odd_adjust(uint16_t word1, uint32_t &addr, uint16_t &byte_len)
-{
-    if (word1 & QNA_DSC_H) {
-        addr += 1;
-        if (byte_len)
-            byte_len -= 1;
+    // Descriptor length helpers shared by RX/TX paths.
+    static inline uint16_t desc_word_length(uint16_t word3)
+    {
+        return static_cast<uint16_t>(~word3 + 1);
     }
-    if (word1 & QNA_DSC_L) {
-        if (byte_len)
-            byte_len -= 1;
+
+    static inline uint16_t desc_byte_length(uint16_t word3)
+    {
+        return static_cast<uint16_t>(desc_word_length(word3) * 2);
     }
-}
+
+    static inline void apply_odd_adjust(uint16_t word1, uint32_t &addr, uint16_t &byte_len)
+    {
+        if (word1 & QNA_DSC_H)
+        {
+            addr += 1;
+            if (byte_len)
+                byte_len -= 1;
+        }
+        if (word1 & QNA_DSC_L)
+        {
+            if (byte_len)
+                byte_len -= 1;
+        }
+    }
 } // namespace
 
 deqna_c::deqna_c() : dec_ether_base_c()
@@ -180,28 +183,45 @@ bool deqna_c::on_param_changed(parameter_c *param)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
-    if (param == &priority_slot) {
+    if (param == &priority_slot)
+    {
         dma_request.set_priority_slot(priority_slot.new_value);
         dma_desc_request.set_priority_slot(priority_slot.new_value);
         intr_request.set_priority_slot(priority_slot.new_value);
-    } else if (param == &intr_level) {
+    }
+    else if (param == &intr_level)
+    {
         intr_request.set_level(intr_level.new_value);
-    } else if (param == &intr_vector) {
+    }
+    else if (param == &intr_vector)
+    {
         intr_request.set_vector(intr_vector.new_value & QNA_VEC_IV);
-    } else if (param == &ifname) {
-        if (handle) {
+    }
+    else if (param == &ifname)
+    {
+        if (handle)
+        {
             WARNING("DEQNA: ifname cannot be changed while device is installed");
             return false;
         }
-    } else if (param == &promisc) {
+    }
+    else if (param == &promisc)
+    {
         update_pcap_filter();
-    } else if (param == &mac) {
-        if (mac.new_value.empty()) {
+    }
+    else if (param == &mac)
+    {
+        if (mac.new_value.empty())
+        {
             mac_override = false;
-        } else if (!parse_mac(mac.new_value, mac_addr)) {
+        }
+        else if (!parse_mac(mac.new_value, mac_addr))
+        {
             ERROR("DEQNA: invalid MAC format '%s'", mac.new_value.c_str());
             return false;
-        } else {
+        }
+        else
+        {
             mac_override = true;
         }
         update_mac_checksum();
@@ -225,12 +245,14 @@ bool deqna_c::on_before_install(void)
 #else
     INFO("DEQNA: emulation %s", DEQNA_VERSION);
 
-    if (ifname.value.empty()) {
+    if (ifname.value.empty())
+    {
         ERROR("DEQNA: ifname must be set");
         return false;
     }
 
-    if (!pcap.open(ifname.value, promisc.value, 2048, 1)) {
+    if (!pcap.open(ifname.value, promisc.value, 2048, 1))
+    {
         ERROR("DEQNA: failed to open pcap on %s: %s", ifname.value.c_str(),
               pcap.last_error().c_str());
         return false;
@@ -265,10 +287,13 @@ void deqna_c::on_before_uninstall(void)
     timeout_c timeout;
     const uint64_t start_ns = timeout_c::abstime_ns();
     const uint64_t wait_ns = 200000000ull; // 200ms
-    while (timeout_c::abstime_ns() - start_ns < wait_ns) {
+    while (timeout_c::abstime_ns() - start_ns < wait_ns)
+    {
         bool any_running = false;
-        for (const auto &w : workers) {
-            if (w.running) {
+        for (const auto &w : workers)
+        {
+            if (w.running)
+            {
                 any_running = true;
                 break;
             }
@@ -317,7 +342,8 @@ void deqna_c::update_mac_checksum(void)
     uint32_t checksum = 0;
     const uint32_t wmask = 0xffff;
 
-    for (size_t i = 0; i < 6; i += 2) {
+    for (size_t i = 0; i < 6; i += 2)
+    {
         checksum <<= 1;
         if (checksum > wmask)
             checksum -= wmask;
@@ -343,7 +369,8 @@ void deqna_c::update_station_regs(void)
     // Update all 6 station address registers (readable via registers 0-5)
     // set_register_dati_value sets the READ value, which is independent of
     // what the driver WRITES to these registers (DATO value for list pointers)
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 6; ++i)
+    {
         uint8_t value = mac_addr[i];
         if (i < 2 && (csr & QNA_CSR_EL))
             value = mac_checksum[i];
@@ -409,17 +436,22 @@ void deqna_c::update_intr(void)
 {
     bool level = irq && (dma_in_progress.load(std::memory_order_relaxed) == 0);
 
-    if (intr_holdoff_active) {
+    if (intr_holdoff_active)
+    {
         uint64_t now = timeout_c::abstime_ns();
-        if (now >= intr_holdoff_until_ns) {
+        if (now >= intr_holdoff_until_ns)
+        {
             intr_holdoff_active = false;
-        } else if (level) {
+        }
+        else if (level)
+        {
             irq = false;
             return;
         }
     }
 
-    switch (intr_request.edge_detect(level)) {
+    switch (intr_request.edge_detect(level))
+    {
     case intr_request_c::INTERRUPT_EDGE_RAISING:
         note_intr_asserted();
         {
@@ -457,12 +489,17 @@ void deqna_c::process_deferred_interrupts(void)
     bool do_set = intr_deferred_set.exchange(false, std::memory_order_acq_rel);
 
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
-    if (do_clr) {
+    if (do_clr)
+    {
         clr_int();
-    } else if (do_set) {
+    }
+    else if (do_set)
+    {
         if ((csr & QNA_CSR_IE) && (csr & QNA_CSR_XIRI) && !irq)
             set_int();
-    } else if (!irq && (csr & QNA_CSR_IE) && (csr & QNA_CSR_XIRI)) {
+    }
+    else if (!irq && (csr & QNA_CSR_IE) && (csr & QNA_CSR_XIRI))
+    {
         set_int();
     }
 }
@@ -481,12 +518,15 @@ void deqna_c::csr_set_clr(uint16_t set_bits, uint16_t clear_bits)
     bool ie_cleared = (saved_csr & QNA_CSR_IE) && !(csr & QNA_CSR_IE);
     bool should_deassert = irq && ie_cleared;
 
-    if (in_bus_callback.load(std::memory_order_acquire)) {
+    if (in_bus_callback.load(std::memory_order_acquire))
+    {
         if (should_deassert)
             intr_deferred_clr.store(true, std::memory_order_release);
         else if (should_assert)
             intr_deferred_set.store(true, std::memory_order_release);
-    } else {
+    }
+    else
+    {
         if (should_deassert)
             clr_int();
         else if (should_assert)
@@ -570,9 +610,11 @@ void deqna_c::service_timers(void)
     const int ticks = static_cast<int>(ticks64);
     timers_last_service_ns += static_cast<uint64_t>(ticks) * tick_ns;
 
-    if (sanity.enabled) {
+    if (sanity.enabled)
+    {
         sanity.timer -= ticks;
-        if (sanity.timer <= 0) {
+        if (sanity.timer <= 0)
+        {
             reset_controller();
             return;
         }
@@ -748,7 +790,8 @@ void deqna_c::update_pcap_filter(void)
     if (!pcap.is_open())
         return;
 
-    if (promisc.value || setup.promiscuous) {
+    if (promisc.value || setup.promiscuous)
+    {
         (void)pcap.set_filter("ip or not ip");
         return;
     }
@@ -757,7 +800,8 @@ void deqna_c::update_pcap_filter(void)
     if (setup.multicast)
         filter += " or ether multicast";
 
-    auto add_mac = [&](const uint8_t *mac_bytes) {
+    auto add_mac = [&](const uint8_t *mac_bytes)
+    {
         char buf[64];
         snprintf(buf, arraysize(buf), "ether dst %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]);
@@ -766,8 +810,10 @@ void deqna_c::update_pcap_filter(void)
     };
 
     add_mac(mac_addr);
-    if (setup.valid) {
-        for (int i = 0; i < QNA_FILTER_MAX; ++i) {
+    if (setup.valid)
+    {
+        for (int i = 0; i < QNA_FILTER_MAX; ++i)
+        {
             if (!mac_is_zero(setup.macs[i]))
                 add_mac(setup.macs[i]);
         }
@@ -805,7 +851,8 @@ bool deqna_c::accept_packet(const uint8_t *data, size_t len) const
     if (mac_is_multicast(dst) && setup.multicast)
         return true;
 
-    for (int i = 0; i < QNA_FILTER_MAX; ++i) {
+    for (int i = 0; i < QNA_FILTER_MAX; ++i)
+    {
         if (!mac_is_zero(setup.macs[i]) && mac_equal(dst, setup.macs[i]))
             return true;
     }
@@ -821,7 +868,8 @@ bool deqna_c::accept_packet(const uint8_t *data, size_t len) const
 uint32_t deqna_c::make_addr(uint16_t hi, uint16_t lo) const
 {
     uint16_t mask = QE_RING_ADDR_HI_MASK;
-    if (qunibus) {
+    if (qunibus)
+    {
         if (qunibus->addr_width <= 16)
             mask = 0x0000;
         else if (qunibus->addr_width <= 18)
@@ -837,7 +885,7 @@ uint32_t deqna_c::make_addr(uint16_t hi, uint16_t lo) const
 // Only processes DATO (write) cycles, not DATI (read).
 
 void deqna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
-        DATO_ACCESS access)
+                                       DATO_ACCESS access)
 {
     if (qunibus_control != QUNIBUS_CYCLE_DATO)
         return;
@@ -866,33 +914,42 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
 {
     // Determine byte mask based on access type: word, high byte, or low byte.
 
-    const uint16_t byte_mask = (access == DATO_WORD) ? 0xffff : (access == DATO_BYTEH) ? 0xff00 : 0x00ff;
+    const uint16_t byte_mask = (access == DATO_WORD) ? 0xffff : (access == DATO_BYTEH) ? 0xff00
+                                                                                       : 0x00ff;
 
-    switch (reg_index) {
-    
+    switch (reg_index)
+    {
+
     // Handle writes to receive descriptor list pointer low part
     case DEQNA_REG_RCVLIST_LO:
         rbdl[0] = static_cast<uint16_t>((rbdl[0] & ~byte_mask) | (val & byte_mask));
         break;
 
-    // Handle writes to receive descriptor list pointer high part
+        // Handle writes to receive descriptor list pointer high part
 
     case DEQNA_REG_RCVLIST_HI:
         rbdl[1] = static_cast<uint16_t>((rbdl[1] & ~byte_mask) | (val & byte_mask));
-        if (access == DATO_WORD) {
+        if (access == DATO_WORD)
+        {
             rbdl_pending = true;
             rbdl_hi_written = false;
             rbdl_lo_written = false;
-        } else if (access == DATO_BYTEH) {
+        }
+        else if (access == DATO_BYTEH)
+        {
             rbdl_hi_written = true;
-            if (rbdl_lo_written) {
+            if (rbdl_lo_written)
+            {
                 rbdl_pending = true;
                 rbdl_hi_written = false;
                 rbdl_lo_written = false;
             }
-        } else { // DATO_BYTEL
+        }
+        else
+        { // DATO_BYTEL
             rbdl_lo_written = true;
-            if (rbdl_hi_written) {
+            if (rbdl_hi_written)
+            {
                 rbdl_pending = true;
                 rbdl_hi_written = false;
                 rbdl_lo_written = false;
@@ -900,30 +957,37 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         }
         break;
 
-    // Handle writes to transmit descriptor list pointer low part
+        // Handle writes to transmit descriptor list pointer low part
 
     case DEQNA_REG_XMTLIST_LO:
         xbdl[0] = static_cast<uint16_t>((xbdl[0] & ~byte_mask) | (val & byte_mask));
         break;
 
-    // Handle writes to transmit descriptor list pointer high part
+        // Handle writes to transmit descriptor list pointer high part
 
     case DEQNA_REG_XMTLIST_HI:
         xbdl[1] = static_cast<uint16_t>((xbdl[1] & ~byte_mask) | (val & byte_mask));
-        if (access == DATO_WORD) {
+        if (access == DATO_WORD)
+        {
             tx_kick = true;
             xbdl_hi_written = false;
             xbdl_lo_written = false;
-        } else if (access == DATO_BYTEH) {
+        }
+        else if (access == DATO_BYTEH)
+        {
             xbdl_hi_written = true;
-            if (xbdl_lo_written) {
+            if (xbdl_lo_written)
+            {
                 tx_kick = true;
                 xbdl_hi_written = false;
                 xbdl_lo_written = false;
             }
-        } else { // DATO_BYTEL
+        }
+        else
+        { // DATO_BYTEL
             xbdl_lo_written = true;
-            if (xbdl_hi_written) {
+            if (xbdl_hi_written)
+            {
                 tx_kick = true;
                 xbdl_hi_written = false;
                 xbdl_lo_written = false;
@@ -931,9 +995,10 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         }
         break;
 
-    // Set the VAR (vector) register, merging bytes as needed.
+        // Set the VAR (vector) register, merging bytes as needed.
 
-    case DEQNA_REG_VECTOR: {
+    case DEQNA_REG_VECTOR:
+    {
         uint16_t merged = var;
         if (access == DATO_WORD)
             merged = val;
@@ -956,9 +1021,10 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         break;
     }
 
-    // Set the CSR register with proper handling of special bits.
+        // Set the CSR register with proper handling of special bits.
 
-    case DEQNA_REG_CSR: {
+    case DEQNA_REG_CSR:
+    {
         uint16_t prev = csr;
         const uint16_t data_masked = static_cast<uint16_t>(val & byte_mask);
         const uint16_t rw_in_access = static_cast<uint16_t>(QNA_CSR_RW & byte_mask);
@@ -968,16 +1034,16 @@ void deqna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
 
         uint16_t set_bits = static_cast<uint16_t>(w1c_only ? 0 : (data_masked & rw_in_access));
         uint16_t clr_bits = 0;
-        
-        if (w1c_only) 
+
+        if (w1c_only)
             clr_bits = static_cast<uint16_t>(w1_in_data | ((w1_in_data & QNA_CSR_XI) ? QNA_CSR_NI : 0));
-         else
+        else
             clr_bits = static_cast<uint16_t>(((data_masked ^ rw_in_access) & rw_in_access) | w1_in_data | ((data_masked & QNA_CSR_XI) ? QNA_CSR_NI : 0));
-        
 
         // Handle software reset (SR) bit separately.  Edge-triggered on 1->0 transition.
 
-        if ((byte_mask & QNA_CSR_SR) && (prev & QNA_CSR_SR) && !(data_masked & QNA_CSR_SR)) {
+        if ((byte_mask & QNA_CSR_SR) && (prev & QNA_CSR_SR) && !(data_masked & QNA_CSR_SR))
+        {
             sw_reset();
             return;
         }
@@ -1012,7 +1078,8 @@ void deqna_c::enqueue_readq(int type, const uint8_t *data, size_t len, int statu
 {
     std::lock_guard<std::mutex> lock(queue_mutex);
 
-    if (read_queue.size() >= QNA_QUE_MAX) {
+    if (read_queue.size() >= QNA_QUE_MAX)
+    {
         read_queue_loss++;
         if (!read_queue.empty())
             read_queue.pop_front();
@@ -1065,7 +1132,8 @@ bool deqna_c::process_rbdl(void)
             return false;
     }
 
-    auto rx_dma_fail = [&]() {
+    auto rx_dma_fail = [&]()
+    {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         rx_nxm_error();
         process_deferred_interrupts();
@@ -1085,7 +1153,8 @@ bool deqna_c::process_rbdl(void)
         start_rbdl_ba = rbdl_ba;
     }
 
-    while (true) {
+    while (true)
+    {
         if (reset_in_progress.load(std::memory_order_acquire))
             return false;
 
@@ -1103,7 +1172,8 @@ bool deqna_c::process_rbdl(void)
 
         if (desc_count > 0 && cur_ba == start_rbdl_ba)
             break;
-        if (++desc_count > 256) {
+        if (++desc_count > 256)
+        {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             csr_set_clr(static_cast<uint16_t>(QNA_CSR_RL | QNA_CSR_RI), 0);
             process_deferred_interrupts();
@@ -1118,14 +1188,16 @@ bool deqna_c::process_rbdl(void)
         if (!desc_write_words(cur_ba, &flag_word, 1))
             return rx_dma_fail();
 
-        if (~words[1] & QNA_DSC_V) {
+        if (~words[1] & QNA_DSC_V)
+        {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             csr_set_clr(QNA_CSR_RL, 0);
             process_deferred_interrupts();
             return true;
         }
 
-        if (words[1] & QNA_DSC_C) {
+        if (words[1] & QNA_DSC_C)
+        {
             uint32_t next_ba = make_addr(words[1], words[2]) & ~1u;
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             rbdl_ba = next_ba;
@@ -1146,10 +1218,14 @@ bool deqna_c::process_rbdl(void)
         apply_odd_adjust(words[1], address, b_length);
 
         size_t rbl = item.packet.len;
-        if (item.packet.used) {
+        if (item.packet.used)
+        {
             rbl -= item.packet.used;
-        } else {
-            if (rbl < ETH_MIN_PACKET) {
+        }
+        else
+        {
+            if (rbl < ETH_MIN_PACKET)
+            {
                 if (item.packet.msg.size() < ETH_MIN_PACKET)
                     item.packet.msg.resize(ETH_MIN_PACKET, 0);
                 else
@@ -1157,7 +1233,8 @@ bool deqna_c::process_rbdl(void)
                 rbl = ETH_MIN_PACKET;
                 item.packet.len = rbl;
             }
-            if (rbl > ETH_MAX_PACKET) {
+            if (rbl > ETH_MAX_PACKET)
+            {
                 item.packet.len = ETH_MAX_PACKET;
                 rbl = ETH_MAX_PACKET;
             }
@@ -1166,7 +1243,8 @@ bool deqna_c::process_rbdl(void)
         uint8_t *rbuf = item.packet.msg.data() + item.packet.used;
         size_t used_before = item.packet.used;
         bool overflow = false;
-        if (rbl > b_length) {
+        if (rbl > b_length)
+        {
             rbl = b_length;
             overflow = true;
         }
@@ -1175,17 +1253,19 @@ bool deqna_c::process_rbdl(void)
             item.packet.used = item.packet.len;
 
         bool dma_failed = false;
-        if (rbl && !dma_write_bytes(address, rbuf, rbl)) {
+        if (rbl && !dma_write_bytes(address, rbuf, rbl))
+        {
             dma_failed = true;
             rbl = 0;
             item.packet.used = item.packet.len;
-            stats.recv++;  // Count as received even if DMA failed
+            stats.recv++; // Count as received even if DMA failed
             stat_rx_frames.value = stats.recv;
         }
 
         uint16_t status1 = 0;
         uint16_t report_rbl = static_cast<uint16_t>(item.packet.len & 0xFFFF);
-        switch (item.type) {
+        switch (item.type)
+        {
         case 0:
             stats.setup++;
             status1 = static_cast<uint16_t>(QE_ESETUP | 0x0700);
@@ -1207,15 +1287,22 @@ bool deqna_c::process_rbdl(void)
             break;
         }
 
-        if (dma_failed) {
+        if (dma_failed)
+        {
             status1 |= QE_RST_LASTERR | QE_DISCARD;
             stat_rx_errors.value++;
-        } else if (overflow) {
+        }
+        else if (overflow)
+        {
             status1 |= QE_RST_LASTERR | QE_OVF | QE_DISCARD;
             stat_rx_errors.value++;
-        } else if (item.packet.used < item.packet.len) {
+        }
+        else if (item.packet.used < item.packet.len)
+        {
             status1 |= QE_RST_LASTNOT;
-        } else {
+        }
+        else
+        {
             // Successfully received complete packet
             stats.recv++;
             stat_rx_frames.value = stats.recv;
@@ -1224,7 +1311,8 @@ bool deqna_c::process_rbdl(void)
         bool loss = false;
         {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
-            if (read_queue_loss) {
+            if (read_queue_loss)
+            {
                 loss = true;
                 read_queue_loss = 0;
             }
@@ -1257,10 +1345,13 @@ bool deqna_c::process_rbdl(void)
             process_deferred_interrupts();
             return false;
         }
-        if (item.packet.used < item.packet.len) {
+        if (item.packet.used < item.packet.len)
+        {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
             read_queue.push_front(std::move(item));
-        } else {
+        }
+        else
+        {
             ri_pending = true;
             if (item.type < 2)
                 xi_pending = true;
@@ -1276,7 +1367,8 @@ bool deqna_c::process_rbdl(void)
             break;
     }
 
-    if (ri_pending) {
+    if (ri_pending)
+    {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         uint16_t set_bits = QNA_CSR_RI;
         if (xi_pending)
@@ -1334,7 +1426,8 @@ bool deqna_c::process_xbdl(void)
     bool waiting_for_valid = false;
     unsigned desc_count = 0;
 
-    auto tx_fail_nxm = [&]() {
+    auto tx_fail_nxm = [&]()
+    {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         tx_nxm_error();
         tx_state = tx_state_enum::idle;
@@ -1342,7 +1435,8 @@ bool deqna_c::process_xbdl(void)
         return false;
     };
 
-    auto tx_fail_generic = [&]() {
+    auto tx_fail_generic = [&]()
+    {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         nxm_error();
         tx_state = tx_state_enum::idle;
@@ -1350,7 +1444,8 @@ bool deqna_c::process_xbdl(void)
         return false;
     };
 
-    while (true) {
+    while (true)
+    {
         if (reset_in_progress.load(std::memory_order_acquire))
             return false;
 
@@ -1362,7 +1457,8 @@ bool deqna_c::process_xbdl(void)
 
         if (desc_count > 0 && cur_ba == start_xbdl_ba)
             break;
-        if (++desc_count > 256) {
+        if (++desc_count > 256)
+        {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             csr_set_clr(static_cast<uint16_t>(QNA_CSR_XL | QNA_CSR_XI), 0);
             tx_state = tx_state_enum::idle;
@@ -1376,7 +1472,8 @@ bool deqna_c::process_xbdl(void)
         if (!desc_read_words(cur_ba, words, QE_RING_WORDS))
             return tx_fail_nxm();
 
-        if (words[1] & QNA_DSC_C) {
+        if (words[1] & QNA_DSC_C)
+        {
             const uint16_t flag_word = 0xFFFF;
             if (!desc_write_words(cur_ba, &flag_word, 1))
                 return tx_fail_nxm();
@@ -1388,7 +1485,8 @@ bool deqna_c::process_xbdl(void)
             continue;
         }
 
-        if (~words[1] & QNA_DSC_V) {
+        if (~words[1] & QNA_DSC_V)
+        {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             tx_state = tx_state_enum::wait_valid;
             tx_wait_ba = cur_ba;
@@ -1429,7 +1527,8 @@ bool deqna_c::process_xbdl(void)
             write_buffer.len += b_length;
         }
 
-        if (words[1] & QNA_DSC_E) {
+        if (words[1] & QNA_DSC_E)
+        {
             bool il_clear = false;
             bool el_set = false;
             size_t len_snapshot = 0;
@@ -1437,7 +1536,8 @@ bool deqna_c::process_xbdl(void)
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 il_clear = (csr & QNA_CSR_IL) == 0;
                 el_set = (csr & QNA_CSR_EL) != 0;
-                if (write_buffer.len < ETH_MIN_PACKET) {
+                if (write_buffer.len < ETH_MIN_PACKET)
+                {
                     size_t pad = ETH_MIN_PACKET - write_buffer.len;
                     memset(write_buffer.msg.data() + write_buffer.len, 0, pad);
                     write_buffer.len = ETH_MIN_PACKET;
@@ -1446,14 +1546,18 @@ bool deqna_c::process_xbdl(void)
             }
             bool loopback = el_set || il_clear;
 
-            if (loopback || setup_packet) {
+            if (loopback || setup_packet)
+            {
                 uint16_t write_success[2] = {0x0000, 0x0001};
-                if (setup_packet) {
+                if (setup_packet)
+                {
                     process_setup();
                     enqueue_readq(0, write_buffer.msg.data(), write_buffer.len, 0);
                     write_success[0] = 0x200C;
                     write_success[1] = 0x0860;
-                } else {
+                }
+                else
+                {
                     enqueue_readq(1, write_buffer.msg.data(), write_buffer.len, 0);
                     write_success[0] = 0x2100;
                 }
@@ -1469,7 +1573,9 @@ bool deqna_c::process_xbdl(void)
                 }
 
                 process_deferred_interrupts();
-            } else {
+            }
+            else
+            {
                 const uint16_t TDR = static_cast<uint16_t>(100 + len_snapshot * 8);
                 uint16_t write_success[2] = {0x2000, static_cast<uint16_t>(TDR & 0x03FF)};
                 uint16_t write_failure[2] = {QNA_DSC_C, static_cast<uint16_t>(TDR & 0x03FF)};
@@ -1483,7 +1589,8 @@ bool deqna_c::process_xbdl(void)
 
                 {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                    if (!ok) {
+                    if (!ok)
+                    {
                         stats.fail++;
                         stat_tx_errors.value = stats.fail;
                     }
@@ -1498,7 +1605,9 @@ bool deqna_c::process_xbdl(void)
                 csr_set_clr(QNA_CSR_XI, 0);
                 process_deferred_interrupts();
             }
-        } else {
+        }
+        else
+        {
             if (!desc_write_words(cur_ba + 8, implicit_chain_status, 2))
                 return tx_fail_nxm();
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1506,7 +1615,8 @@ bool deqna_c::process_xbdl(void)
         }
     }
 
-    if (!waiting_for_valid) {
+    if (!waiting_for_valid)
+    {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         if (tx_state != tx_state_enum::wait_valid)
             tx_state = tx_state_enum::idle;
@@ -1531,10 +1641,13 @@ void deqna_c::process_setup(void)
     const uint8_t *msg = write_buffer.msg.data();
     size_t len = write_buffer.len;
 
-    auto extract_setup_macs = [&]() {
+    auto extract_setup_macs = [&]()
+    {
         memset(setup.macs, 0, sizeof(setup.macs));
-        for (int i = 0; i < 7; i++) {
-            for (int j = 0; j < 6; j++) {
+        for (int i = 0; i < 7; i++)
+        {
+            for (int j = 0; j < 6; j++)
+            {
                 size_t idx1 = static_cast<size_t>((i + 1) + (j * 8));
                 if (idx1 < len)
                     setup.macs[i][j] = msg[idx1];
@@ -1545,33 +1658,48 @@ void deqna_c::process_setup(void)
         }
     };
 
-    auto sanity_seconds_from_code = [](uint16_t san) -> float {
-        switch (san) {
-        case 0: return 0.25f;
-        case 1: return 1.0f;
-        case 2: return 4.0f;
-        case 3: return 16.0f;
-        case 4: return 60.0f;
-        case 5: return 4.0f * 60.0f;
-        case 6: return 16.0f * 60.0f;
-        case 7: return 64.0f * 60.0f;
-        default: return 0.0f;
+    auto sanity_seconds_from_code = [](uint16_t san) -> float
+    {
+        switch (san)
+        {
+        case 0:
+            return 0.25f;
+        case 1:
+            return 1.0f;
+        case 2:
+            return 4.0f;
+        case 3:
+            return 16.0f;
+        case 4:
+            return 60.0f;
+        case 5:
+            return 4.0f * 60.0f;
+        case 6:
+            return 16.0f * 60.0f;
+        case 7:
+            return 64.0f * 60.0f;
+        default:
+            return 0.0f;
         }
     };
 
-    auto apply_setup_flags = [&]() {
+    auto apply_setup_flags = [&]()
+    {
         setup.promiscuous = false;
         setup.multicast = false;
 
-        if (len > 128) {
+        if (len > 128)
+        {
             const uint16_t len16 = static_cast<uint16_t>(len & 0xffff);
             setup.multicast = (0 != (len16 & QNA_SETUP_MC));
             setup.promiscuous = (0 != (len16 & QNA_SETUP_PM));
 
             uint16_t san = static_cast<uint16_t>((len16 & QNA_SETUP_ST) >> 4);
-            if (san) {
+            if (san)
+            {
                 float secs = sanity_seconds_from_code(san);
-                if (secs > 0.0f) {
+                if (secs > 0.0f)
+                {
                     sanity.quarter_secs = static_cast<int>(secs * 4.0f);
                     sanity.max = static_cast<int>(secs * QNA_SERVICE_INTERVAL);
                 }
@@ -1604,8 +1732,10 @@ void deqna_c::worker(unsigned instance)
     worker_init_realtime_priority(rt_device);
 
     uint8_t pkt_buf[2048];
-    while (!workers_terminate) {
-        if (reset_in_progress.load(std::memory_order_acquire)) {
+    while (!workers_terminate)
+    {
+        if (reset_in_progress.load(std::memory_order_acquire))
+        {
             timeout_c::wait_ms(1);
             continue;
         }
@@ -1614,7 +1744,8 @@ void deqna_c::worker(unsigned instance)
         service_intr_complete();
         process_deferred_interrupts();
 
-        if (init_asserted || qunibusadapter->line_INIT) {
+        if (init_asserted || qunibusadapter->line_INIT)
+        {
             timeout_c::wait_ms(1);
             continue;
         }
@@ -1623,25 +1754,35 @@ void deqna_c::worker(unsigned instance)
         bool do_process = false;
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            if (tx_kick) {
+            if (tx_kick)
+            {
                 tx_kick = false;
                 tx_state = tx_state_enum::active;
                 tx_wait_until_ns = 0;
                 do_dispatch = true;
-            } else if (tx_state == tx_state_enum::wait_valid) {
+            }
+            else if (tx_state == tx_state_enum::wait_valid)
+            {
                 do_process = true;
-            } else if (tx_state == tx_state_enum::active) {
+            }
+            else if (tx_state == tx_state_enum::active)
+            {
                 do_process = true;
             }
         }
-        if (do_dispatch) {
-            if (!dispatch_xbdl()) {
+        if (do_dispatch)
+        {
+            if (!dispatch_xbdl())
+            {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 tx_state = tx_state_enum::idle;
             }
             process_deferred_interrupts();
-        } else if (do_process) {
-            if (!process_xbdl()) {
+        }
+        else if (do_process)
+        {
+            if (!process_xbdl())
+            {
                 std::lock_guard<std::recursive_mutex> lock(state_mutex);
                 if (tx_state != tx_state_enum::wait_valid)
                     tx_state = tx_state_enum::idle;
@@ -1652,7 +1793,8 @@ void deqna_c::worker(unsigned instance)
         bool do_rbdl = false;
         {
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            if (rbdl_pending) {
+            if (rbdl_pending)
+            {
                 rbdl_pending = false;
                 do_rbdl = true;
             }
@@ -1667,13 +1809,16 @@ void deqna_c::worker(unsigned instance)
             if (csr & QNA_CSR_RE)
                 capture_enabled = true;
         }
-        if (pcap.is_open() && capture_enabled) {
+        if (pcap.is_open() && capture_enabled)
+        {
             size_t len = 0;
-            if (!pcap.poll(pkt_buf, sizeof(pkt_buf), &len)) {
+            if (!pcap.poll(pkt_buf, sizeof(pkt_buf), &len))
+            {
                 timeout_c::wait_ms(10);
                 continue;
             }
-            if (len > 0) {
+            if (len > 0)
+            {
                 bool should_accept = false;
                 {
                     std::lock_guard<std::recursive_mutex> lock(state_mutex);
