@@ -611,12 +611,12 @@ void deuna_c::update_intr(void)
     const bool inte = (pcsr0 & PCSR0_INTE) != 0;
     if (!inte) {
         if (trace.value && any)
-            WARNING("DEUNA: INTR suppressed (INTE=0) pcsr0=%06o", pcsr0);
+            DEBUG("DEUNA: INTR suppressed (INTE=0) pcsr0=%06o", pcsr0);
         if (irq) {
             qunibusadapter->cancel_INTR(intr_request);
             irq = false;
             if (trace.value)
-                WARNING("DEUNA: INTR deassert pcsr0=%06o", pcsr0);
+                DEBUG("DEUNA: INTR deassert pcsr0=%06o", pcsr0);
         }
         return;
     }
@@ -631,7 +631,7 @@ void deuna_c::update_intr(void)
         qunibusadapter->INTR(intr_request, reg_pcsr0, pcsr0);
         irq = true;
         if (trace.value)
-            WARNING("DEUNA: INTR assert pcsr0=%06o vec=%03o level=%d", pcsr0, intr_vector.value, intr_level.value);
+            DEBUG("DEUNA: INTR assert pcsr0=%06o vec=%03o level=%d", pcsr0, intr_vector.value, intr_level.value);
     }
 }
 
@@ -647,7 +647,7 @@ void deuna_c::reset_controller(void)
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
 
     if (trace.value)
-        WARNING("DEUNA: reset_controller called");
+        DEBUG("DEUNA: reset_controller called");
 
     pcsr0 = PCSR0_DNI;  // Done on reset
     pcsr1 = TYPE_DEUNA | STATE_READY;
@@ -731,7 +731,7 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
                 static_cast<uint16_t>(~w1c_mask), __ATOMIC_RELAXED);
             uint16_t cleared = static_cast<uint16_t>(before & w1c_mask);
             if (trace.value && cleared)
-                WARNING("DEUNA: W1C immediate clear bits=%06o (was pcsr0=%06o)", cleared, before);
+                DEBUG("DEUNA: W1C immediate clear bits=%06o (was pcsr0=%06o)", cleared, before);
             update_intr();
         }
     }
@@ -742,7 +742,7 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
         else if (reg_index == DEUNA_REG_PCSR1) rname = "PCSR1";
         else if (reg_index == DEUNA_REG_PCSR2) rname = "PCSR2";
         else if (reg_index == DEUNA_REG_PCSR3) rname = "PCSR3";
-        WARNING("DEUNA: on_after_register_access %s = %06o (access=%d)", rname, val, access);
+        DEBUG("DEUNA: on_after_register_access %s = %06o (access=%d)", rname, val, access);
     }
 
     // PCSR2/3 are safe to apply immediately; diagnostics read back right away.
@@ -785,7 +785,7 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         else if (reg_index == DEUNA_REG_PCSR1) rname = "PCSR1";
         else if (reg_index == DEUNA_REG_PCSR2) rname = "PCSR2";
         else if (reg_index == DEUNA_REG_PCSR3) rname = "PCSR3";
-        WARNING("DEUNA: Write %s (reg %d) = %06o", rname, reg_index, val);
+        DEBUG("DEUNA: Write %s (reg %d) = %06o", rname, reg_index, val);
     }
 
     switch (reg_index) {
@@ -793,7 +793,7 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         if (access == DATO_BYTEH) {
             uint16_t cleared = w1c_snapshot;
             if (trace.value && cleared)
-                WARNING("DEUNA: W1C BYTEH clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
+                DEBUG("DEUNA: W1C BYTEH clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
             pcsr0 &= static_cast<uint16_t>(~w1c_snapshot);
             update_intr();
             return;
@@ -806,7 +806,7 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
         if (access == DATO_WORD) {
             uint16_t cleared = w1c_snapshot;
             if (trace.value && cleared)
-                WARNING("DEUNA: W1C WORD clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
+                DEBUG("DEUNA: W1C WORD clear bits=%06o (was pcsr0=%06o)", cleared, pcsr0);
             pcsr0 &= static_cast<uint16_t>(~w1c_snapshot);
         }
 
@@ -825,7 +825,7 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
             uint16_t cmd = pcsr0 & PCSR0_PCMD;
             if (cmd != CMD_NOOP) {
                 if (trace.value)
-                    WARNING("DEUNA: PCSR0 write cmd=%03o, pcsr0=%06o", cmd, pcsr0);
+                    DEBUG("DEUNA: PCSR0 write cmd=%03o, pcsr0=%06o", cmd, pcsr0);
                 
                 // Commands that require DMA must be queued for worker thread.
                 // Commands that don't need DMA can be processed immediately.
@@ -835,15 +835,15 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
                     std::lock_guard<std::mutex> cmdlock(pending_cmd_mutex);
                     pending_cmd = cmd;
                     if (trace.value)
-                        WARNING("DEUNA: Queued command %03o for worker", cmd);
+                        DEBUG("DEUNA: Queued command %03o for worker", cmd);
                 } else {
                     // Safe to execute immediately (no DMA needed)
                     port_command(cmd);
                     if (trace.value)
-                        WARNING("DEUNA: PCSR0 after command, pcsr0=%06o", pcsr0);
+                        DEBUG("DEUNA: PCSR0 after command, pcsr0=%06o", pcsr0);
                 }
             } else if (trace.value) {
-                WARNING("DEUNA: PCSR0 write with NOOP, pcsr0=%06o", pcsr0);
+                DEBUG("DEUNA: PCSR0 write with NOOP, pcsr0=%06o", pcsr0);
             }
         }
 
@@ -905,13 +905,13 @@ void deuna_c::process_pending_command(void)
 
     if (cmd != 0) {
         if (trace.value)
-            WARNING("DEUNA: Worker processing queued command %03o", cmd);
+            DEBUG("DEUNA: Worker processing queued command %03o", cmd);
         
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         port_command(cmd);
         
         if (trace.value)
-            WARNING("DEUNA: Worker command done, pcsr0=%06o", pcsr0);
+            DEBUG("DEUNA: Worker command done, pcsr0=%06o", pcsr0);
     }
 }
 
@@ -1385,13 +1385,13 @@ void deuna_c::port_command(uint16_t cmd)
         case CMD_HALT: cmdname = "HALT"; break;
         case CMD_STOP: cmdname = "STOP"; break;
         }
-        WARNING("DEUNA: port_command(%s/%03o) state=%03o pcsr0=%06o", cmdname, cmd, state, pcsr0);
+        DEBUG("DEUNA: port_command(%s/%03o) state=%03o pcsr0=%06o", cmdname, cmd, state, pcsr0);
     }
 
     switch (cmd) {
     case CMD_PDMD:
         if (trace.value) {
-            WARNING("DEUNA: PDMD tdrb=%08o telen=%u trlen=%u txnext=%u",
+            DEBUG("DEUNA: PDMD tdrb=%08o telen=%u trlen=%u txnext=%u",
                     tdrb, telen, trlen, txnext);
         }
         process_transmit(1);  // Process only one descriptor for PDMD
@@ -1478,7 +1478,7 @@ void deuna_c::port_command(uint16_t cmd)
     pcsr0 &= ~PCSR0_PCMD;
 
     if (trace.value)
-        WARNING("DEUNA: port_command done, pcsr0=%06o", pcsr0);
+        DEBUG("DEUNA: port_command done, pcsr0=%06o", pcsr0);
 
     update_intr();
 }
@@ -2145,7 +2145,7 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
         return false;
     };
     if (trace.value && tx_not_owned_squelch < 4) {
-        WARNING("DEUNA: TX start tdrb=%08o telen=%u trlen=%u txnext=%u limit=%u",
+        DEBUG("DEUNA: TX start tdrb=%08o telen=%u trlen=%u txnext=%u limit=%u",
                 tdrb, telen, trlen, txnext, limit);
     }
 
@@ -2166,7 +2166,7 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
             unsigned owned_index = 0;
             if (find_owned_desc(owned_index)) {
                 if (trace.value && tx_not_owned_squelch < 4) {
-                    WARNING("DEUNA: TX desc not owned at txnext=%u, jumping to owned=%u",
+                    DEBUG("DEUNA: TX desc not owned at txnext=%u, jumping to owned=%u",
                             txnext, owned_index);
                 }
                 txnext = owned_index;
@@ -2174,12 +2174,12 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
                 continue;
             }
             if (trace.value && tx_ring_dump_squelch < 2) {
-                WARNING("DEUNA: TX ring has no owned descriptors, dumping ring");
+                DEBUG("DEUNA: TX ring has no owned descriptors, dumping ring");
                 dump_tx_ring(8);
                 tx_ring_dump_squelch++;
             }
             if (trace.value && tx_not_owned_squelch < 4) {
-                WARNING("DEUNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
+                DEBUG("DEUNA: TX desc addr=%08o w0=%06o w1=%06o w2=%06o w3=%06o",
                         desc_addr, txhdr[0], txhdr[1], txhdr[2], txhdr[3]);
                 WARNING("DEUNA: TX desc not owned, stopping at txnext=%u", txnext);
                 tx_not_owned_squelch++;

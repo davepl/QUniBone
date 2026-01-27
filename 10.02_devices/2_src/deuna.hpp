@@ -29,6 +29,28 @@
 #include "pcap_bridge.hpp"
 #include "parameter.hpp"
 
+// Safe string copy with guaranteed NUL termination for static arrays.
+// Array size is automatically deduced at compile time.
+// Returns length of src (like strlcpy).
+template <size_t N>
+static inline size_t static_strcpy(char (&dst)[N], const char *src)
+{
+    size_t len = std::strlen(src);
+    if (N > 0) {
+        size_t copy_len = (len < N - 1) ? len : N - 1;
+        std::memcpy(dst, src, copy_len);
+        dst[copy_len] = '\0';
+    }
+    return len;
+}
+
+// Array size helper - deduces static array length at compile time.
+template <typename T, size_t N>
+static constexpr size_t arraysize(const T (&)[N]) noexcept
+{
+    return N;
+}
+
 /*
  * Default DEUNA I/O page parameters
  * Base address is a typical DEUNA CSR location (octal)
