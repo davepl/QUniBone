@@ -153,56 +153,56 @@ static constexpr size_t ETH_MAX_PACKET = 1514;  // Maximum Ethernet frame (no CR
 static constexpr size_t ETH_FRAME_SIZE = 1518;  // Frame + CRC space
 
 // Queue and timing
-static constexpr unsigned QNA_QUE_MAX = 64;
-static constexpr unsigned QNA_SERVICE_INTERVAL = 100; // Timer service rate (Hz)
-static constexpr unsigned QNA_HW_SANITY_SECS = 240;
+static constexpr unsigned QNA_QUE_MAX = 64;                 // Maximum queued packets
+static constexpr unsigned QNA_SERVICE_INTERVAL = 100;       // Timer service rate (Hz)
+static constexpr unsigned QNA_HW_SANITY_SECS = 240;         // Hardware sanity check period (seconds)
 
 // Descriptor flags
-static constexpr uint16_t QNA_DSC_V = QE_RING_VALID;
-static constexpr uint16_t QNA_DSC_C = QE_RING_CHAIN;
-static constexpr uint16_t QNA_DSC_E = QE_RING_EOMSG;
-static constexpr uint16_t QNA_DSC_S = QE_RING_SETUP;
-static constexpr uint16_t QNA_DSC_L = QE_RING_ODD_END;
-static constexpr uint16_t QNA_DSC_H = QE_RING_ODD_BEGIN;
+static constexpr uint16_t QNA_DSC_V = QE_RING_VALID;        // Descriptor valid
+static constexpr uint16_t QNA_DSC_C = QE_RING_CHAIN;        // Chain to next descriptor
+static constexpr uint16_t QNA_DSC_E = QE_RING_EOMSG;        // End of message indicator
+static constexpr uint16_t QNA_DSC_S = QE_RING_SETUP;        // Setup frame indicator
+static constexpr uint16_t QNA_DSC_L = QE_RING_ODD_END;      // Odd byte at end
+static constexpr uint16_t QNA_DSC_H = QE_RING_ODD_BEGIN;    // Odd byte at beginning
 
 // CSR bits
-static constexpr uint16_t QNA_CSR_RI = QE_RCV_INT;
-static constexpr uint16_t QNA_CSR_PE = QE_PARITY;
-static constexpr uint16_t QNA_CSR_CA = QE_CARRIER;
-static constexpr uint16_t QNA_CSR_OK = QE_OK;
-static constexpr uint16_t QNA_CSR_SE = QE_STIM_ENABLE;
-static constexpr uint16_t QNA_CSR_EL = QE_ELOOP;
-static constexpr uint16_t QNA_CSR_IL = QE_ILOOP;
-static constexpr uint16_t QNA_CSR_XI = QE_XMIT_INT;
-static constexpr uint16_t QNA_CSR_IE = QE_INT_ENABLE;
-static constexpr uint16_t QNA_CSR_RL = QE_RL_INVALID;
-static constexpr uint16_t QNA_CSR_XL = QE_XL_INVALID;
-static constexpr uint16_t QNA_CSR_NI = QE_NEX_MEM_INT;
-static constexpr uint16_t QNA_CSR_SR = QE_RESET;
-static constexpr uint16_t QNA_CSR_RE = QE_RCV_ENABLE;
+static constexpr uint16_t QNA_CSR_RI = QE_RCV_INT;          // Receive Interrupt
+static constexpr uint16_t QNA_CSR_PE = QE_PARITY;           // Parity Error
+static constexpr uint16_t QNA_CSR_CA = QE_CARRIER;          // Carrier sense/Collision
+static constexpr uint16_t QNA_CSR_OK = QE_OK;               // Device ready/healthy
+static constexpr uint16_t QNA_CSR_SE = QE_STIM_ENABLE;      // Stimulus Enable (loopback)
+static constexpr uint16_t QNA_CSR_EL = QE_ELOOP;            // External Loopback
+static constexpr uint16_t QNA_CSR_IL = QE_ILOOP;            // Internal Loopback
+static constexpr uint16_t QNA_CSR_XI = QE_XMIT_INT;         // Transmit Interrupt
+static constexpr uint16_t QNA_CSR_IE = QE_INT_ENABLE;       // Interrupt Enable
+static constexpr uint16_t QNA_CSR_RL = QE_RL_INVALID;       // Receive List Invalid
+static constexpr uint16_t QNA_CSR_XL = QE_XL_INVALID;       // Transmit List Invalid
+static constexpr uint16_t QNA_CSR_NI = QE_NEX_MEM_INT;      // Nonexistent Memory Interrupt
+static constexpr uint16_t QNA_CSR_SR = QE_RESET;            // Software Reset
+static constexpr uint16_t QNA_CSR_RE = QE_RCV_ENABLE;       // Receive Enable
 
 // CSR masks
-static constexpr uint16_t QNA_CSR_RO = QE_CSR_RO;
-static constexpr uint16_t QNA_CSR_RW = QE_CSR_RW;
-static constexpr uint16_t QNA_CSR_W1 = QE_CSR_W1;
-static constexpr uint16_t QNA_CSR_BP = QE_CSR_BP;
+static constexpr uint16_t QNA_CSR_RO = QE_CSR_RO;           // Read-only bits
+static constexpr uint16_t QNA_CSR_RW = QE_CSR_RW;           // Read-write bits
+static constexpr uint16_t QNA_CSR_W1 = QE_CSR_W1;           // Write-1-to-clear bits
+static constexpr uint16_t QNA_CSR_BP = QE_CSR_BP;           // Bad parity (sticky) 
 static constexpr uint16_t QNA_CSR_XIRI = (QNA_CSR_XI | QNA_CSR_RI);
 
 // Vector register bits
-static constexpr uint16_t QNA_VEC_MS = QE_VEC_MS;
-static constexpr uint16_t QNA_VEC_OS = QE_VEC_OS;
-static constexpr uint16_t QNA_VEC_RS = QE_VEC_RS;
-static constexpr uint16_t QNA_VEC_ST = QE_VEC_ST;
-static constexpr uint16_t QNA_VEC_IV = QE_VEC_IV;
-static constexpr uint16_t QNA_VEC_ID = QE_VEC_ID;
-static constexpr uint16_t QNA_VEC_RO = QE_VEC_RO;
-static constexpr uint16_t QNA_VEC_RW = QE_VEC_RW;
+static constexpr uint16_t QNA_VEC_MS = QE_VEC_MS;           // Mode select
+static constexpr uint16_t QNA_VEC_OS = QE_VEC_OS;           // Offset select
+static constexpr uint16_t QNA_VEC_RS = QE_VEC_RS;           // Ring select
+static constexpr uint16_t QNA_VEC_ST = QE_VEC_ST;           // Setup/test
+static constexpr uint16_t QNA_VEC_IV = QE_VEC_IV;           // Interrupt vector
+static constexpr uint16_t QNA_VEC_ID = QE_VEC_ID;           // Interrupt disable
+static constexpr uint16_t QNA_VEC_RO = QE_VEC_RO;           // Read-only bits
+static constexpr uint16_t QNA_VEC_RW = QE_VEC_RW;           // Read-write bits
 
 // Setup packet bits
-static constexpr uint16_t QNA_SETUP_MC = 0x0001;  // Accept all multicast
-static constexpr uint16_t QNA_SETUP_PM = 0x0002;  // Promiscuous mode
-static constexpr uint16_t QNA_SETUP_LD = 0x000C;  // LED control bits
-static constexpr uint16_t QNA_SETUP_ST = 0x0070;  // Sanity timer setting
+static constexpr uint16_t QNA_SETUP_MC = 0x0001;            // Accept all multicast
+static constexpr uint16_t QNA_SETUP_PM = 0x0002;            // Promiscuous mode
+static constexpr uint16_t QNA_SETUP_LD = 0x000C;            // LED control bits
+static constexpr uint16_t QNA_SETUP_ST = 0x0070;            // Sanity timer setting
 
 // Version
 static const char *DEQNA_VERSION = "v090";  // Simplified refactor, OpenSIMH-aligned

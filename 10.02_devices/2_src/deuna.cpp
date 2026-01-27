@@ -1,52 +1,50 @@
-/*
- * DEUNA Ethernet Controller Emulation for QUniBone
- * (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
- * Contributed under the BSD License
- *
- * This is implementation based on:
- *   - DEC DEUNA User's Guide (EK-DEUNA-UG)
- *   - UNIBUS specification
- *
- *  * This file is part of the QUniBone project, licensed under the BSD License.
- *
- *   May be based in part on the DEQNA implementation in the OpenSIMH project:
- *
- *   Copyright (c) 1993-2008, Robert M Supnik
- *   Permission is hereby granted, free of charge, to any person obtaining a
- *   copy of this software and associated documentation files (the "Software"),
- *   to deal in the Software without restriction, including without limitation
- *   the rights to use, copy, modify, merge, publish, distribute, sublicense,
- *   and/or sell copies of the Software, and to permit persons to whom the
- *   Software is furnished to do so, subject to the following conditions:
- *
- * Theory of Operation
- * -------------------
- * The DEUNA exposes four UNIBUS registers (PCSR0-3). PCSR0 is the command/status
- * register (port commands, interrupts, W1C bits). PCSR2/3 provide the PCBB
- * pointer, which is a UNIBUS address to the PCB command block. The driver
- * programs PCSR2/3, then issues PCSR0 GETPCBB/GETCMD commands to let the
- * controller fetch the PCB and perform a command (configure, set mode, etc).
- *
- * Once configured, RX and TX use descriptor rings in PDP-11 memory. The device
- * DMA-reads descriptors and buffers, then DMA-writes status and ownership
- * back to the rings. RX frames are sourced from libpcap and queued before
- * being copied into host memory. TX frames are DMA-read and injected via pcap.
- *
- * Two worker threads drive the device: instance 0 handles RX (pcap poll, queue,
- * process_receive), instance 1 handles TX (process_transmit). All UNIBUS
- * register writes are captured in order and replayed by the workers to preserve
- * PCSR2/3 -> PCSR0 command sequencing (critical for GETPCBB).
- *
- * Interrupt behavior mirrors hardware: PCSR0 summary bits and INTE gate the
- * UNIBUS interrupt. The code maintains PCSR0/1 state and updates the visible
- * register latches after each operation.
- *
- * Defaults are set for operator convenience (ifname=eth0, promisc on, etc),
- * but the driver can override MAC and mode via PCB commands. Reset and INIT
- * reset all state, descriptor pointers, and statistics.
- *
- * This file is part of the QUniBone project, licensed under GPLv2.
- */
+// DEUNA Ethernet Controller Emulation for QUniBone
+// (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
+// Contributed under the BSD License
+//
+// This is implementation based on:
+//   - DEC DEUNA User's Guide (EK-DEUNA-UG)
+//   - UNIBUS specification
+//
+// This file is part of the QUniBone project, licensed under the BSD License.
+//
+// May be based in part on the DEQNA implementation in the OpenSIMH project:
+//
+// Copyright (c) 1993-2008, Robert M Supnik
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// Theory of Operation
+// -------------------
+// The DEUNA exposes four UNIBUS registers (PCSR0-3). PCSR0 is the command/status
+// register (port commands, interrupts, W1C bits). PCSR2/3 provide the PCBB
+// pointer, which is a UNIBUS address to the PCB command block. The driver
+// programs PCSR2/3, then issues PCSR0 GETPCBB/GETCMD commands to let the
+// controller fetch the PCB and perform a command (configure, set mode, etc).
+//
+// Once configured, RX and TX use descriptor rings in PDP-11 memory. The device
+// DMA-reads descriptors and buffers, then DMA-writes status and ownership
+// back to the rings. RX frames are sourced from libpcap and queued before
+// being copied into host memory. TX frames are DMA-read and injected via pcap.
+//
+// Two worker threads drive the device: instance 0 handles RX (pcap poll, queue,
+// process_receive), instance 1 handles TX (process_transmit). All UNIBUS
+// register writes are captured in order and replayed by the workers to preserve
+// PCSR2/3 -> PCSR0 command sequencing (critical for GETPCBB).
+//
+// Interrupt behavior mirrors hardware: PCSR0 summary bits and INTE gate the
+// UNIBUS interrupt. The code maintains PCSR0/1 state and updates the visible
+// register latches after each operation.
+//
+// Defaults are set for operator convenience (ifname=eth0, promisc on, etc),
+// but the driver can override MAC and mode via PCB commands. Reset and INIT
+// reset all state, descriptor pointers, and statistics.
+//
+// This file is part of the QUniBone project, licensed under GPLv2.
 
 #include <string.h>
 #include <stdio.h>
@@ -71,231 +69,70 @@
 #error "DEUNA is a UNIBUS-only device"
 #endif
 
-/*
- * Ethernet framing constants
- */
-static const size_t ETH_MIN_PACKET = 60;   // Minimum Ethernet frame (no CRC)
-static const size_t ETH_MAX_PACKET = 1514; // Maximum Ethernet frame (no CRC)
-static const size_t ETH_FRAME_SIZE = 1518; // Frame + CRC space
-static const size_t UNA_MAX_RCV_PACKET = 1600;
+// Ethernet framing constants
 
-/*
- * Queue and timer constants
- */
-static const unsigned UNA_QUE_MAX = 500;
-
-/*
- * Internal memory sizes (word counts)
- */
-static const size_t DEUNA_WCS_WORDS = 8192;
-static const size_t DEUNA_LINK_WORDS = 1024;
-
-/*
- * Default DEUNA hardware address (DEC OUI)
- */
-static const uint8_t DEUNA_DEFAULT_MAC[6] = {0x08, 0x00, 0x2b, 0xcc, 0xdd, 0xee};
-
-/*
- * PCSR0 register definitions
- */
-static const uint16_t PCSR0_SERI = 0100000;     // Status Error Interrupt
-static const uint16_t PCSR0_PCEI = 0040000;     // Port Command Error Interrupt
-static const uint16_t PCSR0_RXI = 0020000;      // Receive Interrupt
-static const uint16_t PCSR0_TXI = 0010000;      // Transmit Interrupt
-static const uint16_t PCSR0_DNI = 0004000;      // Done Interrupt
-static const uint16_t PCSR0_RCBI = 0002000;     // Receive Buffer Unavailable
-static const uint16_t PCSR0_FATL = 0001000;     // Fatal Internal Error
-static const uint16_t PCSR0_USCI = 0000400;     // Unsolicited State Change Interrupt
-static const uint16_t PCSR0_INTR = 0000200;     // Interrupt Summary
-static const uint16_t PCSR0_INTE = 0000100;     // Interrupt Enable
-static const uint16_t PCSR0_RSET = 0000040;     // Reset
-static const uint16_t PCSR0_PCMD = 0000017;     // Port Command field
-static const uint16_t PCSR0_W1C_MASK = 0177400; // Write-1-to-clear bits
-
-/*
- * PCSR0 Port Commands
- */
-static const uint16_t CMD_NOOP = 000;
-static const uint16_t CMD_GETPCBB = 001;
-static const uint16_t CMD_GETCMD = 002;
-static const uint16_t CMD_SELFTEST = 003;
-static const uint16_t CMD_START = 004;
-static const uint16_t CMD_BOOT = 005;
-static const uint16_t CMD_PDMD = 010;
-static const uint16_t CMD_HALT = 016;
-static const uint16_t CMD_STOP = 017;
-
-/*
- * PCSR1 register definitions
- */
-static const uint16_t PCSR1_XPWR = 0100000;  // Transceiver power failure
-static const uint16_t PCSR1_ICAB = 0040000;  // Port/Link cable failure
-static const uint16_t PCSR1_ECOD = 0037400;  // Self-test error code
-static const uint16_t PCSR1_PCTO = 0000200;  // Port Command Timeout
-static const uint16_t PCSR1_TYPE = 0000160;  // Interface type
-static const uint16_t PCSR1_STATE = 0000017; // State
-
-static const uint16_t TYPE_DEUNA = (0 << 4);
-static const uint16_t TYPE_DELUA = (1 << 4);
-
-static const uint16_t STATE_RESET = 000;
-static const uint16_t STATE_PLOAD = 001;
-static const uint16_t STATE_READY = 002;
-static const uint16_t STATE_RUNNING = 003;
-static const uint16_t STATE_UHALT = 005;
-static const uint16_t STATE_NHALT = 006;
-static const uint16_t STATE_NUHALT = 007;
-static const uint16_t STATE_HALT = 010;
-static const uint16_t STATE_SLOAD = 017;
-
-/*
- * Status register definitions
- */
-static const uint16_t STAT_ERRS = 0100000;
-static const uint16_t STAT_MERR = 0040000;
-static const uint16_t STAT_BABL = 0020000;
-static const uint16_t STAT_CERR = 0010000;
-static const uint16_t STAT_TMOT = 0004000;
-static const uint16_t STAT_RRNG = 0001000;
-static const uint16_t STAT_TRNG = 0000400;
-static const uint16_t STAT_PTCH = 0000200;
-static const uint16_t STAT_RRAM = 0000100;
-static const uint16_t STAT_RREV = 0000077;
-
-/*
- * Mode register definitions
- */
-static const uint16_t MODE_PROM = 0100000; // Promiscuous mode
-static const uint16_t MODE_ENAL = 0040000; // Enable all multicast
-static const uint16_t MODE_DRDC = 0020000; // Disable data chaining
-static const uint16_t MODE_TPAD = 0010000; // Transmit pad enable
-static const uint16_t MODE_ECT = 0004000;  // Enable collision test
-static const uint16_t MODE_DMNT = 0001000; // Disable maintenance message
-static const uint16_t MODE_INTL = 0000200; // Internal loopback enable
-static const uint16_t MODE_DTCR = 0000010; // Disable transmit CRC
-static const uint16_t MODE_LOOP = 0000004; // Internal loopback mode
-static const uint16_t MODE_HDPX = 0000001; // Half duplex
-
-/*
- * Function Code definitions
- */
-static const uint16_t FC_NOOP = 0000000;
-static const uint16_t FC_LSM = 0000001;
-static const uint16_t FC_RDPA = 0000002;
-static const uint16_t FC_RPA = 0000004;
-static const uint16_t FC_WPA = 0000005;
-static const uint16_t FC_RMAL = 0000006;
-static const uint16_t FC_WMAL = 0000007;
-static const uint16_t FC_RRF = 0000010;
-static const uint16_t FC_WRF = 0000011;
-static const uint16_t FC_RDCTR = 0000012;
-static const uint16_t FC_RDCLCTR = 0000013;
-static const uint16_t FC_RMODE = 0000014;
-static const uint16_t FC_WMODE = 0000015;
-static const uint16_t FC_RSTAT = 0000016;
-static const uint16_t FC_RCSTAT = 0000017;
-static const uint16_t FC_DIM = 0000020;
-static const uint16_t FC_LIM = 0000021;
-static const uint16_t FC_RSID = 0000022;
-static const uint16_t FC_WSID = 0000023;
-static const uint16_t FC_RLSA = 0000024;
-static const uint16_t FC_WLSA = 0000025;
-
-/*
- * Transmitter Ring definitions
- */
-static const uint16_t TXR_OWN = 0100000;
-static const uint16_t TXR_ERRS = 0040000;
-static const uint16_t TXR_MTCH = 0020000;
-static const uint16_t TXR_MORE = 0010000;
-static const uint16_t TXR_ONE = 0004000;
-static const uint16_t TXR_DEF = 0002000;
-static const uint16_t TXR_STF = 0001000;
-static const uint16_t TXR_ENF = 0000400;
-
-static const uint16_t TXR_BUFL = 0100000;
-static const uint16_t TXR_UBTO = 0040000;
-static const uint16_t TXR_UFLO = 0020000;
-static const uint16_t TXR_LCOL = 0010000;
-static const uint16_t TXR_LCAR = 0004000;
-static const uint16_t TXR_RTRY = 0002000;
-static const uint16_t TXR_TDR = 0001777;
-
-/*
- * Receiver Ring definitions
- */
-static const uint16_t RXR_OWN = 0100000;
-static const uint16_t RXR_ERRS = 0040000;
-static const uint16_t RXR_FRAM = 0020000;
-static const uint16_t RXR_OFLO = 0010000;
-static const uint16_t RXR_CRC = 0004000;
-static const uint16_t RXR_STF = 0001000;
-static const uint16_t RXR_ENF = 0000400;
-
-static const uint16_t RXR_BUFL = 0100000;
-static const uint16_t RXR_UBTO = 0040000;
 static const uint16_t RXR_NCHN = 0020000;
 static const uint16_t RXR_OVRN = 0010000;
 static const uint16_t RXR_MLEN = 0007777;
 
-/*
- * Version string
- */
+//
+// Version string
+//
 static const char *DEUNA_VERSION = "v002"; // Only poll pcap when STATE_RUNNING
 
-/*
- * mac_is_zero
- * Purpose: central helper to validate all-zero MACs.
- * Behavior: checks six bytes for zeros and returns true if all are zero.
- * Notes: used to gate setup and filter logic; expects a 6-byte array.
- */
+//
+// mac_is_zero
+// Purpose: central helper to validate all-zero MACs.
+// Behavior: checks six bytes for zeros and returns true if all are zero.
+// Notes: used to gate setup and filter logic; expects a 6-byte array.
+//
 static bool mac_is_zero(const uint8_t *mac)
 {
     return dec_ether_base_c::mac_is_zero(mac);
 }
 
-/*
- * mac_is_broadcast
- * Purpose: detect the Ethernet broadcast address.
- * Behavior: returns true when all six bytes are 0xff.
- * Notes: used in receive accept path and filter logic.
- */
+//
+// mac_is_broadcast
+// Purpose: detect the Ethernet broadcast address.
+// Behavior: returns true when all six bytes are 0xff.
+// Notes: used in receive accept path and filter logic.
+//
 static bool mac_is_broadcast(const uint8_t *mac)
 {
     return dec_ether_base_c::mac_is_broadcast(mac);
 }
 
-/*
- * mac_is_multicast
- * Purpose: detect multicast addresses.
- * Behavior: checks the low bit of the first byte.
- * Notes: callers should have validated length; this does not validate OUI.
- */
+//
+// mac_is_multicast
+// Purpose: detect multicast addresses.
+// Behavior: checks the low bit of the first byte.
+// Notes: callers should have validated length; this does not validate OUI.
+//
 static bool mac_is_multicast(const uint8_t *mac)
 {
     return dec_ether_base_c::mac_is_multicast(mac);
 }
 
-/*
- * mac_equal
- * Purpose: byte-wise MAC comparison utility.
- * Behavior: returns true if two 6-byte MACs are identical.
- * Notes: simple memcmp wrapper for clarity in filter code.
- */
+//
+// mac_equal
+// Purpose: byte-wise MAC comparison utility.
+// Behavior: returns true if two 6-byte MACs are identical.
+// Notes: simple memcmp wrapper for clarity in filter code.
+//
 static bool mac_equal(const uint8_t *a, const uint8_t *b)
 {
     return dec_ether_base_c::mac_equal(a, b);
 }
 
-/*
- * DEUNA Constructor
- */
-/*
- * deuna_c::deuna_c
- * Purpose: construct the DEUNA device with sane defaults and register layout.
- * Behavior: initializes registers, defaults, MAC, and buffers for emulation.
- * Notes: sets host-interface defaults (e.g., ifname) and DEC-range MAC.
- */
+//
+// DEUNA Constructor
+//
+//
+// deuna_c::deuna_c
+// Purpose: construct the DEUNA device with sane defaults and register layout.
+// Behavior: initializes registers, defaults, MAC, and buffers for emulation.
+// Notes: sets host-interface defaults (e.g., ifname) and DEC-range MAC.
+//
 deuna_c::deuna_c() : qunibusdevice_c()
 {
     set_workers_count(2); // Instance 0 = RX, Instance 1 = TX
@@ -311,13 +148,11 @@ deuna_c::deuna_c() : qunibusdevice_c()
     intr_request.set_level(intr_level.value);
     intr_request.set_vector(intr_vector.value);
 
-    /*
-     * Register layout (4 registers, 8 bytes total at base address):
-     *   +0: PCSR0
-     *   +2: PCSR1
-     *   +4: PCSR2
-     *   +6: PCSR3
-     */
+    // Register layout (4 registers, 8 bytes total at base address):
+    //   +0: PCSR0
+    //   +2: PCSR1
+    //   +4: PCSR2
+    //   +6: PCSR3
     register_count = 4;
 
     reg_pcsr0 = &(this->registers[0]);
@@ -355,7 +190,7 @@ deuna_c::deuna_c() : qunibusdevice_c()
     tx_slots.value = 0;
     trace.value = false;
 
-    /* Default MAC in DEC range */
+    // Default MAC in DEC range
     memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
 
     read_buffer.msg.reserve(UNA_MAX_RCV_PACKET);
@@ -365,12 +200,12 @@ deuna_c::deuna_c() : qunibusdevice_c()
     link_mem.assign(DEUNA_LINK_WORDS, 0);
 }
 
-/*
- * deuna_c::~deuna_c
- * Purpose: clean shutdown of DEUNA resources.
- * Behavior: closes pcap handle if compiled in.
- * Notes: workers are managed by the base framework; this just releases pcap.
- */
+//
+// deuna_c::~deuna_c
+// Purpose: clean shutdown of DEUNA resources.
+// Behavior: closes pcap handle if compiled in.
+// Notes: workers are managed by the base framework; this just releases pcap.
+//
 deuna_c::~deuna_c()
 {
 #ifdef HAVE_PCAP
@@ -378,23 +213,23 @@ deuna_c::~deuna_c()
 #endif
 }
 
-/*
- * deuna_c::parse_mac
- * Purpose: accept operator-provided MAC strings for overrides.
- * Behavior: parses aa:bb:cc:dd:ee:ff into six bytes; returns false on error.
- * Notes: empty string is treated as "no override" and returns false.
- */
+//
+// deuna_c::parse_mac
+// Purpose: accept operator-provided MAC strings for overrides.
+// Behavior: parses aa:bb:cc:dd:ee:ff into six bytes; returns false on error.
+// Notes: empty string is treated as "no override" and returns false.
+//
 bool deuna_c::parse_mac(const std::string &text, uint8_t out[6])
 {
     return dec_ether_base_c::parse_mac(text, out);
 }
 
-/*
- * deuna_c::on_param_changed
- * Purpose: react to menu/runtime parameter changes.
- * Behavior: updates DMA/interrupt routing, MAC override, and pcap filtering.
- * Notes: ifname is locked while installed; MAC parsing is strict.
- */
+//
+// deuna_c::on_param_changed
+// Purpose: react to menu/runtime parameter changes.
+// Behavior: updates DMA/interrupt routing, MAC override, and pcap filtering.
+// Notes: ifname is locked while installed; MAC parsing is strict.
+//
 bool deuna_c::on_param_changed(parameter_c *param)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -456,12 +291,12 @@ bool deuna_c::on_param_changed(parameter_c *param)
     return qunibusdevice_c::on_param_changed(param);
 }
 
-/*
- * deuna_c::on_before_install
- * Purpose: validate config and open host networking before device is active.
- * Behavior: ensures pcap support, ifname set, and opens pcap handle.
- * Notes: failure here prevents device installation and avoids a stuck PDP-11.
- */
+//
+// deuna_c::on_before_install
+// Purpose: validate config and open host networking before device is active.
+// Behavior: ensures pcap support, ifname set, and opens pcap handle.
+// Notes: failure here prevents device installation and avoids a stuck PDP-11.
+//
 bool deuna_c::on_before_install(void)
 {
 #ifndef HAVE_PCAP
@@ -498,23 +333,23 @@ bool deuna_c::on_before_install(void)
 #endif
 }
 
-/*
- * deuna_c::on_after_install
- * Purpose: finalize device state once installed in the UNIBUS.
- * Behavior: marks parameters read-only and updates link status bits.
- * Notes: called after register space is live; avoid heavy operations here.
- */
+//
+// deuna_c::on_after_install
+// Purpose: finalize device state once installed in the UNIBUS.
+// Behavior: marks parameters read-only and updates link status bits.
+// Notes: called after register space is live; avoid heavy operations here.
+//
 void deuna_c::on_after_install(void)
 {
     reset_controller();
 }
 
-/*
- * deuna_c::on_after_uninstall
- * Purpose: unwind installation state.
- * Behavior: clears readonly flags and refreshes status bits.
- * Notes: pcap close is handled in destructor or when disabling.
- */
+//
+// deuna_c::on_after_uninstall
+// Purpose: unwind installation state.
+// Behavior: clears readonly flags and refreshes status bits.
+// Notes: pcap close is handled in destructor or when disabling.
+//
 void deuna_c::on_after_uninstall(void)
 {
 #ifdef HAVE_PCAP
@@ -531,12 +366,12 @@ void deuna_c::on_after_uninstall(void)
     update_intr();
 }
 
-/*
- * deuna_c::on_power_changed
- * Purpose: respond to UNIBUS power transitions.
- * Behavior: resets controller on DCLO assert edge.
- * Notes: matches DEC power/reset semantics for device state.
- */
+//
+// deuna_c::on_power_changed
+// Purpose: respond to UNIBUS power transitions.
+// Behavior: resets controller on DCLO assert edge.
+// Notes: matches DEC power/reset semantics for device state.
+//
 void deuna_c::on_power_changed(signal_edge_enum aclo_edge, signal_edge_enum dclo_edge)
 {
     UNUSED(aclo_edge);
@@ -544,24 +379,24 @@ void deuna_c::on_power_changed(signal_edge_enum aclo_edge, signal_edge_enum dclo
         reset_controller();
 }
 
-/*
- * deuna_c::on_init_changed
- * Purpose: respond to INIT line assertion.
- * Behavior: resets the controller when INIT is asserted.
- * Notes: keeps device state consistent with PDP-11 initialization.
- */
+//
+// deuna_c::on_init_changed
+// Purpose: respond to INIT line assertion.
+// Behavior: resets the controller when INIT is asserted.
+// Notes: keeps device state consistent with PDP-11 initialization.
+//
 void deuna_c::on_init_changed(void)
 {
     if (init_asserted)
         reset_controller();
 }
 
-/*
- * deuna_c::update_pcsr_regs
- * Purpose: sync internal PCS register state to UNIBUS-visible latches.
- * Behavior: copies pcsr0-3 into active DATI/DATO flipflops.
- * Notes: call after any pcsr change to keep the CPU’s view coherent.
- */
+//
+// deuna_c::update_pcsr_regs
+// Purpose: sync internal PCS register state to UNIBUS-visible latches.
+// Behavior: copies pcsr0-3 into active DATI/DATO flipflops.
+// Notes: call after any pcsr change to keep the CPU’s view coherent.
+//
 void deuna_c::update_pcsr_regs(void)
 {
     if (reg_pcsr0)
@@ -596,12 +431,12 @@ void deuna_c::update_pcsr_regs(void)
         reg_pcsr3->pru_iopage_register->value = pcsr3;
 }
 
-/*
- * deuna_c::update_transceiver_bits
- * Purpose: reflect link/transceiver status in PCSR1.
- * Behavior: updates XPWR/ICAB bits based on pcap status and overrides.
- * Notes: called on install/uninstall and during reset.
- */
+//
+// deuna_c::update_transceiver_bits
+// Purpose: reflect link/transceiver status in PCSR1.
+// Behavior: updates XPWR/ICAB bits based on pcap status and overrides.
+// Notes: called on install/uninstall and during reset.
+//
 void deuna_c::update_transceiver_bits(void)
 {
     if (pcap.is_open())
@@ -610,12 +445,12 @@ void deuna_c::update_transceiver_bits(void)
         pcsr1 |= PCSR1_XPWR;
 }
 
-/*
- * deuna_c::update_intr
- * Purpose: raise/cancel UNIBUS interrupt based on pcsr0 status.
- * Behavior: sets INTR summary and signals/cancels interrupt requests.
- * Notes: requires pcsr0 W1C and INTE semantics to be respected.
- */
+//
+// deuna_c::update_intr
+// Purpose: raise/cancel UNIBUS interrupt based on pcsr0 status.
+// Behavior: sets INTR summary and signals/cancels interrupt requests.
+// Notes: requires pcsr0 W1C and INTE semantics to be respected.
+//
 void deuna_c::update_intr(void)
 {
     const bool any = (pcsr0 & PCSR0_W1C_MASK) != 0;
@@ -661,12 +496,12 @@ void deuna_c::update_intr(void)
     }
 }
 
-/*
- * deuna_c::reset_controller
- * Purpose: central reset path for DEUNA state.
- * Behavior: reinitializes pcsr state, descriptor pointers, filters, and stats.
- * Notes: called on INIT, power transitions, and software reset.
- */
+//
+// deuna_c::reset_controller
+// Purpose: central reset path for DEUNA state.
+// Behavior: reinitializes pcsr state, descriptor pointers, filters, and stats.
+// Notes: called on INIT, power transitions, and software reset.
+//
 void deuna_c::reset_controller(void)
 {
     reset_in_progress.store(true, std::memory_order_release); // Fix: Signal reset start
@@ -726,12 +561,12 @@ void deuna_c::init_internal_memory(void)
     link_mem.assign(DEUNA_LINK_WORDS, 0100000);
 }
 
-/*
- * deuna_c::on_after_register_access
- * Purpose: capture UNIBUS register writes from the PDP-11.
- * Behavior: queues writes for worker thread processing to avoid DMA deadlock.
- * Notes: must be fast to not block the UNIBUS callback path.
- */
+//
+// deuna_c::on_after_register_access
+// Purpose: capture UNIBUS register writes from the PDP-11.
+// Behavior: queues writes for worker thread processing to avoid DMA deadlock.
+// Notes: must be fast to not block the UNIBUS callback path.
+//
 void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uint8_t qunibus_control,
                                        DATO_ACCESS access)
 {
@@ -802,12 +637,12 @@ void deuna_c::on_after_register_access(qunibusdevice_register_t *device_reg, uin
     pending_cmd_cv.notify_one();
 }
 
-/*
- * deuna_c::handle_register_write
- * Purpose: implement PCSR0-3 semantics for writes.
- * Behavior: updates pcsr fields, latches commands, and triggers actions.
- * Notes: pcbb/cmd sequencing depends on write order; keep W1C rules intact.
- */
+//
+// deuna_c::handle_register_write
+// Purpose: implement PCSR0-3 semantics for writes.
+// Behavior: updates pcsr fields, latches commands, and triggers actions.
+// Notes: pcbb/cmd sequencing depends on write order; keep W1C rules intact.
+//
 void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS access,
                                     uint16_t w1c_snapshot)
 {
@@ -919,12 +754,12 @@ void deuna_c::handle_register_write(uint8_t reg_index, uint16_t val, DATO_ACCESS
     }
 }
 
-/*
- * deuna_c::apply_pending_reg_writes
- * Purpose: drain queued register writes in original UNIBUS order.
- * Behavior: dequeues and dispatches to handle_register_write.
- * Notes: ordering matters for GETPCBB; this runs in worker threads.
- */
+//
+// deuna_c::apply_pending_reg_writes
+// Purpose: drain queued register writes in original UNIBUS order.
+// Behavior: dequeues and dispatches to handle_register_write.
+// Notes: ordering matters for GETPCBB; this runs in worker threads.
+//
 void deuna_c::apply_pending_reg_writes(void)
 {
     std::deque<pending_reg_write> writes;
@@ -942,12 +777,12 @@ void deuna_c::apply_pending_reg_writes(void)
     }
 }
 
-/*
- * deuna_c::process_pending_command
- * Purpose: execute queued port command that requires DMA.
- * Behavior: called by worker thread to safely execute GETCMD/PDMD.
- * Notes: DMA is only safe from worker context, not from UNIBUS callback.
- */
+//
+// deuna_c::process_pending_command
+// Purpose: execute queued port command that requires DMA.
+// Behavior: called by worker thread to safely execute GETCMD/PDMD.
+// Notes: DMA is only safe from worker context, not from UNIBUS callback.
+//
 void deuna_c::process_pending_command(void)
 {
     uint16_t cmd = 0;
@@ -970,12 +805,12 @@ void deuna_c::process_pending_command(void)
     }
 }
 
-/*
- * deuna_c::dma_read_words
- * Purpose: DMA read helper for device descriptors and buffers.
- * Behavior: reads from UNIBUS or DDR-backed memory into a word buffer.
- * Notes: returns false on NXM; callers must handle failures.
- */
+//
+// deuna_c::dma_read_words
+// Purpose: DMA read helper for device descriptors and buffers.
+// Behavior: reads from UNIBUS or DDR-backed memory into a word buffer.
+// Notes: returns false on NXM; callers must handle failures.
+//
 bool deuna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
@@ -1007,12 +842,12 @@ bool deuna_c::dma_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     return dma_request.success;
 }
 
-/*
- * deuna_c::dma_write_words
- * Purpose: DMA write helper for descriptors and status back to PDP-11 memory.
- * Behavior: writes word buffers into UNIBUS or DDR-backed memory.
- * Notes: returns false on NXM; callers should set PCEI/ERR as needed.
- */
+//
+// deuna_c::dma_write_words
+// Purpose: DMA write helper for descriptors and status back to PDP-11 memory.
+// Behavior: writes word buffers into UNIBUS or DDR-backed memory.
+// Notes: returns false on NXM; callers should set PCEI/ERR as needed.
+//
 bool deuna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
@@ -1045,12 +880,12 @@ bool deuna_c::dma_write_words(uint32_t addr, const uint16_t *buffer, size_t word
     return dma_request.success;
 }
 
-/*
- * deuna_c::desc_read_words
- * Purpose: descriptor read wrapper with NXM handling.
- * Behavior: performs DMA reads and updates error status on failure.
- * Notes: used by RX/TX descriptor processing; keep error semantics consistent.
- */
+//
+// deuna_c::desc_read_words
+// Purpose: descriptor read wrapper with NXM handling.
+// Behavior: performs DMA reads and updates error status on failure.
+// Notes: used by RX/TX descriptor processing; keep error semantics consistent.
+//
 bool deuna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
@@ -1079,12 +914,12 @@ bool deuna_c::desc_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     return dma_desc_request.success;
 }
 
-/*
- * deuna_c::desc_write_words
- * Purpose: descriptor write wrapper with NXM handling.
- * Behavior: performs DMA writes and updates error status on failure.
- * Notes: used when returning ownership or status to the PDP-11.
- */
+//
+// deuna_c::desc_write_words
+// Purpose: descriptor write wrapper with NXM handling.
+// Behavior: performs DMA writes and updates error status on failure.
+// Notes: used when returning ownership or status to the PDP-11.
+//
 bool deuna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
@@ -1114,12 +949,12 @@ bool deuna_c::desc_write_words(uint32_t addr, const uint16_t *buffer, size_t wor
     return dma_desc_request.success;
 }
 
-/*
- * deuna_c::dma_read_bytes
- * Purpose: byte-granular DMA reader for Ethernet frames.
- * Behavior: reads bytes from PDP-11 memory using aligned word reads.
- * Notes: handles odd-byte alignment; expects len <= frame size.
- */
+//
+// deuna_c::dma_read_bytes
+// Purpose: byte-granular DMA reader for Ethernet frames.
+// Behavior: reads bytes from PDP-11 memory using aligned word reads.
+// Notes: handles odd-byte alignment; expects len <= frame size.
+//
 bool deuna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
 {
     if (len == 0)
@@ -1162,12 +997,12 @@ bool deuna_c::dma_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
     return true;
 }
 
-/*
- * deuna_c::dma_write_bytes
- * Purpose: byte-granular DMA writer for Ethernet frames.
- * Behavior: writes bytes into PDP-11 memory using aligned word writes.
- * Notes: handles odd alignment; callers should verify buffer lengths.
- */
+//
+// deuna_c::dma_write_bytes
+// Purpose: byte-granular DMA writer for Ethernet frames.
+// Behavior: writes bytes into PDP-11 memory using aligned word writes.
+// Notes: handles odd alignment; callers should verify buffer lengths.
+//
 bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
 {
     if (len == 0)
@@ -1218,12 +1053,12 @@ bool deuna_c::dma_write_bytes(uint32_t addr, const uint8_t *buffer, size_t len)
     return dma_write_words(aligned, tmp.data(), wordcount);
 }
 
-/*
- * deuna_c::cpu_read_words
- * Purpose: CPU-visible read helper for debugging memory mapping issues.
- * Behavior: performs CPU DATI cycles to read words from UNIBUS space.
- * Notes: serialized with DMA to avoid interleaving with device DMA ops.
- */
+//
+// deuna_c::cpu_read_words
+// Purpose: CPU-visible read helper for debugging memory mapping issues.
+// Behavior: performs CPU DATI cycles to read words from UNIBUS space.
+// Notes: serialized with DMA to avoid interleaving with device DMA ops.
+//
 bool deuna_c::cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
 {
     if (wordcount == 0)
@@ -1248,12 +1083,12 @@ bool deuna_c::cpu_read_words(uint32_t addr, uint16_t *buffer, size_t wordcount)
     return true;
 }
 
-/*
- * deuna_c::cpu_read_bytes
- * Purpose: CPU-visible byte reader layered over cpu_read_words.
- * Behavior: reads aligned words and extracts bytes.
- * Notes: used for diagnostics to compare CPU view with DMA view.
- */
+//
+// deuna_c::cpu_read_bytes
+// Purpose: CPU-visible byte reader layered over cpu_read_words.
+// Behavior: reads aligned words and extracts bytes.
+// Notes: used for diagnostics to compare CPU view with DMA view.
+//
 bool deuna_c::cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
 {
     if (len == 0)
@@ -1283,12 +1118,12 @@ bool deuna_c::cpu_read_bytes(uint32_t addr, uint8_t *buffer, size_t len)
     return true;
 }
 
-/*
- * deuna_c::process_bootrom
- * Purpose: DMA the DEUNA boot ROM into host memory for CMD_BOOT.
- * Behavior: writes the combined EPROM image to the destination address.
- * Notes: caller must hold state_mutex; uses dma_write_bytes for transfer.
- */
+//
+// deuna_c::process_bootrom
+// Purpose: DMA the DEUNA boot ROM into host memory for CMD_BOOT.
+// Behavior: writes the combined EPROM image to the destination address.
+// Notes: caller must hold state_mutex; uses dma_write_bytes for transfer.
+//
 bool deuna_c::process_bootrom(uint32_t dst_addr)
 {
     if (dst_addr == 0 || deuna_bootrom_size == 0)
@@ -1382,12 +1217,12 @@ bool deuna_c::transfer_internal_memory(uint32_t udbb, bool to_internal)
     return true;
 }
 
-/*
- * deuna_c::log_pcbb_snapshot
- * Purpose: dump DMA vs CPU-visible snapshots of PCBB and MAC bytes.
- * Behavior: reads PCBB words and the 6-byte MAC via both DMA and CPU paths.
- * Notes: intended for diagnosing mapping mismatches during GETCMD.
- */
+//
+// deuna_c::log_pcbb_snapshot
+// Purpose: dump DMA vs CPU-visible snapshots of PCBB and MAC bytes.
+// Behavior: reads PCBB words and the 6-byte MAC via both DMA and CPU paths.
+// Notes: intended for diagnosing mapping mismatches during GETCMD.
+//
 void deuna_c::log_pcbb_snapshot(const char *tag, uint32_t addr)
 {
     uint16_t dma_words[4] = {0};
@@ -1427,12 +1262,12 @@ void deuna_c::log_pcbb_snapshot(const char *tag, uint32_t addr)
     }
 }
 
-/*
- * deuna_c::make_addr
- * Purpose: build a PDP-11 physical address from high/low words.
- * Behavior: masks upper bits based on bus width (16/18-bit).
- * Notes: DEUNA uses 18-bit addressing by default.
- */
+//
+// deuna_c::make_addr
+// Purpose: build a PDP-11 physical address from high/low words.
+// Behavior: masks upper bits based on bus width (16/18-bit).
+// Notes: DEUNA uses 18-bit addressing by default.
+//
 uint32_t deuna_c::make_addr(uint16_t hi, uint16_t lo) const
 {
     uint16_t mask = 0x0003; // DEUNA uses 18-bit addressing (2 high bits)
@@ -1446,12 +1281,12 @@ uint32_t deuna_c::make_addr(uint16_t hi, uint16_t lo) const
     return (static_cast<uint32_t>(hi & mask) << 16) | lo;
 }
 
-/*
- * deuna_c::port_command
- * Purpose: execute PCSR0 port commands from the driver.
- * Behavior: handles GETPCBB/GETCMD/START/STOP/etc and updates state.
- * Notes: sets PCSR0.DNI/PCEI and drives state transitions.
- */
+//
+// deuna_c::port_command
+// Purpose: execute PCSR0 port commands from the driver.
+// Behavior: handles GETPCBB/GETCMD/START/STOP/etc and updates state.
+// Notes: sets PCSR0.DNI/PCEI and drives state transitions.
+//
 void deuna_c::port_command(uint16_t cmd)
 {
     uint16_t state = pcsr1 & PCSR1_STATE;
@@ -1601,12 +1436,12 @@ void deuna_c::port_command(uint16_t cmd)
     update_intr();
 }
 
-/*
- * deuna_c::execute_command
- * Purpose: interpret and execute the PCB command block.
- * Behavior: reads PCB/UDW pointers and services function codes.
- * Notes: returns false on invalid PCB or DMA failure to signal PCEI.
- */
+//
+// deuna_c::execute_command
+// Purpose: interpret and execute the PCB command block.
+// Behavior: reads PCB/UDW pointers and services function codes.
+// Notes: returns false on invalid PCB or DMA failure to signal PCEI.
+//
 bool deuna_c::execute_command(void)
 {
     if (!dma_read_words(pcbb, pcb, 4))
@@ -1937,12 +1772,12 @@ bool deuna_c::execute_command(void)
     return true;
 }
 
-/*
- * deuna_c::enqueue_readq
- * Purpose: stage a received Ethernet frame for later RX processing.
- * Behavior: copies data into the read queue with length and flags.
- * Notes: queue overflow increments loss counters.
- */
+//
+// deuna_c::enqueue_readq
+// Purpose: stage a received Ethernet frame for later RX processing.
+// Behavior: copies data into the read queue with length and flags.
+// Notes: queue overflow increments loss counters.
+//
 void deuna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
 {
     bool dropped = false;
@@ -1982,12 +1817,12 @@ void deuna_c::enqueue_readq(const uint8_t *data, size_t len, bool loopback)
     }
 }
 
-/*
- * deuna_c::accept_packet
- * Purpose: decide whether a host frame should be delivered to the emulated NIC.
- * Behavior: checks length, broadcast/multicast rules, and filter setup.
- * Notes: assumes data points to a full Ethernet frame.
- */
+//
+// deuna_c::accept_packet
+// Purpose: decide whether a host frame should be delivered to the emulated NIC.
+// Behavior: checks length, broadcast/multicast rules, and filter setup.
+// Notes: assumes data points to a full Ethernet frame.
+//
 bool deuna_c::accept_packet(const uint8_t *data, size_t len) const
 {
     if (!data || len < 6)
@@ -2025,12 +1860,12 @@ bool deuna_c::accept_packet(const uint8_t *data, size_t len) const
     return false;
 }
 
-/*
- * deuna_c::update_pcap_filter
- * Purpose: configure libpcap filter based on current setup and mode.
- * Behavior: builds and applies a filter string or falls back to promisc.
- * Notes: failures are logged but do not abort the device.
- */
+//
+// deuna_c::update_pcap_filter
+// Purpose: configure libpcap filter based on current setup and mode.
+// Behavior: builds and applies a filter string or falls back to promisc.
+// Notes: failures are logged but do not abort the device.
+//
 void deuna_c::update_pcap_filter(void)
 {
 #ifdef HAVE_PCAP
@@ -2102,12 +1937,12 @@ void deuna_c::update_pcap_filter(void)
 #endif
 }
 
-/*
- * deuna_c::process_receive
- * Purpose: move queued frames into the RX descriptor ring.
- * Behavior: pulls from read_queue, DMA-writes buffers, updates status.
- * Notes: only runs when state is RUNNING; returns false on ring errors.
- */
+//
+// deuna_c::process_receive
+// Purpose: move queued frames into the RX descriptor ring.
+// Behavior: pulls from read_queue, DMA-writes buffers, updates status.
+// Notes: only runs when state is RUNNING; returns false on ring errors.
+//
 bool deuna_c::process_receive(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -2274,12 +2109,12 @@ bool deuna_c::process_receive(void)
     return true;
 }
 
-/*
- * deuna_c::process_transmit
- * Purpose: send frames from the TX descriptor ring to the host.
- * Behavior: reads descriptors, DMA-reads buffers, and injects via pcap.
- * Notes: updates TX stats and sets PCSR0 flags on errors.
- */
+//
+// deuna_c::process_transmit
+// Purpose: send frames from the TX descriptor ring to the host.
+// Behavior: reads descriptors, DMA-reads buffers, and injects via pcap.
+// Notes: updates TX stats and sets PCSR0 flags on errors.
+//
 bool deuna_c::process_transmit(unsigned max_descriptors)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -2532,12 +2367,12 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
     return true;
 }
 
-/*
- * deuna_c::dump_tx_ring
- * Purpose: trace TX ring descriptor ownership and headers for debugging.
- * Behavior: reads up to max_entries descriptors and logs their header words.
- * Notes: trace-only diagnostic to correlate driver-owned vs device-owned slots.
- */
+//
+// deuna_c::dump_tx_ring
+// Purpose: trace TX ring descriptor ownership and headers for debugging.
+// Behavior: reads up to max_entries descriptors and logs their header words.
+// Notes: trace-only diagnostic to correlate driver-owned vs device-owned slots.
+//
 void deuna_c::dump_tx_ring(unsigned max_entries)
 {
     if (trlen == 0 || telen < 4)
@@ -2561,12 +2396,12 @@ void deuna_c::dump_tx_ring(unsigned max_entries)
     }
 }
 
-/*
- * deuna_c::service_timers
- * Purpose: maintain DEUNA stats timebase.
- * Behavior: updates seconds counter based on monotonic time.
- * Notes: invoked in RX thread to amortize timer work.
- */
+//
+// deuna_c::service_timers
+// Purpose: maintain DEUNA stats timebase.
+// Behavior: updates seconds counter based on monotonic time.
+// Notes: invoked in RX thread to amortize timer work.
+//
 void deuna_c::service_timers(void)
 {
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -2582,12 +2417,12 @@ void deuna_c::service_timers(void)
     }
 }
 
-/*
- * deuna_c::worker
- * Purpose: worker thread entrypoint dispatcher.
- * Behavior: routes instance 0 to RX and instance 1 to TX.
- * Notes: trace is emitted here to tag worker startup.
- */
+//
+// deuna_c::worker
+// Purpose: worker thread entrypoint dispatcher.
+// Behavior: routes instance 0 to RX and instance 1 to TX.
+// Notes: trace is emitted here to tag worker startup.
+//
 void deuna_c::worker(unsigned instance)
 {
     if (trace.value)
@@ -2598,12 +2433,12 @@ void deuna_c::worker(unsigned instance)
         worker_tx();
 }
 
-/*
- * deuna_c::worker_rx
- * Purpose: RX thread loop for pcap polling and receive ring processing.
- * Behavior: polls pcap, enqueues frames, runs process_receive, and services timers.
- * Notes: runs at RT priority; keep per-iteration work short.
- */
+//
+// deuna_c::worker_rx
+// Purpose: RX thread loop for pcap polling and receive ring processing.
+// Behavior: polls pcap, enqueues frames, runs process_receive, and services timers.
+// Notes: runs at RT priority; keep per-iteration work short.
+//
 void deuna_c::worker_rx(void)
 {
     worker_init_realtime_priority(rt_device);
@@ -2657,12 +2492,12 @@ void deuna_c::worker_rx(void)
     }
 }
 
-/*
- * deuna_c::worker_tx
- * Purpose: TX thread loop for descriptor-driven transmit and command processing.
- * Behavior: processes queued register writes and port commands, then handles TX.
- * Notes: uses condition variable for low-latency wakeup on new commands.
- */
+//
+// deuna_c::worker_tx
+// Purpose: TX thread loop for descriptor-driven transmit and command processing.
+// Behavior: processes queued register writes and port commands, then handles TX.
+// Notes: uses condition variable for low-latency wakeup on new commands.
+//
 void deuna_c::worker_tx(void)
 {
     worker_init_realtime_priority(rt_device);
