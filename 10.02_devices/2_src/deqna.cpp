@@ -17,6 +17,87 @@
 //   The above copyright notice and this permission notice shall be included in
 //   all copies or substantial portions of the Software.
 //
+// HARDWARE OVERVIEW:
+// ------------------
+// The DEQNA occupies 16 bytes of I/O space and provides:
+//   - Six station address registers (SA0-SA5): Read MAC or checksum
+//   - RCV list address (RCLL/RCLH): 22-bit pointer to RX descriptor ring
+//   - XMT list address (XMTL/XMTH): 22-bit pointer to TX descriptor ring
+//   - Vector Address Register (VAR): Interrupt vector and mode control
+//   - Control/Status Register (CSR): Device control and status
+//
+// DMA DESCRIPTOR RING ARCHITECTURE:
+// ---------------------------------
+// Both TX and RX use linked descriptor rings in host memory. Each descriptor
+// is 12 bytes (6 words):
+//   Word 0: Flag word (0xFFFF when in-use by device)
+//   Word 1: Address high bits + control flags (V=valid, C=chain, E=end, S=setup, L/H=length adjust)
+//   Word 2: Buffer address low 16 bits
+//   Word 3: Buffer length (one's complement)
+//   Word 4: Status word 1 (written by device after completion)
+//   Word 5: Status word 2 (written by device after completion)
+//
+// THREADING MODEL:
+// ----------------
+// Single deterministic state-machine worker:
+//   - One worker thread handles RX and TX in a fixed sequence each loop.
+//   - Register writes from the PDP-11 are captured atomically and applied in
+//     the worker loop to avoid DMA/IACK deadlocks.
+//   - RX capture, RX ring processing, and TX ring processing are interleaved
+//     deterministically to keep the driver serviced.
+//
+// LOOPBACK MODE:
+// --------------
+// Loopback is controlled by CSR bits IL (internal) and EL (external):
+//   - IL=0 (internal loopback) OR EL=1 (external loopback) → packets loop back
+//   - This behavior is derived from hardware testing, independent of RE
+//
+// NETWORK BRIDGING:
+// -----------------
+// libpcap bridges the emulated Ethernet to a real host interface. The pcap
+// filter is dynamically updated based on setup packet contents and promisc
+// mode to minimize unnecessary packet processing.
+//
+// REFERENCE:
+// ----------
+// This implementation derives behavior from reference behavior where the
+// hardware documentation is ambiguous. Key compatibility behaviors:
+//   - Descriptor base address is recalculated from registers on each dispatch
+//   - Loopback is IL=0 OR EL=1 (not AND, not dependent on RE)
+//   - Boot ROM handling is not applicable for DEQNA
+//
+// Ring Buffer Architecture
+// ------------------------
+//
+//  ┌────────────────────────────────────────────────────────────────┐
+//  │                      BeagleBone (Linux)                        │
+//  │  ┌──────────────┐    ┌──────────────────────────────────────┐  │
+//  │  │ Host Network │───▶│ read_queue (up to 500 packets)       │  │
+//  │  │   (pcap)     │    │ std::deque in Linux memory           │  │
+//  │  └──────────────┘    └───────────────┬──────────────────────┘  │
+//  │                                      │ DMA                     │
+//  └──────────────────────────────────────│─────────────────────────┘
+//                                         ▼
+//  ┌────────────────────────────────────────────────────────────────┐
+//  │                    PDP-11 System Memory                        │
+//  │  ┌─────────────────────────────────────────────────────────┐   │
+//  │  │ RX Descriptor Ring (driver-allocated, 4-16 descriptors) │   │
+//  │  │ rbdl_ba → [desc0] → [desc1] → [desc2] → ... (C=0 ends)  │   │
+//  │  └─────────────────────────────────────────────────────────┘   │
+//  │  ┌─────────────────────────────────────────────────────────┐   │
+//  │  │ TX Descriptor Ring (driver-allocated, 4-16 descriptors) │   │
+//  │  │ xbdl_ba → [desc0] → [desc1] → [desc2] → ... (C=0 ends)  │   │
+//  │  └─────────────────────────────────────────────────────────┘   │
+//  └────────────────────────────────────────────────────────────────┘
+//
+//  The read_queue is a staging buffer that allows packets to come in
+//  faster than the PDP-11 can process them. The state-machine loop
+//  dequeues packets from read_queue and DMA's them into the RX descriptor
+//  ring in PDP-11 memory.
+//
+//  The same loop processes the TX descriptor ring and sends packets out
+//  via pcap.
+//
 
 #include <string.h>
 #include <stdio.h>
