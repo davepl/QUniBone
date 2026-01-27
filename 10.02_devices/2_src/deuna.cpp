@@ -351,7 +351,7 @@ deuna_c::deuna_c() : qunibusdevice_c()
 
     ifname.value = "eth0";
     mac.value = "";
-    promisc.value = true;
+    promisc.value = false;
     rx_slots.value = 0;
     tx_slots.value = 0;
     trace.value = false;
@@ -474,7 +474,7 @@ bool deuna_c::on_before_install(void)
         return false;
     }
 
-    if (!pcap.open(ifname.value, promisc.value, 2048, 1)) {
+    if (!pcap.open(ifname.value, true, 2048, 1)) {
         ERROR("DEUNA: failed to open pcap on %s: %s", ifname.value.c_str(),
               pcap.last_error().c_str());
         return false;

@@ -3,6 +3,16 @@
 // (c) Dave Plummer, davepl@davepl.com, Plummer's Software LLC, 2026
 // Contributed under the BSD License
 //
+// FLOOD PING RACE CONDITION FIX:
+// During flood pings (-f flag), the device can process descriptors faster than
+// the driver can reclaim them. When the ring wraps around, the device would
+// re-process already-claimed descriptors (flag_word == 0xFFFF), causing:
+//   - Duplicate packet delivery (duplicate IP warnings)
+//   - Descriptor ring corruption
+//   - BSD kernel panics ("Unexpected net trap" / "net crashed")
+// Fix: Check flag_word before claiming - if already 0xFFFF, stop processing
+// and set RL/XL to indicate ring exhausted. This prevents wrap-around corruption.
+//
 // This implementation is derived from DEC DEQNA documentation and the
 // OpenSIMH PDP-11 xq (DEQNA) emulator. OpenSIMH attribution:
 //
@@ -114,7 +124,7 @@ deqna_c::deqna_c() : dec_ether_base_c()
 
     ifname.value   = "eth0";
     mac.value      = "";
-    promisc.value  = true;
+    promisc.value  = false;
     rx_slots.value = 0;
     tx_slots.value = 0;
     trace.value    = false;
@@ -237,7 +247,11 @@ bool deqna_c::on_before_install(void)
         }
 
         // cppcheck-suppress open - false positive: opening network interface, not file
-        if (!pcap.open(ifname.value, promisc.value, 2048, 1))
+        // Always open libpcap in promiscuous mode to capture all packets from the host interface.
+        // The BPF filter (set in update_pcap_filter) determines which packets the emulated device sees.
+        // This separation allows the device to filter by MAC address even though libpcap captures all packets.
+        // The promisc.value parameter controls whether the EMULATED device is promiscuous, not libpcap.
+        if (!pcap.open(ifname.value, true, 2048, 1))
         {
             ERROR("DEQNA: failed to open pcap on %s: %s", ifname.value.c_str(),
                 pcap.last_error().c_str());
@@ -1155,9 +1169,9 @@ bool deqna_c::process_rbdl(void)
     unsigned processed  = 0;
 
     // Limit RX processing per call to prevent TX starvation during floods.
-    // If rx_slots is configured, use that; otherwise default to 8 packets max.
-    
-    const unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 8;
+    // If rx_slots is configured, use that; otherwise default to 4 packets max (reduced for flood safety).
+    // Conservative limit prevents descriptor ring overflow during high-bandwidth flood conditions.
+    const unsigned limit = rx_slots.value ? static_cast<unsigned>(rx_slots.value) : 4;
     uint32_t start_rbdl_ba = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1200,6 +1214,18 @@ bool deqna_c::process_rbdl(void)
             return false;
         }
 
+        // Check if descriptor is already claimed (flag_word == 0xFFFF)
+        // This prevents re-processing descriptors during ring wrap-around in flood conditions
+        if (words[0] == 0xFFFF)
+        {
+            // Descriptor already claimed - we've wrapped around the ring
+            // Set RL to indicate list exhausted and stop processing
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(QNA_CSR_RL, 0);
+            process_deferred_interrupts();
+            return true;
+        }
+
         const uint16_t flag_word = 0xFFFF;
         if (!desc_write_words(cur_ba, &flag_word, 1))
         {
@@ -1208,6 +1234,19 @@ bool deqna_c::process_rbdl(void)
             process_deferred_interrupts();
             return false;
         }
+
+        // Re-read word[1] to verify descriptor is still valid after claiming it.
+        // This detects race conditions where driver invalidates descriptor between claim and use.
+        uint16_t verify_word1 = 0;
+        if (!desc_read_words(cur_ba + 2, &verify_word1, 1))
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            rx_nxm_error();
+            process_deferred_interrupts();
+            return false;
+        }
+        // Update words[1] with the re-read value in case it changed
+        words[1] = verify_word1;
 
         if (~words[1] & QNA_DSC_V)
         {
@@ -1489,6 +1528,16 @@ bool deqna_c::process_xbdl(void)
 
         if (words[1] & QNA_DSC_C)
         {
+            // Check if chain descriptor is already claimed
+            if (words[0] == 0xFFFF)
+            {
+                // Already claimed - ring wrap detected, stop processing
+                std::lock_guard<std::recursive_mutex> lock(state_mutex);
+                csr_set_clr(QNA_CSR_XL, 0);
+                tx_state = tx_state_enum::idle;
+                process_deferred_interrupts();
+                return true;
+            }
             const uint16_t flag_word = 0xFFFF;
             if (!desc_write_words(cur_ba, &flag_word, 1))
             {
@@ -1511,6 +1560,21 @@ bool deqna_c::process_xbdl(void)
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             tx_state = tx_state_enum::wait_valid;
             tx_wait_ba = cur_ba;
+            write_buffer.len = 0;
+            write_buffer.used = 0;
+            process_deferred_interrupts();
+            return true;
+        }
+
+        // Check if descriptor is already claimed (flag_word == 0xFFFF)
+        // This prevents re-processing descriptors during ring wrap-around in flood conditions
+        if (words[0] == 0xFFFF)
+        {
+            // Descriptor already claimed - we've wrapped around the ring
+            // Set XL to indicate list exhausted and stop processing
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            csr_set_clr(QNA_CSR_XL, 0);
+            tx_state = tx_state_enum::idle;
             write_buffer.len = 0;
             write_buffer.used = 0;
             process_deferred_interrupts();
