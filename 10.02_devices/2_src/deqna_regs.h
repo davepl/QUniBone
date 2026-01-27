@@ -1,7 +1,7 @@
 /*
  * Author: Dave Plummer (davepl@davepl.com)
  * (c) 2026 Plummer's Software LLC
- * Contributed under the GPL2 License
+ * Contributed under the BSD License
  */
 #ifndef _DEQNA_REGS_H_
 #define _DEQNA_REGS_H_

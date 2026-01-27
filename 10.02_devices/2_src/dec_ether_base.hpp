@@ -25,7 +25,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "logger.hpp"
@@ -48,6 +51,52 @@ public:
 
     ~dec_ether_base_c() override = default;
 
+    // Common Ethernet helper functions (shared by DEQNA/DEUNA).
+    static inline bool mac_is_zero(const uint8_t *mac)
+    {
+        return mac[0] == 0 && mac[1] == 0 && mac[2] == 0 &&
+               mac[3] == 0 && mac[4] == 0 && mac[5] == 0;
+    }
+
+    static inline bool mac_is_broadcast(const uint8_t *mac)
+    {
+        return mac[0] == 0xff && mac[1] == 0xff && mac[2] == 0xff &&
+               mac[3] == 0xff && mac[4] == 0xff && mac[5] == 0xff;
+    }
+
+    static inline bool mac_is_multicast(const uint8_t *mac)
+    {
+        return (mac[0] & 0x01) != 0;
+    }
+
+    static inline bool mac_equal(const uint8_t *a, const uint8_t *b)
+    {
+        return std::memcmp(a, b, 6) == 0;
+    }
+
+    template <typename T, size_t N>
+    static constexpr size_t arraysize(const T (&)[N]) noexcept
+    {
+        return N;
+    }
+
+    static inline bool parse_mac(const std::string &text, uint8_t out[6])
+    {
+        unsigned values[6];
+        if (text.empty())
+            return false;
+        if (std::sscanf(text.c_str(), "%x:%x:%x:%x:%x:%x",
+                        &values[0], &values[1], &values[2],
+                        &values[3], &values[4], &values[5]) != 6)
+            return false;
+        for (int i = 0; i < 6; ++i) {
+            if (values[i] > 0xff)
+                return false;
+            out[i] = static_cast<uint8_t>(values[i]);
+        }
+        return true;
+    }
+
 protected:
     // Bus requests for interrupts and DMA (common to both devices)
     intr_request_c intr_request;
@@ -64,6 +113,8 @@ protected:
 
     // Device-specific interrupt update
     virtual void update_intr(void) = 0;
+    // Optional hook when DMA transitions to idle (dma_in_progress -> 0)
+    virtual void on_dma_quiet(void) {}
 
     // DMA tracking guard (for diagnostic output)
     struct dma_inflight_guard {
@@ -74,7 +125,8 @@ protected:
         }
         ~dma_inflight_guard()
         {
-            dev.dma_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+            if (dev.dma_in_progress.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                dev.on_dma_quiet();
         }
     };
 
@@ -112,6 +164,8 @@ protected:
     {
         if (wordcount == 0)
             return true;
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
@@ -134,6 +188,7 @@ protected:
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         holdoff_dma_if_intr_pending();
         dma_inflight_guard guard(*this);
+        update_intr(); // gate bus-level INTR while DMA is active
         const int max_attempts = 3;
         for (int attempt = 0; attempt < max_attempts; ++attempt) {
             qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
@@ -149,6 +204,8 @@ protected:
     {
         if (wordcount == 0)
             return true;
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
@@ -171,6 +228,7 @@ protected:
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         holdoff_dma_if_intr_pending();
         dma_inflight_guard guard(*this);
+        update_intr(); // gate bus-level INTR while DMA is active
         const int max_attempts = 3;
         for (int attempt = 0; attempt < max_attempts; ++attempt) {
             qunibusadapter->DMA(dma_request, true, QUNIBUS_CYCLE_DATO, addr,
@@ -187,6 +245,8 @@ protected:
     {
         if (wordcount == 0)
             return true;
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
@@ -209,6 +269,7 @@ protected:
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         holdoff_dma_if_intr_pending();
         dma_inflight_guard guard(*this);
+        update_intr(); // gate bus-level INTR while DMA is active
         const int max_attempts = 3;
         for (int attempt = 0; attempt < max_attempts; ++attempt) {
             qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATI, addr, buffer, wordcount);
@@ -224,6 +285,8 @@ protected:
     {
         if (wordcount == 0)
             return true;
+        if (reset_in_progress.load(std::memory_order_acquire))
+            return false;
         uint64_t addr64 = addr;
         uint64_t byte_count = static_cast<uint64_t>(wordcount) * 2;
         uint64_t max = qunibus->addr_space_byte_count;
@@ -246,6 +309,7 @@ protected:
         std::lock_guard<std::recursive_mutex> lock(dma_mutex);
         holdoff_dma_if_intr_pending();
         dma_inflight_guard guard(*this);
+        update_intr(); // gate bus-level INTR while DMA is active
         const int max_attempts = 3;
         for (int attempt = 0; attempt < max_attempts; ++attempt) {
             qunibusadapter->DMA(dma_desc_request, true, QUNIBUS_CYCLE_DATO, addr,
