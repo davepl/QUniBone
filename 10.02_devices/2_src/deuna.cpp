@@ -321,28 +321,28 @@ deuna_c::deuna_c() : qunibusdevice_c()
     register_count = 4;
 
     reg_pcsr0 = &(this->registers[0]);
-    strcpy(reg_pcsr0->name, "PCSR0");
+    static_strcpy(reg_pcsr0->name, "PCSR0");
     reg_pcsr0->active_on_dati = false;
     reg_pcsr0->active_on_dato = true;
     reg_pcsr0->reset_value = 0;
     reg_pcsr0->writable_bits = 0xffff;
 
     reg_pcsr1 = &(this->registers[1]);
-    strcpy(reg_pcsr1->name, "PCSR1");
+    static_strcpy(reg_pcsr1->name, "PCSR1");
     reg_pcsr1->active_on_dati = false;
     reg_pcsr1->active_on_dato = false;
     reg_pcsr1->reset_value = 0;
     reg_pcsr1->writable_bits = 0x0000;  // Read-only
 
     reg_pcsr2 = &(this->registers[2]);
-    strcpy(reg_pcsr2->name, "PCSR2");
+    static_strcpy(reg_pcsr2->name, "PCSR2");
     reg_pcsr2->active_on_dati = false;
     reg_pcsr2->active_on_dato = true;
     reg_pcsr2->reset_value = 0;
     reg_pcsr2->writable_bits = 0xffff;
 
     reg_pcsr3 = &(this->registers[3]);
-    strcpy(reg_pcsr3->name, "PCSR3");
+    static_strcpy(reg_pcsr3->name, "PCSR3");
     reg_pcsr3->active_on_dati = false;
     reg_pcsr3->active_on_dato = true;
     reg_pcsr3->reset_value = 0;
@@ -1890,7 +1890,7 @@ void deuna_c::update_pcap_filter(void)
     // libpcap can deliver outgoing packets back to us; we want to reject them.
     char srcbuf[64] = {0};
     if (!mac_is_zero(mac_addr)) {
-        snprintf(srcbuf, sizeof(srcbuf), "not ether src %02x:%02x:%02x:%02x:%02x:%02x",
+        snprintf(srcbuf, arraysize(srcbuf), "not ether src %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
     }
     const bool have_src_excl = srcbuf[0] != '\0';
@@ -1913,7 +1913,7 @@ void deuna_c::update_pcap_filter(void)
     };
     auto add_mac = [&](const uint8_t *mac_bytes) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "ether dst %02x:%02x:%02x:%02x:%02x:%02x",
+        snprintf(buf, arraysize(buf), "ether dst %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]);
         append_term(buf);
     };

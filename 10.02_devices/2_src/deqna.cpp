@@ -79,21 +79,21 @@ deqna_c::deqna_c() : dec_ether_base_c()
     register_count = 8;
 
     reg_sta_addr[0] = &(this->registers[0]);
-    strcpy(reg_sta_addr[0]->name, "STA0");
+    static_strcpy(reg_sta_addr[0]->name, "STA0");
     reg_sta_addr[0]->active_on_dati = false;
     reg_sta_addr[0]->active_on_dato = false;
     reg_sta_addr[0]->reset_value = 0;
     reg_sta_addr[0]->writable_bits = 0x0000;
 
     reg_sta_addr[1] = &(this->registers[1]);
-    strcpy(reg_sta_addr[1]->name, "STA1");
+    static_strcpy(reg_sta_addr[1]->name, "STA1");
     reg_sta_addr[1]->active_on_dati = false;
     reg_sta_addr[1]->active_on_dato = false;
     reg_sta_addr[1]->reset_value = 0;
     reg_sta_addr[1]->writable_bits = 0x0000;
 
     reg_rcvlist_lo = &(this->registers[2]);
-    strcpy(reg_rcvlist_lo->name, "RCLL");
+    static_strcpy(reg_rcvlist_lo->name, "RCLL");
     reg_rcvlist_lo->active_on_dati = false;
     reg_rcvlist_lo->active_on_dato = true;
     reg_rcvlist_lo->reset_value = 0;
@@ -101,7 +101,7 @@ deqna_c::deqna_c() : dec_ether_base_c()
     reg_sta_addr[2] = reg_rcvlist_lo;
 
     reg_rcvlist_hi = &(this->registers[3]);
-    strcpy(reg_rcvlist_hi->name, "RCLH");
+    static_strcpy(reg_rcvlist_hi->name, "RCLH");
     reg_rcvlist_hi->active_on_dati = false;
     reg_rcvlist_hi->active_on_dato = true;
     reg_rcvlist_hi->reset_value = 0;
@@ -109,7 +109,7 @@ deqna_c::deqna_c() : dec_ether_base_c()
     reg_sta_addr[3] = reg_rcvlist_hi;
 
     reg_xmtlist_lo = &(this->registers[4]);
-    strcpy(reg_xmtlist_lo->name, "XMTL");
+    static_strcpy(reg_xmtlist_lo->name, "XMTL");
     reg_xmtlist_lo->active_on_dati = false;
     reg_xmtlist_lo->active_on_dato = true;
     reg_xmtlist_lo->reset_value = 0;
@@ -117,7 +117,7 @@ deqna_c::deqna_c() : dec_ether_base_c()
     reg_sta_addr[4] = reg_xmtlist_lo;
 
     reg_xmtlist_hi = &(this->registers[5]);
-    strcpy(reg_xmtlist_hi->name, "XMTH");
+    static_strcpy(reg_xmtlist_hi->name, "XMTH");
     reg_xmtlist_hi->active_on_dati = false;
     reg_xmtlist_hi->active_on_dato = true;
     reg_xmtlist_hi->reset_value = 0;
@@ -125,14 +125,14 @@ deqna_c::deqna_c() : dec_ether_base_c()
     reg_sta_addr[5] = reg_xmtlist_hi;
 
     reg_vector = &(this->registers[6]);
-    strcpy(reg_vector->name, "VECTOR");
+    static_strcpy(reg_vector->name, "VECTOR");
     reg_vector->active_on_dati = false;
     reg_vector->active_on_dato = true;
     reg_vector->reset_value = 0;
     reg_vector->writable_bits = 0xffff;
 
     reg_csr = &(this->registers[7]);
-    strcpy(reg_csr->name, "CSR");
+    static_strcpy(reg_csr->name, "CSR");
     reg_csr->active_on_dati = false;
     reg_csr->active_on_dato = true;
     reg_csr->reset_value = 0;
@@ -506,11 +506,6 @@ void deqna_c::service_intr_complete(void)
     clr_int();
 }
 
-bool deqna_c::wait_for_interrupt_ack(void)
-{
-    return false;
-}
-
 // Report non-existent memory (NXM) error for both RX and TX.
 // Sets RL, XL, and NI bits in CSR and increments TX error counter.
 // Legacy function kept for compatibility but prefer rx_nxm_error/tx_nxm_error.
@@ -764,7 +759,7 @@ void deqna_c::update_pcap_filter(void)
 
     auto add_mac = [&](const uint8_t *mac_bytes) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "ether dst %02x:%02x:%02x:%02x:%02x:%02x",
+        snprintf(buf, arraysize(buf), "ether dst %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]);
         filter += " or ";
         filter += buf;
@@ -1241,14 +1236,27 @@ bool deqna_c::process_rbdl(void)
         const uint16_t rbl_low = static_cast<uint16_t>(report_rbl & 0x00FF);
         words[5] = static_cast<uint16_t>((rbl_low << 8) | rbl_low);
 
-        if (!desc_write_words(cur_ba + 8, &words[4], 2)) {
+        if (!desc_write_words(cur_ba + 8, &words[4], 2))
+        {
+            // DMA write timed out or failed. Treat as NXM, set RL, and stop RX processing
+            // to avoid hammering the same bad descriptor and spamming timeouts.
             std::lock_guard<std::recursive_mutex> lock(state_mutex);
             rx_nxm_error();
             stat_rx_errors.value++;
+
+            // Disable current RX list to prevent immediate re-entry on the same bad address.
+            rbdl_ba = 0;
+            rbdl_pending = false;
+
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex);
+                read_queue.clear();
+                read_queue_loss = 0;
+            }
+
             process_deferred_interrupts();
             return false;
         }
-
         if (item.packet.used < item.packet.len) {
             std::lock_guard<std::mutex> queue_lock(queue_mutex);
             read_queue.push_front(std::move(item));

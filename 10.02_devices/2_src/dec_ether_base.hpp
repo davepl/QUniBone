@@ -74,6 +74,12 @@ public:
         return std::memcmp(a, b, 6) == 0;
     }
 
+    template <typename T, size_t N>
+    static constexpr size_t arraysize(const T (&)[N]) noexcept
+    {
+        return N;
+    }
+
     static inline bool parse_mac(const std::string &text, uint8_t out[6])
     {
         unsigned values[6];

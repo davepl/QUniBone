@@ -113,10 +113,26 @@
 #include <deque>
 #include <mutex>
 #include <atomic>
+#include <cstring>
 
 #include "dec_ether_base.hpp"
 #include "parameter.hpp"
 #include "deqna_regs.h"
+
+// Safe string copy with guaranteed NUL termination for static arrays.
+// Array size is automatically deduced at compile time.
+// Returns length of src (like strlcpy).  Uses byte size chars, but I've already paid my Unicode tax in life.
+template <size_t N>
+static inline size_t static_strcpy(char (&dst)[N], const char *src)
+{
+    size_t len = std::strlen(src);
+    if (N > 0) {
+        size_t copy_len = (len < N - 1) ? len : N - 1;
+        std::memcpy(dst, src, copy_len);
+        dst[copy_len] = '\0';
+    }
+    return len;
+}
 
 // Default DEQNA I/O page parameters
 // Base address 017774440 = IOPAGE + 014440 (octal)
@@ -132,61 +148,61 @@
 // ===============
 
 // Ethernet frame sizes
-static const size_t ETH_MIN_PACKET = 60;    // Minimum Ethernet frame (no CRC)
-static const size_t ETH_MAX_PACKET = 1514;  // Maximum Ethernet frame (no CRC)
-static const size_t ETH_FRAME_SIZE = 1518;  // Frame + CRC space
+static constexpr size_t ETH_MIN_PACKET = 60;    // Minimum Ethernet frame (no CRC)
+static constexpr size_t ETH_MAX_PACKET = 1514;  // Maximum Ethernet frame (no CRC)
+static constexpr size_t ETH_FRAME_SIZE = 1518;  // Frame + CRC space
 
 // Queue and timing
-static const unsigned QNA_QUE_MAX = 64;
-static const unsigned QNA_SERVICE_INTERVAL = 100; // Timer service rate (Hz)
-static const unsigned QNA_HW_SANITY_SECS = 240;
+static constexpr unsigned QNA_QUE_MAX = 64;
+static constexpr unsigned QNA_SERVICE_INTERVAL = 100; // Timer service rate (Hz)
+static constexpr unsigned QNA_HW_SANITY_SECS = 240;
 
 // Descriptor flags
-static const uint16_t QNA_DSC_V = QE_RING_VALID;
-static const uint16_t QNA_DSC_C = QE_RING_CHAIN;
-static const uint16_t QNA_DSC_E = QE_RING_EOMSG;
-static const uint16_t QNA_DSC_S = QE_RING_SETUP;
-static const uint16_t QNA_DSC_L = QE_RING_ODD_END;
-static const uint16_t QNA_DSC_H = QE_RING_ODD_BEGIN;
+static constexpr uint16_t QNA_DSC_V = QE_RING_VALID;
+static constexpr uint16_t QNA_DSC_C = QE_RING_CHAIN;
+static constexpr uint16_t QNA_DSC_E = QE_RING_EOMSG;
+static constexpr uint16_t QNA_DSC_S = QE_RING_SETUP;
+static constexpr uint16_t QNA_DSC_L = QE_RING_ODD_END;
+static constexpr uint16_t QNA_DSC_H = QE_RING_ODD_BEGIN;
 
 // CSR bits
-static const uint16_t QNA_CSR_RI = QE_RCV_INT;
-static const uint16_t QNA_CSR_PE = QE_PARITY;
-static const uint16_t QNA_CSR_CA = QE_CARRIER;
-static const uint16_t QNA_CSR_OK = QE_OK;
-static const uint16_t QNA_CSR_SE = QE_STIM_ENABLE;
-static const uint16_t QNA_CSR_EL = QE_ELOOP;
-static const uint16_t QNA_CSR_IL = QE_ILOOP;
-static const uint16_t QNA_CSR_XI = QE_XMIT_INT;
-static const uint16_t QNA_CSR_IE = QE_INT_ENABLE;
-static const uint16_t QNA_CSR_RL = QE_RL_INVALID;
-static const uint16_t QNA_CSR_XL = QE_XL_INVALID;
-static const uint16_t QNA_CSR_NI = QE_NEX_MEM_INT;
-static const uint16_t QNA_CSR_SR = QE_RESET;
-static const uint16_t QNA_CSR_RE = QE_RCV_ENABLE;
+static constexpr uint16_t QNA_CSR_RI = QE_RCV_INT;
+static constexpr uint16_t QNA_CSR_PE = QE_PARITY;
+static constexpr uint16_t QNA_CSR_CA = QE_CARRIER;
+static constexpr uint16_t QNA_CSR_OK = QE_OK;
+static constexpr uint16_t QNA_CSR_SE = QE_STIM_ENABLE;
+static constexpr uint16_t QNA_CSR_EL = QE_ELOOP;
+static constexpr uint16_t QNA_CSR_IL = QE_ILOOP;
+static constexpr uint16_t QNA_CSR_XI = QE_XMIT_INT;
+static constexpr uint16_t QNA_CSR_IE = QE_INT_ENABLE;
+static constexpr uint16_t QNA_CSR_RL = QE_RL_INVALID;
+static constexpr uint16_t QNA_CSR_XL = QE_XL_INVALID;
+static constexpr uint16_t QNA_CSR_NI = QE_NEX_MEM_INT;
+static constexpr uint16_t QNA_CSR_SR = QE_RESET;
+static constexpr uint16_t QNA_CSR_RE = QE_RCV_ENABLE;
 
 // CSR masks
-static const uint16_t QNA_CSR_RO = QE_CSR_RO;
-static const uint16_t QNA_CSR_RW = QE_CSR_RW;
-static const uint16_t QNA_CSR_W1 = QE_CSR_W1;
-static const uint16_t QNA_CSR_BP = QE_CSR_BP;
-static const uint16_t QNA_CSR_XIRI = (QNA_CSR_XI | QNA_CSR_RI);
+static constexpr uint16_t QNA_CSR_RO = QE_CSR_RO;
+static constexpr uint16_t QNA_CSR_RW = QE_CSR_RW;
+static constexpr uint16_t QNA_CSR_W1 = QE_CSR_W1;
+static constexpr uint16_t QNA_CSR_BP = QE_CSR_BP;
+static constexpr uint16_t QNA_CSR_XIRI = (QNA_CSR_XI | QNA_CSR_RI);
 
 // Vector register bits
-static const uint16_t QNA_VEC_MS = QE_VEC_MS;
-static const uint16_t QNA_VEC_OS = QE_VEC_OS;
-static const uint16_t QNA_VEC_RS = QE_VEC_RS;
-static const uint16_t QNA_VEC_ST = QE_VEC_ST;
-static const uint16_t QNA_VEC_IV = QE_VEC_IV;
-static const uint16_t QNA_VEC_ID = QE_VEC_ID;
-static const uint16_t QNA_VEC_RO = QE_VEC_RO;
-static const uint16_t QNA_VEC_RW = QE_VEC_RW;
+static constexpr uint16_t QNA_VEC_MS = QE_VEC_MS;
+static constexpr uint16_t QNA_VEC_OS = QE_VEC_OS;
+static constexpr uint16_t QNA_VEC_RS = QE_VEC_RS;
+static constexpr uint16_t QNA_VEC_ST = QE_VEC_ST;
+static constexpr uint16_t QNA_VEC_IV = QE_VEC_IV;
+static constexpr uint16_t QNA_VEC_ID = QE_VEC_ID;
+static constexpr uint16_t QNA_VEC_RO = QE_VEC_RO;
+static constexpr uint16_t QNA_VEC_RW = QE_VEC_RW;
 
 // Setup packet bits
-static const uint16_t QNA_SETUP_MC = 0x0001;  // Accept all multicast
-static const uint16_t QNA_SETUP_PM = 0x0002;  // Promiscuous mode
-static const uint16_t QNA_SETUP_LD = 0x000C;  // LED control bits
-static const uint16_t QNA_SETUP_ST = 0x0070;  // Sanity timer setting
+static constexpr uint16_t QNA_SETUP_MC = 0x0001;  // Accept all multicast
+static constexpr uint16_t QNA_SETUP_PM = 0x0002;  // Promiscuous mode
+static constexpr uint16_t QNA_SETUP_LD = 0x000C;  // LED control bits
+static constexpr uint16_t QNA_SETUP_ST = 0x0070;  // Sanity timer setting
 
 // Version
 static const char *DEQNA_VERSION = "v090";  // Simplified refactor, OpenSIMH-aligned
@@ -214,12 +230,12 @@ static inline bool mac_equal(const uint8_t *a, const uint8_t *b)
     return dec_ether_base_c::mac_equal(a, b);
 }
 
-static inline uint8_t word_low(uint16_t w)
+static constexpr uint8_t word_low(uint16_t w)
 {
     return static_cast<uint8_t>(w & 0xff);
 }
 
-static inline uint8_t word_high(uint16_t w)
+static constexpr uint8_t word_high(uint16_t w)
 {
     return static_cast<uint8_t>((w >> 8) & 0xff);
 }
@@ -325,21 +341,6 @@ private:
     std::recursive_mutex state_mutex;
     std::mutex queue_mutex;  // Serialize queue access from PCAP callbacks
     // Note: reset_in_progress is inherited from dec_ether_base_c
-
-    /*
-     * Pending register writes from PDP-11
-     * -----------------------------------
-     * Register writes are captured atomically by on_after_register_access()
-     * and processed by the worker loop. This avoids DMA deadlocks where the
-     * PRU waits for bus grant while the CPU polls CSR waiting for completion.
-     *
-     * pending_reg_mask: Bitmask of registers with pending writes (bit N = reg N)
-     * pending_reg_byteflags[]: Which bytes were written (bit0=low, bit1=high)
-     * pending_reg_value[]: Written values for each register (byte writes merged)
-     */
-    std::atomic<uint16_t> pending_reg_mask{0};
-    std::atomic<uint8_t> pending_reg_byteflags[8];
-    std::atomic<uint16_t> pending_reg_value[8];
 
     /*
      * Setup packet state (from last processed setup frame)
@@ -553,7 +554,6 @@ private:
     void set_int(void);
     void clr_int(void);
     void process_deferred_interrupts(void);
-    bool wait_for_interrupt_ack(void);  // Now returns false immediately
     void csr_set_clr(uint16_t set_bits, uint16_t clear_bits);
     void nxm_error(void);
     void rx_nxm_error(void);
