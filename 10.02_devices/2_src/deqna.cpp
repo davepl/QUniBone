@@ -1276,6 +1276,17 @@ bool deqna_c::process_rbdl(void)
         uint32_t address = make_addr(words[1], words[2]);
         uint16_t w_length = static_cast<uint16_t>(~words[3] + 1);
         uint16_t b_length = static_cast<uint16_t>(w_length * 2);
+        
+        // Sanity check: buffer length should not exceed max packet size
+        // This prevents invalid DMA operations from corrupting host memory
+        if (b_length > ETH_MAX_PACKET + 100)
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex);
+            rx_nxm_error();
+            process_deferred_interrupts();
+            return false;
+        }
+        
         if (words[1] & QNA_DSC_H)
         {
             address += 1;
