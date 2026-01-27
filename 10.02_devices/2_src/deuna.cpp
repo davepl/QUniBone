@@ -322,28 +322,28 @@ deuna_c::deuna_c() : qunibusdevice_c()
     register_count = 4;
 
     reg_pcsr0 = &(this->registers[0]);
-    strcpy(reg_pcsr0->name, "PCSR0");
+    safe_strcpy(reg_pcsr0->name, "PCSR0", sizeof(reg_pcsr0->name));
     reg_pcsr0->active_on_dati = false;
     reg_pcsr0->active_on_dato = true;
     reg_pcsr0->reset_value = 0;
     reg_pcsr0->writable_bits = 0xffff;
 
     reg_pcsr1 = &(this->registers[1]);
-    strcpy(reg_pcsr1->name, "PCSR1");
+    safe_strcpy(reg_pcsr1->name, "PCSR1", sizeof(reg_pcsr1->name));
     reg_pcsr1->active_on_dati = false;
     reg_pcsr1->active_on_dato = false;
     reg_pcsr1->reset_value = 0;
     reg_pcsr1->writable_bits = 0x0000;  // Read-only
 
     reg_pcsr2 = &(this->registers[2]);
-    strcpy(reg_pcsr2->name, "PCSR2");
+    safe_strcpy(reg_pcsr2->name, "PCSR2", sizeof(reg_pcsr2->name));
     reg_pcsr2->active_on_dati = false;
     reg_pcsr2->active_on_dato = true;
     reg_pcsr2->reset_value = 0;
     reg_pcsr2->writable_bits = 0xffff;
 
     reg_pcsr3 = &(this->registers[3]);
-    strcpy(reg_pcsr3->name, "PCSR3");
+    safe_strcpy(reg_pcsr3->name, "PCSR3", sizeof(reg_pcsr3->name));
     reg_pcsr3->active_on_dati = false;
     reg_pcsr3->active_on_dato = true;
     reg_pcsr3->reset_value = 0;
@@ -357,7 +357,9 @@ deuna_c::deuna_c() : qunibusdevice_c()
     trace.value = false;
 
     /* Default MAC in DEC range */
-    memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
+    static_assert(sizeof(mac_addr) == 6, "mac_addr must be 6 bytes");
+    static_assert(sizeof(setup.macs[0]) >= sizeof(mac_addr), "setup.macs[0] must fit mac_addr");
+    memcpy(mac_addr, DEUNA_DEFAULT_MAC, std::min(sizeof(mac_addr), sizeof(DEUNA_DEFAULT_MAC)));
 
     read_buffer.msg.reserve(UNA_MAX_RCV_PACKET);
     write_buffer.msg.reserve(UNA_MAX_RCV_PACKET);
@@ -429,8 +431,8 @@ bool deuna_c::on_param_changed(parameter_c *param)
     } else if (param == &mac) {
         if (mac.new_value.empty()) {
             mac_override = false;
-            memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
-            memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
+            memcpy(mac_addr, DEUNA_DEFAULT_MAC, std::min(sizeof(mac_addr), sizeof(DEUNA_DEFAULT_MAC)));
+            memcpy(setup.macs[0], mac_addr, std::min(sizeof(setup.macs[0]), sizeof(mac_addr)));
             setup.valid = true;
             if (setup.mac_count < 2)
                 setup.mac_count = 2;
@@ -443,7 +445,7 @@ bool deuna_c::on_param_changed(parameter_c *param)
             }
             mac_override = true;
             memcpy(mac_addr, parsed, sizeof(mac_addr));
-            memcpy(setup.macs[0], parsed, sizeof(mac_addr));
+            memcpy(setup.macs[0], parsed, std::min(sizeof(setup.macs[0]), sizeof(mac_addr)));
             setup.valid = true;
             update_pcap_filter();
         }
@@ -691,7 +693,8 @@ void deuna_c::reset_controller(void)
     setup = setup_state();
     if (!mac_override && mac_is_zero(mac_addr))
         memcpy(mac_addr, DEUNA_DEFAULT_MAC, sizeof(mac_addr));
-    memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
+    static_assert(sizeof(setup.macs[0]) >= sizeof(mac_addr), "setup.macs[0] must fit mac_addr");
+    memcpy(setup.macs[0], mac_addr, std::min(sizeof(setup.macs[0]), sizeof(mac_addr)));
     for (int i = 0; i < 6; ++i)
         setup.macs[1][i] = 0xff;
     setup.mac_count = 2;
@@ -1581,9 +1584,11 @@ bool deuna_c::execute_command(void)
                         tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5]);
             }
             if (mac_is_zero(tmp)) {
-                memcpy(setup.macs[0], mac_addr, sizeof(mac_addr));
+                static_assert(sizeof(setup.macs[0]) >= sizeof(mac_addr), "setup.macs[0] must fit mac_addr");
+                memcpy(setup.macs[0], mac_addr, std::min(sizeof(setup.macs[0]), sizeof(mac_addr)));
             } else {
-                memcpy(setup.macs[0], tmp, sizeof(tmp));
+                static_assert(sizeof(setup.macs[0]) >= sizeof(tmp), "setup.macs[0] must fit tmp");
+                memcpy(setup.macs[0], tmp, std::min(sizeof(setup.macs[0]), sizeof(tmp)));
             }
             setup.valid = true;
             if (setup.mac_count < 2)
@@ -1902,17 +1907,19 @@ void deuna_c::update_pcap_filter(void)
 
     // Build a filter to exclude packets from our own source MAC.
     // libpcap can deliver outgoing packets back to us; we want to reject them.
-    char srcbuf[64] = {0};
+    std::string srcbuf;
     if (!mac_is_zero(mac_addr)) {
-        snprintf(srcbuf, sizeof(srcbuf), "not ether src %02x:%02x:%02x:%02x:%02x:%02x",
+        char temp[64];
+        snprintf(temp, sizeof(temp), "not ether src %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+        srcbuf = temp;
     }
-    const bool have_src_excl = srcbuf[0] != '\0';
+    const bool have_src_excl = !srcbuf.empty();
 
     if (setup.promiscuous) {
         std::string filter = "ip or not ip";
         if (have_src_excl) {
-            filter = std::string(srcbuf) + " and (" + filter + ")";
+            filter = srcbuf + " and (" + filter + ")";
         }
         if (!pcap.set_filter(filter))
             WARNING("DEUNA: pcap filter set failed: %s", pcap.last_error().c_str());
@@ -1927,9 +1934,11 @@ void deuna_c::update_pcap_filter(void)
     };
     auto add_mac = [&](const uint8_t *mac_bytes) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "ether dst %02x:%02x:%02x:%02x:%02x:%02x",
+        int written = snprintf(buf, sizeof(buf), "ether dst %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5]);
-        append_term(buf);
+        if (written >= 0 && static_cast<size_t>(written) < sizeof(buf)) {
+            append_term(buf);
+        }
     };
 
     append_term("ether broadcast");
@@ -2245,8 +2254,12 @@ bool deuna_c::process_transmit(unsigned max_descriptors)
                     runt = true;
             }
 
-            if (write_buffer.len >= 12 && !mac_is_zero(setup.macs[0])) {
-                memcpy(write_buffer.msg.data() + 6, setup.macs[0], 6);
+            if (write_buffer.len >= 12 && write_buffer.msg.size() >= 12 && !mac_is_zero(setup.macs[0])) {
+                // Ensure destination buffer has space for 6 bytes at offset 6 (total 12 bytes minimum)
+                size_t copy_len = std::min(sizeof(setup.macs[0]), static_cast<size_t>(6));
+                if (write_buffer.msg.size() >= 6 + copy_len) {
+                    memcpy(write_buffer.msg.data() + 6, setup.macs[0], copy_len);
+                }
             }
 
             if ((mode & MODE_LOOP) && (mode & MODE_INTL)) {

@@ -1,0 +1,26 @@
+CompileFlags:
+  Add:
+    - -std=c++11
+    - -DQBUS
+    - -DARM
+    - -DBLINKENLIGHT_CLIENT
+    - -DHAVE_PCAP
+    - -DDBG
+    - -I/Users/dave/source/repos/QUniBone/10.01_base/2_src/shared
+    - -I/Users/dave/source/repos/QUniBone/10.01_base/2_src/arm
+    - -I/Users/dave/source/repos/QUniBone/10.02_devices/2_src
+    - -I/Users/dave/source/repos/QUniBone/10.02_devices/2_src/blinkenbone
+    - -I/Users/dave/source/repos/QUniBone/10.02_devices/2_src/sharedfilesystem
+    - -I/Users/dave/source/repos/QUniBone/10.02_devices/2_src/cpu20
+    - -I/Users/dave/source/repos/QUniBone/10.03_app_demo/2_src
+    - -I/Users/dave/source/repos/QUniBone/10.04_device_exerciser/2_src
+    - -I/Users/dave/source/repos/QUniBone/90_common/src
+    - -I/Users/dave/source/repos/QUniBone/91_3rd_party/am335x_pru_package/include
+    - -I/Users/dave/source/repos/QUniBone/10.01_base/4_deploy_q
+    - -I/Users/dave/source/repos/QUniBone/10.03_app_demo/4_deploy_q
+
+Diagnostics:
+  UnusedIncludes: None
+  Suppress:
+    - security.*
+    - bugprone-suspicious-include

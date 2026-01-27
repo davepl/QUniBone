@@ -216,6 +216,19 @@ static inline bool mac_equal(const uint8_t *a, const uint8_t *b)
     return memcmp(a, b, 6) == 0;
 }
 
+// Safe string copy with guaranteed NUL termination.
+// Returns length of src (like strlcpy).
+static inline size_t safe_strcpy(char *dst, const char *src, size_t size)
+{
+    size_t len = strlen(src);
+    if (size > 0) {
+        size_t copy_len = (len < size - 1) ? len : size - 1;
+        memcpy(dst, src, copy_len);
+        dst[copy_len] = '\0';
+    }
+    return len;
+}
+
 static inline uint8_t word_low(uint16_t w)
 {
     return static_cast<uint8_t>(w & 0xff);
@@ -413,7 +426,7 @@ private:
         size_t len = 0;
         size_t used = 0;
         int status = 0;
-    } read_buffer, write_buffer;
+    } write_buffer;
 
     /*
      * Queue item for received packets waiting to be delivered
@@ -571,7 +584,6 @@ private:
     void set_int(void);
     void clr_int(void);
     void process_deferred_interrupts(void);  // Now a no-op stub
-    bool wait_for_interrupt_ack(void);  // Now returns false immediately
     void csr_set_clr(uint16_t set_bits, uint16_t clear_bits);
     void nxm_error(void);
     void rx_nxm_error(void);

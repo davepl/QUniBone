@@ -1,0 +1,75 @@
+{
+    "configurations": [
+        {
+            "name": "QUniBone QBUS",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/10.01_base/2_src/shared",
+                "${workspaceFolder}/10.01_base/2_src/arm",
+                "${workspaceFolder}/10.02_devices/2_src",
+                "${workspaceFolder}/10.02_devices/2_src/blinkenbone",
+                "${workspaceFolder}/10.02_devices/2_src/sharedfilesystem",
+                "${workspaceFolder}/10.02_devices/2_src/cpu20",
+                "${workspaceFolder}/10.03_app_demo/2_src",
+                "${workspaceFolder}/10.04_device_exerciser/2_src",
+                "${workspaceFolder}/90_common/src",
+                "${workspaceFolder}/91_3rd_party/am335x_pru_package/include",
+                "${workspaceFolder}/10.01_base/4_deploy_q",
+                "${workspaceFolder}/10.03_app_demo/4_deploy_q"
+            ],
+            "defines": [
+                "QBUS",
+                "ARM",
+                "BLINKENLIGHT_CLIENT",
+                "HAVE_PCAP",
+                "DBG",
+                "_DEBUG"
+            ],
+            "cStandard": "c11",
+            "cppStandard": "c++11",
+            "intelliSenseMode": "linux-gcc-arm",
+            "compilerPath": "/usr/bin/gcc",
+            "compilerArgs": [
+                "-Wall",
+                "-Wextra",
+                "-Wshadow"
+            ]
+        },
+        {
+            "name": "QUniBone UNIBUS",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/10.01_base/2_src/shared",
+                "${workspaceFolder}/10.01_base/2_src/arm",
+                "${workspaceFolder}/10.02_devices/2_src",
+                "${workspaceFolder}/10.02_devices/2_src/blinkenbone",
+                "${workspaceFolder}/10.02_devices/2_src/sharedfilesystem",
+                "${workspaceFolder}/10.02_devices/2_src/cpu20",
+                "${workspaceFolder}/10.03_app_demo/2_src",
+                "${workspaceFolder}/10.04_device_exerciser/2_src",
+                "${workspaceFolder}/90_common/src",
+                "${workspaceFolder}/91_3rd_party/am335x_pru_package/include",
+                "${workspaceFolder}/10.01_base/4_deploy_u",
+                "${workspaceFolder}/10.03_app_demo/4_deploy_u"
+            ],
+            "defines": [
+                "UNIBUS",
+                "ARM",
+                "BLINKENLIGHT_CLIENT",
+                "HAVE_PCAP",
+                "DBG",
+                "_DEBUG"
+            ],
+            "cStandard": "c11",
+            "cppStandard": "c++11",
+            "intelliSenseMode": "linux-gcc-arm",
+            "compilerPath": "/usr/bin/gcc",
+            "compilerArgs": [
+                "-Wall",
+                "-Wextra",
+                "-Wshadow"
+            ]
+        }
+    ],
+    "version": 4
+}

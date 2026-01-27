@@ -40,6 +40,19 @@
 #define DEUNA_FILTER_MAX 12 
 #define DEUNA_UDB_WORDS 200 
 
+// Safe string copy with guaranteed NUL termination.
+// Returns length of src (like strlcpy).
+static inline size_t safe_strcpy(char *dst, const char *src, size_t size)
+{
+    size_t len = strlen(src);
+    if (size > 0) {
+        size_t copy_len = (len < size - 1) ? len : size - 1;
+        memcpy(dst, src, copy_len);
+        dst[copy_len] = '\0';
+    }
+    return len;
+}
+
 #define DEUNA_REG_PCSR0 0
 #define DEUNA_REG_PCSR1 1
 #define DEUNA_REG_PCSR2 2

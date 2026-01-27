@@ -1,0 +1,15 @@
+{
+    "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.default.intelliSenseMode": "linux-gcc-arm",
+    "C_Cpp.default.cppStandard": "c++11",
+    "C_Cpp.default.cStandard": "c11",
+    "C_Cpp.errorSquiggles": "enabled",
+    "files.associations": {
+        "*.h": "c",
+        "*.hpp": "cpp",
+        "*.cpp": "cpp",
+        "*.c": "c"
+    },
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true
+}
